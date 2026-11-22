@@ -29,6 +29,11 @@ import {
   createChatStream,
   type ActiveOllamaChatStream,
 } from "./ollamaClient";
+import {
+  type ContextStats,
+  resolveContextBudget,
+  selectHistory,
+} from "./contextManager";
 
 // ============================================================
 // TYPES
@@ -147,6 +152,7 @@ type PerfTrace = {
   thinkingChannel: boolean;
   historyMessages: number;
   historyChars: number;
+  context: ContextStats | null; // estimates from contextManager
   systemPromptChars: number;
   userPromptChars: number;
   marks: Partial<Record<PerfMarkName, number>>;
@@ -233,6 +239,27 @@ function perfDiff(later?: number, earlier?: number): string {
   return `${(later - earlier).toFixed(0)} ms`;
 }
 
+// Context Manager metrics. All "est_" values are local estimates; the actual
+// prompt size is prompt_tokens_prompt_eval_count (Ollama). Metadata only.
+function perfContextReport(ctx: ContextStats | null): Record<string, string> {
+  if (!ctx) return { context_optimization: "N/A" };
+
+  return {
+    context_optimization: ctx.optimized ? "active" : "not needed",
+    context_status: ctx.status,
+    context_window: `${ctx.contextWindow} (${ctx.windowSource})`,
+    context_input_budget_est: String(ctx.inputBudget),
+    context_output_reserve: String(ctx.outputReserve),
+    history_messages_total: String(ctx.totalHistoryMessages),
+    history_messages_omitted: String(ctx.omittedHistoryMessages),
+    est_history_tokens_original: String(ctx.estOriginalHistoryTokens),
+    est_history_tokens_retained: String(ctx.estSelectedHistoryTokens),
+    est_history_tokens_removed: String(ctx.estRemovedHistoryTokens),
+    est_fixed_tokens_system_plus_user: String(ctx.estFixedTokens),
+    est_input_tokens_total: String(ctx.estInputTokens),
+  };
+}
+
 function perfBuildReport(trace: PerfTrace): Record<string, string> {
   const final = trace.final;
   const marks = trace.marks;
@@ -297,6 +324,7 @@ function perfBuildReport(trace: PerfTrace): Record<string, string> {
 
     history_messages_sent: String(trace.historyMessages),
     history_chars_sent: String(trace.historyChars),
+    ...perfContextReport(trace.context),
     system_prompt_chars: String(trace.systemPromptChars),
     user_prompt_chars: String(trace.userPromptChars),
   };
@@ -1187,7 +1215,9 @@ CSS підключено
     const userRequestedThinking = route && route.ok ? route.userRequestedThinking : false;
     const shouldUseThinkingChannel = route && route.ok ? route.think : false;
 
-    const historyMessages = messages.map((message) => ({
+    // Full stored conversation (UI state is never modified). Only the model
+    // input is reduced, later, by selectHistory().
+    const fullHistory = messages.map((message) => ({
       role: message.role,
       content: message.content,
     }));
@@ -1202,8 +1232,9 @@ CSS підключено
       profile: modelProfile,
       backend: backendConfig.backend,
       thinkingChannel: shouldUseThinkingChannel,
-      historyMessages: historyMessages.length,
-      historyChars: historyMessages.reduce(
+      historyMessages: fullHistory.length,
+      context: null,
+      historyChars: fullHistory.reduce(
         (total, message) => total + message.content.length,
         0,
       ),
@@ -1301,6 +1332,28 @@ CSS підключено
       const systemPrompt = buildSystemPrompt(runtimeInstructions, resolvedMode);
 
       perfTrace.systemPromptChars = systemPrompt.length; // [perf-diag]
+
+      // Context Budget + Smart History: choose what part of the stored
+      // conversation the model receives. Token numbers are estimates.
+      const contextSelection = selectHistory(fullHistory, {
+        systemPrompt,
+        userPrompt: prompt,
+        budget: resolveContextBudget(backendConfig, shouldUseThinkingChannel),
+      });
+      const historyMessages = contextSelection.history;
+
+      perfTrace.context = contextSelection.stats; // [perf-diag]
+      perfTrace.historyMessages = historyMessages.length; // [perf-diag]
+      perfTrace.historyChars = historyMessages.reduce(
+        (total, message) => total + message.content.length,
+        0,
+      ); // [perf-diag]
+
+      if (contextSelection.stats.status === "fixed-content-exceeds-budget") {
+        console.warn(
+          "[Sonne context] system prompt + current message exceed the estimated input budget; sent without history, not truncated.",
+        );
+      }
 
       const apiMessages = [
         {
