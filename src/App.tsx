@@ -25,12 +25,17 @@ import {
   isSupportedModelName,
   routeRequest,
 } from "./modelRouting";
+import {
+  createChatStream,
+  type ActiveOllamaChatStream,
+} from "./ollamaClient";
 
 // ============================================================
 // TYPES
 // ============================================================
 
 type ChatMessage = {
+  id?: number;
   role: "user" | "assistant";
   content: string;
   modeUsed?: ResolvedMode;
@@ -66,6 +71,14 @@ type OllamaChatChunk = {
 // ============================================================
 
 const OLLAMA_URL = "http://127.0.0.1:11434";
+
+type ActiveGeneration = {
+  id: number;
+  controller: AbortController;
+  request: ActiveOllamaChatStream | null;
+  cancelled: boolean;
+  flush: () => void;
+};
 
 // ============================================================
 // HELPERS
@@ -142,6 +155,7 @@ type PerfTrace = {
   contentChunks: number;
   lineFailures: number;
   streamError: string | null;
+  cancelled: boolean;
   final: OllamaChatChunk | null;
 };
 
@@ -274,6 +288,8 @@ function perfBuildReport(trace: PerfTrace): Record<string, string> {
     done_chunk_received: String(trace.final !== null),
     done_reason: final?.done_reason ?? "N/A",
     stream_error: trace.streamError ?? "none",
+    stream_cancelled: String(trace.cancelled),
+    stream_completed: String(trace.final !== null && !trace.cancelled),
     stream_chunks_total: String(trace.chunks),
     stream_chunks_thinking: String(trace.thinkingChunks),
     stream_chunks_content: String(trace.contentChunks),
@@ -932,6 +948,8 @@ export function App() {
   const [previewHtml, setPreviewHtml] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const activeGenerationRef = useRef<ActiveGeneration | null>(null);
+  const generationIdRef = useRef(0);
 
   // ----------------------------------------------------------
   // LOAD PRISM LANGUAGES
@@ -1032,6 +1050,18 @@ CSS підключено
     setPreviewHtml(code);
   }
 
+  function handleStopGeneration() {
+    const active = activeGenerationRef.current;
+
+    if (!active) return;
+
+    active.flush();
+    active.cancelled = true;
+    active.controller.abort();
+    active.request?.abort();
+    setIsGenerating(false);
+  }
+
   // ----------------------------------------------------------
   // SEND MESSAGE
   // ----------------------------------------------------------
@@ -1093,6 +1123,9 @@ CSS підключено
 
     if (requiresModel && !backendConfig) return;
 
+    const generationId = requiresModel ? ++generationIdRef.current : undefined;
+    const generationController = requiresModel ? new AbortController() : null;
+
     // Add user message and an empty assistant message.
     setMessages((previous) => [
       ...previous,
@@ -1102,6 +1135,7 @@ CSS підключено
         timestamp: userTime,
       },
       {
+        id: generationId,
         role: "assistant",
         content: "",
         modeUsed: resolvedMode,
@@ -1145,6 +1179,8 @@ CSS підключено
 
     if (!backendConfig) return;
 
+    if (!generationController || generationId === undefined) return;
+
     // The router already applied the Thinking override and resolved `think`
     // for the chosen backend (Pro Thinking: true, Pro Instruct: false,
     // Gemma: user-controlled). App.tsx only consumes the result.
@@ -1179,8 +1215,74 @@ CSS підключено
       contentChunks: 0,
       lineFailures: 0,
       streamError: null,
+      cancelled: false,
       final: null,
     };
+
+    let rawFull = "";
+    let pendingContent = "";
+    let animationFrame: number | null = null;
+
+    function updateAssistant(update: Partial<ChatMessage>) {
+      setMessages((previous) => {
+        const assistantIndex = previous.findIndex(
+          (message) => message.id === generationId,
+        );
+
+        if (assistantIndex === -1) return previous;
+
+        const updated = [...previous];
+        updated[assistantIndex] = {
+          ...updated[assistantIndex],
+          ...update,
+        };
+        return updated;
+      });
+    }
+
+    function flushPendingContent() {
+      if (animationFrame !== null) {
+        cancelAnimationFrame(animationFrame);
+        animationFrame = null;
+      }
+
+      if (activeGeneration.cancelled) {
+        pendingContent = "";
+        return;
+      }
+
+      if (!pendingContent) return;
+
+      rawFull += pendingContent;
+      pendingContent = "";
+
+      const answer = extractAnswer(rawFull);
+
+      // [perf-diag] First non-empty answer text that reaches the UI.
+      if (answer && perfTrace.marks.firstVisible === undefined) {
+        perfMark(perfTrace, "firstVisible");
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => perfMark(perfTrace, "firstPaint")),
+        );
+      }
+
+      updateAssistant({
+        content: answer,
+        modeUsed: resolvedMode,
+        modelUsed: activeModel,
+        timestamp: formatNow(),
+      });
+    }
+
+    const activeGeneration: ActiveGeneration = {
+      id: generationId,
+      controller: generationController,
+      request: null,
+      cancelled: false,
+      flush: flushPendingContent,
+    };
+
+    activeGenerationRef.current = activeGeneration;
 
     // --------------------------------------------------------
     // RUNTIME INSTRUCTIONS + OLLAMA REQUEST
@@ -1212,114 +1314,64 @@ CSS підключено
         },
       ];
 
-      const response = await fetch(`${OLLAMA_URL}/api/chat`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(
-          buildChatRequestBody(
-            backendConfig,
-            apiMessages,
-            userRequestedThinking,
-          ),
+      const activeRequest = await createChatStream(
+        OLLAMA_URL,
+        buildChatRequestBody(
+          backendConfig,
+          apiMessages,
+          userRequestedThinking,
         ),
-      });
+        generationController.signal,
+      );
 
       perfMark(perfTrace, "headers"); // [perf-diag]
 
-      if (!response.ok || !response.body) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-      }
+      activeGeneration.request = activeRequest;
 
       // ------------------------------------------------------
       // STREAM PROCESSING
       // ------------------------------------------------------
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-
-      let buffer = "";
-      let rawFull = "";
-
-      function appendContent(contentChunk: string) {
-        if (!contentChunk) return;
-
-        rawFull += contentChunk;
-
-        const answer = extractAnswer(rawFull);
-
-        // [perf-diag] First non-empty answer text that reaches the UI.
-        if (answer && perfTrace.marks.firstVisible === undefined) {
-          perfMark(perfTrace, "firstVisible");
-          requestAnimationFrame(() =>
-            requestAnimationFrame(() => perfMark(perfTrace, "firstPaint")),
-          );
+      function queueContent(contentChunk: string) {
+        if (
+          !contentChunk ||
+          activeGeneration.cancelled ||
+          activeGenerationRef.current?.id !== generationId
+        ) {
+          return;
         }
 
-        setMessages((previous) => {
-          const updated = [...previous];
+        pendingContent += contentChunk;
 
-          const lastIndex = updated.length - 1;
-
-          updated[lastIndex] = {
-            ...updated[lastIndex],
-            role: "assistant",
-            content: answer,
-            modeUsed: resolvedMode,
-            modelUsed: activeModel,
-            timestamp: formatNow(),
-          };
-
-          return updated;
-        });
-      }
-
-      function processStreamLine(line: string) {
-        if (!line.trim()) return;
-
-        try {
-          const parsed = JSON.parse(line) as OllamaChatChunk;
-
-          perfObserveChunk(perfTrace, parsed); // [perf-diag]
-
-          // The private thinking channel is intentionally ignored.
-          // Only normal response content is displayed.
-          const contentChunk = parsed.message?.content || "";
-
-          appendContent(contentChunk);
-        } catch {
-          perfTrace.lineFailures += 1; // [perf-diag]
-          // Ignore malformed or incomplete stream fragments.
+        if (animationFrame === null) {
+          animationFrame = requestAnimationFrame(() => {
+            animationFrame = null;
+            if (activeGeneration.cancelled) return;
+            flushPendingContent();
+          });
         }
       }
 
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) break;
-
-        buffer += decoder.decode(value, {
-          stream: true,
-        });
-
-        const lines = buffer.split("\n");
-
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          processStreamLine(line);
+      for await (const chunk of activeRequest.stream) {
+        if (
+          activeGeneration.cancelled ||
+          generationController.signal.aborted
+        ) {
+          break;
         }
+
+        perfObserveChunk(perfTrace, chunk); // [perf-diag]
+
+        // The private thinking channel is intentionally ignored.
+        // Only normal response content is displayed.
+        queueContent(chunk.message?.content || "");
       }
 
-      // Flush any remaining bytes from the decoder.
-      buffer += decoder.decode();
-
-      // Process the final fragment if it does not end with a newline.
-      if (buffer.trim()) {
-        processStreamLine(buffer);
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        throw new DOMException("Generation cancelled", "AbortError");
       }
 
+      flushPendingContent();
       perfMark(perfTrace, "streamEnd"); // [perf-diag]
       perfLogReport(perfTrace); // [perf-diag]
 
@@ -1329,18 +1381,9 @@ CSS підключено
 
       const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
 
-      setMessages((previous) => {
-        const updated = [...previous];
-
-        const lastIndex = updated.length - 1;
-
-        updated[lastIndex] = {
-          ...updated[lastIndex],
-          timestamp: formatNow(),
-          durationSec: totalSec,
-        };
-
-        return updated;
+      updateAssistant({
+        timestamp: formatNow(),
+        durationSec: totalSec,
       });
     } catch (err) {
       // ------------------------------------------------------
@@ -1350,27 +1393,38 @@ CSS підключено
       const errMsg =
         err instanceof Error ? err.message : "Помилка з'єднання з Ollama";
 
+      flushPendingContent();
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        perfTrace.cancelled = true; // [perf-diag]
+        perfMark(perfTrace, "streamEnd"); // [perf-diag]
+        perfLogReport(perfTrace); // [perf-diag]
+        updateAssistant({
+          timestamp: formatNow(),
+          durationSec: ((Date.now() - startTime) / 1000).toFixed(1),
+        });
+        return;
+      }
+
       perfLogFailure(perfTrace, errMsg); // [perf-diag]
 
-      setMessages((previous) => {
-        const updated = [...previous];
-
-        const lastIndex = updated.length - 1;
-
-        updated[lastIndex] = {
-          role: "assistant",
-          modeUsed: resolvedMode,
-          modelUsed: modelToUse,
-          content:
-            `Не вдалося отримати відповідь від Sonne або Ollama: ${errMsg}. ` +
-            `Перевір підключення та запуск Ollama.`,
-          timestamp: formatNow(),
-        };
-
-        return updated;
+      updateAssistant({
+        role: "assistant",
+        modeUsed: resolvedMode,
+        modelUsed: modelToUse,
+        content:
+          `Не вдалося отримати відповідь від Sonne або Ollama: ${errMsg}. ` +
+          `Перевір підключення та запуск Ollama.`,
+        timestamp: formatNow(),
       });
     } finally {
-      setIsGenerating(false);
+      flushPendingContent();
+      activeGeneration.request?.dispose();
+
+      if (activeGenerationRef.current?.id === generationId) {
+        activeGenerationRef.current = null;
+        setIsGenerating(false);
+      }
     }
   }
 
@@ -1525,10 +1579,18 @@ CSS підключено
 
               <button
                 className="send-btn"
-                onClick={() => void handleSend()}
-                disabled={isGenerating || !input.trim()}
+                onClick={() => {
+                  if (isGenerating) {
+                    handleStopGeneration();
+                  } else {
+                    void handleSend();
+                  }
+                }}
+                disabled={!isGenerating && !input.trim()}
               >
-                {isGenerating ? `${elapsedSec.toFixed(0)} с...` : "Надіслати"}
+                {isGenerating
+                  ? `Зупинити · ${elapsedSec.toFixed(0)} с`
+                  : "Надіслати"}
               </button>
             </div>
           </div>
