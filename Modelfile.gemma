@@ -1,0 +1,13 @@
+# SONNE — GEMMA MODEL CONFIGURATION
+# Target: macOS / Apple M5 Pro / 24 GB Unified Memory
+
+FROM gemma3:12b
+
+# Generation parameters
+PARAMETER temperature 0.70
+PARAMETER top_p 0.90
+PARAMETER repeat_penalty 1.05
+
+# Context and output limits
+PARAMETER num_ctx 8192
+PARAMETER num_predict 4096

@@ -1,20 +1,29 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import "prismjs";
-const Prism = (globalThis as unknown as {
-  Prism?: {
-    languages?: Record<string, unknown>;
-    highlight?: (code: string, grammar: unknown, lang: string) => string;
-  };
-}).Prism;
+
+const Prism = (
+  globalThis as unknown as {
+    Prism?: {
+      languages?: Record<string, unknown>;
+      highlight?: (code: string, grammar: unknown, lang: string) => string;
+    };
+  }
+).Prism;
+
 import "./App.css";
+
+// ============================================================
+// TYPES
+// ============================================================
 
 type ModeOption = "auto" | "chat" | "code" | "image";
 type ResolvedMode = "chat" | "code" | "image";
+type ModelProfile = "pro-ai" | "gemma";
 
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
-  thinking?: string;
   modeUsed?: ResolvedMode;
   modelUsed?: string;
   timestamp: string;
@@ -25,24 +34,38 @@ type MessagePart =
   | { type: "text"; value: string }
   | { type: "code"; lang: string; code: string };
 
+type OllamaChatChunk = {
+  message?: {
+    thinking?: string;
+    content?: string;
+  };
+  done?: boolean;
+  // [perf-diag] Fields present on Ollama's final (done: true) chunk.
+  model?: string;
+  done_reason?: string;
+  error?: string;
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
+  eval_count?: number;
+  eval_duration?: number;
+};
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
 const OLLAMA_URL = "http://127.0.0.1:11434";
 
-const CHAT_SYSTEM_PROMPT =
-  "Ти — швидкий і живий локальний асистент Sonne. Відповідай українською. " +
-  "На привітання, балачку та прості запитання відповідай коротко (1-3 речення) і по суті, " +
-  "БЕЗ коду, верстки та зайвих вступів, якщо користувач прямо не просить код або дизайн.";
+const MODEL_PROFILES: Record<string, ModelProfile> = {
+  "sonne-gemma:latest": "gemma",
+  "sonne-pro-ai:latest": "pro-ai",
+};
 
-const CODE_SYSTEM_PROMPT =
-  "Ти — провідний UI/UX дизайнер і креативний frontend-інженер рівня Awwwards у додатку Sonne. Пиши виключно українською у живому, драйвовому та впевненому стилі (без сухої офіційності й без англійських чернеток чи внутрішніх монологів). " +
-  "Коли просять зверстати секцію, сторінку або компонент, ЗАБОРОНЕНО робити примітивні шаблони з 30 рядків, стандартними кнопками або текстом-рибою типу 'Привітання!' чи 'Тут буде опис'. " +
-  "Якщо робиш Hero або лендинг — вигадуй цілісний концепт-бренд (наприклад, студія, космічна місія, AI-платформа, кібер-архітектура) і будуй насичену багатошарову сцену: " +
-  "навігація з логотипом та скляною кнопкою, акцентний бейдж, масивний градієнтний заголовок через clamp(), виразний підзаголовок і дві кнопки дій, " +
-  "складний центральний візуальний арт-об'єкт на чистому CSS (сфери, кільця, орбіти, світлові промені, сітки або 3D-шари) плюс 2 плаваючі glassmorphism-картки з живими метриками та нижній статус-бар. " +
-  "Використовуй CSS-змінні (:root), багаторівневі radial-gradient, backdrop-filter: blur(), плавні @keyframes (світіння, левітація, орбітальний рух, перелив градієнта), hover-мікроанімації, повний адаптив (@media) та @media (prefers-reduced-motion: reduce). " +
-  "Формат відповіді:\n" +
-  "1) Живий вступ (2-3 речення): яку саме концепцію ти вигадав і що це один самодостатній HTML-файл без бібліотек.\n" +
-  "2) Один повний, детально прописаний блок ```html ... ```.\n" +
-  "3) Розділ 'Що тут прикольного' списком фіч і анімацій, коротка порада щодо запуску на весь екран і смілива ідея для наступної версії.";
+// ============================================================
+// HELPERS
+// ============================================================
 
 function formatNow(): string {
   return new Date().toLocaleTimeString("uk-UA", {
@@ -57,30 +80,47 @@ function detectIntent(prompt: string, modeSetting: ModeOption): ResolvedMode {
 
   const q = prompt.toLowerCase().trim();
 
-  const imageKeywords = [
+  const imageRequests = [
     "намалюй",
     "згенеруй картинку",
     "згенеруй зображення",
     "зроби картинку",
     "зроби зображення",
-    "банер",
-    "іконк",
-    "арт",
-    "постер",
-    "обкладинк",
-    "draw ",
+    "draw",
     "generate image",
     "create image",
     "image of",
-    "banner",
   ];
-  if (imageKeywords.some((kw) => q.includes(kw))) {
+
+  if (imageRequests.some((request) => containsTerm(q, request))) {
     return "image";
   }
 
-  const codeKeywords = [
+  const formattingRequests = [
+    "markdown",
+    "inline code",
+    "жирний текст",
+    "курсив",
+    "таблиця",
+    "таблицею",
+    "форматування",
+  ];
+
+  if (formattingRequests.some((request) => containsTerm(q, request))) {
+    return "chat";
+  }
+
+  const codeTerms = [
     "код",
-    "верстк",
+    "коді",
+    "коду",
+    "кодом",
+    "скрипт",
+    "скрипті",
+    "функція",
+    "функцію",
+    "компонент",
+    "компоненті",
     "html",
     "css",
     "javascript",
@@ -89,151 +129,836 @@ function detectIntent(prompt: string, modeSetting: ModeOption): ResolvedMode {
     "python",
     "java",
     "c++",
-    "компонент",
-    "сторінк",
-    "лендинг",
-    "сайт",
-    "кнопк",
-    "картк",
-    "карточк",
-    "анімац",
-    "функц",
-    "скрипт",
-    "баг",
-    "помилк",
     "sql",
-    "api",
     "code",
-    "layout",
-    "ui",
-    "ux",
-    "інтерфейс",
-    "форма",
-    "таблиц",
   ];
-  if (codeKeywords.some((kw) => q.includes(kw))) {
+
+  if (codeTerms.some((term) => containsTerm(q, term))) {
+    return "code";
+  }
+
+  if (isComplexTechnicalRequest(q)) {
     return "code";
   }
 
   return "chat";
 }
 
+function containsTerm(text: string, term: string): boolean {
+  const escaped = term.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(
+    `(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`,
+    "iu",
+  );
+
+  return pattern.test(text);
+}
+
+function isComplexTechnicalRequest(prompt: string): boolean {
+  const complexRequests = [
+    "повноцінну систему авторизації",
+    "архітектуру проєкту",
+    "архітектуру проекту",
+    "рефакторинг багатьох файлів",
+    "рефакторинг кількох файлів",
+    "багатофайлові зміни",
+    "multi-file",
+    "складний дебагінг",
+    "complex debugging",
+    "складний алгоритм",
+    "оптимальний алгоритм",
+  ];
+
+  return complexRequests.some((request) => containsTerm(prompt, request));
+}
+
 function pickModelForMode(
   resolvedMode: ResolvedMode,
   availableModels: string[],
-  selectedModel: string
-): string {
+  selectedModel: string,
+  prompt: string,
+  isAutoMode: boolean,
+): string | null {
+  // Manual model selection always has priority.
   if (selectedModel !== "auto" && availableModels.includes(selectedModel)) {
     return selectedModel;
   }
 
-  if (resolvedMode === "chat") {
-    const lightModel = availableModels.find((m) => m.toLowerCase().includes("gemma3"));
-    if (lightModel) return lightModel;
+  const gemmaModel = availableModels.find(
+    (model) => getModelProfile(model) === "gemma",
+  );
+  const proModel = availableModels.find(
+    (model) => getModelProfile(model) === "pro-ai",
+  );
+
+  // Explicit code mode preserves its existing Pro AI behavior.
+  if (
+    resolvedMode === "code" &&
+    (!isAutoMode || isComplexTechnicalRequest(prompt))
+  ) {
+    return proModel || gemmaModel || null;
   }
 
-  if (resolvedMode === "code") {
-    const proModel = availableModels.find((m) => m.toLowerCase().includes("pro-ai"));
-    if (proModel) return proModel;
-    const coderModel = availableModels.find((m) => m.toLowerCase().includes("coder"));
-    if (coderModel) return coderModel;
-  }
-
-  const fallbackPro = availableModels.find((m) => m.toLowerCase().includes("pro-ai"));
-  return fallbackPro || availableModels[0] || "pro-ai:latest";
+  return gemmaModel || proModel || null;
 }
 
-function stripSelfMonologue(text: string): string {
-  const lines = text.split("\n");
-  const filtered = lines.filter((line) => {
-    const t = line.trim();
-    if (!t) return true;
-    const isMonologueLine =
-      /^(okay,|first,|wait,|but sometimes|the user (asked|said|might)|let me |i'll |i will |check online:|make sure there are)/i.test(
-        t
-      );
-    return !isMonologueLine;
-  });
-  return filtered.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+function getModelProfile(modelName: string): ModelProfile | null {
+  return MODEL_PROFILES[modelName.trim().toLowerCase()] || null;
 }
 
-function splitThinking(raw: string): { thinking: string; answer: string } {
+/**
+ * Removes an embedded <think>...</think> block if a model
+ * accidentally includes one in its normal response content.
+ *
+ * The separate Ollama thinking channel is never displayed.
+ */
+function extractAnswer(raw: string): string {
   const thinkOpen = raw.indexOf("<think>");
+
   if (thinkOpen === -1) {
-    return { thinking: "", answer: stripSelfMonologue(raw) };
+    return raw.trim();
   }
-  const thinkClose = raw.indexOf("</think>");
+
+  const thinkClose = raw.indexOf("</think>", thinkOpen);
+
   if (thinkClose === -1) {
-    return {
-      thinking: raw.slice(thinkOpen + 7).trim(),
-      answer: "",
-    };
+    return raw.slice(0, thinkOpen).trim();
   }
+
+  return (
+    raw.slice(0, thinkOpen) + raw.slice(thinkClose + "</think>".length)
+  ).trim();
+}
+
+// ============================================================
+// [perf-diag] TEMPORARY PERFORMANCE DIAGNOSTICS
+// Logs timing metrics to the developer console only. Never logs
+// message text, system instructions or any other private data.
+// To remove: delete this block and every line tagged [perf-diag].
+// ============================================================
+
+const PERF_DIAGNOSTICS_ENABLED = true;
+
+type PerfMarkName =
+  | "instructions"
+  | "headers"
+  | "firstChunk"
+  | "firstThinking"
+  | "firstContent"
+  | "firstVisible"
+  | "firstPaint"
+  | "doneChunk"
+  | "streamEnd";
+
+type PerfTrace = {
+  t0: number;
+  model: string;
+  mode: ResolvedMode;
+  modeSetting: ModeOption;
+  modelSelection: "auto" | "manual";
+  profile: ModelProfile;
+  thinkingChannel: boolean;
+  historyMessages: number;
+  historyChars: number;
+  systemPromptChars: number;
+  userPromptChars: number;
+  marks: Partial<Record<PerfMarkName, number>>;
+  chunks: number;
+  thinkingChunks: number;
+  contentChunks: number;
+  lineFailures: number;
+  streamError: string | null;
+  final: OllamaChatChunk | null;
+};
+
+function perfMark(trace: PerfTrace, name: PerfMarkName): void {
+  // Only the first occurrence of each mark is recorded.
+  if (trace.marks[name] === undefined) {
+    trace.marks[name] = performance.now();
+  }
+}
+
+function perfObserveChunk(trace: PerfTrace, chunk: OllamaChatChunk): void {
+  trace.chunks += 1;
+
+  const hasThinking = Boolean(chunk.message?.thinking);
+  const hasContent = Boolean(chunk.message?.content);
+
+  if (hasThinking) {
+    trace.thinkingChunks += 1;
+    perfMark(trace, "firstThinking");
+  }
+
+  if (hasContent) {
+    trace.contentChunks += 1;
+    perfMark(trace, "firstContent");
+  }
+
+  if (hasThinking || hasContent) {
+    perfMark(trace, "firstChunk");
+  }
+
+  if (typeof chunk.error === "string" && trace.streamError === null) {
+    trace.streamError = chunk.error.slice(0, 200);
+  }
+
+  if (chunk.done === true) {
+    trace.final = chunk;
+    perfMark(trace, "doneChunk");
+  }
+}
+
+function perfIsValidNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/** Ollama reports durations in nanoseconds. Absent value -> "N/A". */
+function perfNsToMs(value: unknown): string {
+  return perfIsValidNumber(value) ? `${(value / 1e6).toFixed(0)} ms` : "N/A";
+}
+
+/** Milliseconds elapsed from t0 to a mark. Missing mark -> "N/A". */
+function perfSince(trace: PerfTrace, name: PerfMarkName): string {
+  const mark = trace.marks[name];
+
+  return mark === undefined ? "N/A" : `${(mark - trace.t0).toFixed(0)} ms`;
+}
+
+/** Tokens per second from an Ollama count and a nanosecond duration. */
+function perfRate(count: unknown, durationNs: unknown): string {
+  if (!perfIsValidNumber(count) || !perfIsValidNumber(durationNs)) {
+    return "N/A";
+  }
+
+  if (count === 0 || durationNs === 0) return "N/A";
+
+  return `${(count / (durationNs / 1e9)).toFixed(1)} tok/s`;
+}
+
+function perfCount(value: unknown): string {
+  return perfIsValidNumber(value) ? String(value) : "N/A";
+}
+
+function perfDiff(later?: number, earlier?: number): string {
+  if (later === undefined || earlier === undefined) return "N/A";
+
+  return `${(later - earlier).toFixed(0)} ms`;
+}
+
+function perfBuildReport(trace: PerfTrace): Record<string, string> {
+  const final = trace.final;
+  const marks = trace.marks;
+
+  const wallMs =
+    marks.streamEnd !== undefined ? marks.streamEnd - trace.t0 : undefined;
+
+  const ollamaTotalMs = perfIsValidNumber(final?.total_duration)
+    ? final.total_duration / 1e6
+    : undefined;
+
   return {
-    thinking: raw.slice(thinkOpen + 7, thinkClose).trim(),
-    answer: stripSelfMonologue(raw.slice(thinkClose + 8).trim()),
+    model_requested: trace.model,
+    model_reported_by_ollama: final?.model ?? "N/A",
+    mode_resolved: trace.mode,
+    mode_setting: trace.modeSetting,
+    model_selection: trace.modelSelection,
+    profile: trace.profile,
+    thinking_channel_requested: String(trace.thinkingChannel),
+
+    wall_total: wallMs === undefined ? "N/A" : `${wallMs.toFixed(0)} ms`,
+    ollama_total_duration: perfNsToMs(final?.total_duration),
+    client_overhead_wall_minus_ollama:
+      wallMs === undefined || ollamaTotalMs === undefined
+        ? "N/A"
+        : `${(wallMs - ollamaTotalMs).toFixed(0)} ms`,
+    ollama_load_duration: perfNsToMs(final?.load_duration),
+    ollama_prompt_eval_duration: perfNsToMs(final?.prompt_eval_duration),
+    ollama_eval_duration: perfNsToMs(final?.eval_duration),
+
+    ttft_first_visible_token_queued: perfSince(trace, "firstVisible"),
+    ttft_first_visible_token_painted_approx: perfSince(trace, "firstPaint"),
+    time_to_first_any_chunk: perfSince(trace, "firstChunk"),
+    time_to_first_thinking_chunk: perfSince(trace, "firstThinking"),
+    time_to_first_content_chunk: perfSince(trace, "firstContent"),
+    thinking_phase_first_thinking_to_first_content: perfDiff(
+      marks.firstContent,
+      marks.firstThinking,
+    ),
+    time_to_instructions_ready: perfSince(trace, "instructions"),
+    time_to_response_headers: perfSince(trace, "headers"),
+    time_to_done_chunk: perfSince(trace, "doneChunk"),
+
+    prompt_tokens_prompt_eval_count: perfCount(final?.prompt_eval_count),
+    output_tokens_eval_count: perfCount(final?.eval_count),
+    prompt_eval_rate: perfRate(
+      final?.prompt_eval_count,
+      final?.prompt_eval_duration,
+    ),
+    generation_rate: perfRate(final?.eval_count, final?.eval_duration),
+
+    done_chunk_received: String(trace.final !== null),
+    done_reason: final?.done_reason ?? "N/A",
+    stream_error: trace.streamError ?? "none",
+    stream_chunks_total: String(trace.chunks),
+    stream_chunks_thinking: String(trace.thinkingChunks),
+    stream_chunks_content: String(trace.contentChunks),
+    stream_line_failures: String(trace.lineFailures),
+
+    history_messages_sent: String(trace.historyMessages),
+    history_chars_sent: String(trace.historyChars),
+    system_prompt_chars: String(trace.systemPromptChars),
+    user_prompt_chars: String(trace.userPromptChars),
   };
 }
 
+function perfLogReport(trace: PerfTrace): void {
+  if (!PERF_DIAGNOSTICS_ENABLED) return;
+
+  console.info("[Sonne perf] response metrics");
+  console.table(perfBuildReport(trace));
+  void perfLogOllamaResidency(trace.model);
+}
+
+function perfLogFailure(trace: PerfTrace, message: string): void {
+  if (!PERF_DIAGNOSTICS_ENABLED) return;
+
+  console.warn("[Sonne perf] request failed", {
+    model: trace.model,
+    mode: trace.mode,
+    elapsed: `${(performance.now() - trace.t0).toFixed(0)} ms`,
+    time_to_response_headers: perfSince(trace, "headers"),
+    error: message.slice(0, 200),
+  });
+}
+
+/**
+ * Read-only check of which models Ollama currently keeps in memory
+ * (GET /api/ps). Does not change the keep-alive timer.
+ */
+async function perfLogOllamaResidency(requestedModel: string): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+
+  try {
+    const response = await fetch(`${OLLAMA_URL}/api/ps`, {
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      console.info(`[Sonne perf] /api/ps unavailable: HTTP ${response.status}`);
+      return;
+    }
+
+    const data = (await response.json()) as {
+      models?: Array<{
+        name?: string;
+        model?: string;
+        size?: number;
+        size_vram?: number;
+        context_length?: number;
+        expires_at?: string;
+      }>;
+    };
+
+    const gib = (bytes: unknown) =>
+      perfIsValidNumber(bytes) ? (bytes / 1024 ** 3).toFixed(2) : "N/A";
+
+    const rows = (data.models ?? []).map((entry) => {
+      const name = entry.name ?? entry.model ?? "N/A";
+      const expires = entry.expires_at ? Date.parse(entry.expires_at) : NaN;
+
+      return {
+        model: name,
+        is_requested_model: String(name === requestedModel),
+        size_gib: gib(entry.size),
+        vram_gib: gib(entry.size_vram),
+        gpu_share:
+          perfIsValidNumber(entry.size) &&
+          entry.size > 0 &&
+          perfIsValidNumber(entry.size_vram)
+            ? `${((entry.size_vram / entry.size) * 100).toFixed(0)}%`
+            : "N/A",
+        context_length: perfCount(entry.context_length),
+        unloads_in: Number.isFinite(expires)
+          ? `${Math.max(0, Math.round((expires - Date.now()) / 1000))} s`
+          : "N/A",
+      };
+    });
+
+    console.info(
+      `[Sonne perf] models resident in Ollama after response: ${rows.length}`,
+    );
+
+    if (rows.length > 0) console.table(rows);
+  } catch {
+    console.info("[Sonne perf] /api/ps request failed or timed out");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ============================================================
+// CONTENT PARSING
+// ============================================================
+
 function extractRawHtmlIfUnfenced(text: string): MessagePart[] | null {
   const trimmed = text.trim();
-  const doctypeIdx = trimmed.toLowerCase().indexOf("<!doctype html");
-  const htmlIdx = trimmed.toLowerCase().indexOf("<html");
-  const startIdx =
-    doctypeIdx !== -1 && htmlIdx !== -1
-      ? Math.min(doctypeIdx, htmlIdx)
-      : Math.max(doctypeIdx, htmlIdx);
 
-  if (startIdx === -1) return null;
+  const lowerText = trimmed.toLowerCase();
+  const doctypeIndex = lowerText.indexOf("<!doctype html");
+  const htmlIndex = lowerText.indexOf("<html");
 
-  const closeHtmlIdx = trimmed.toLowerCase().lastIndexOf("</html>");
-  if (closeHtmlIdx === -1) return null;
+  const startIndex =
+    doctypeIndex !== -1 && htmlIndex !== -1
+      ? Math.min(doctypeIndex, htmlIndex)
+      : Math.max(doctypeIndex, htmlIndex);
 
-  const endIdx = closeHtmlIdx + "</html>".length;
-  const before = trimmed.slice(0, startIdx).trim();
-  const htmlCode = trimmed.slice(startIdx, endIdx).trim();
-  const after = trimmed.slice(endIdx).trim();
+  if (startIndex === -1) return null;
+
+  const closeHtmlIndex = lowerText.lastIndexOf("</html>");
+
+  if (closeHtmlIndex === -1) return null;
+
+  const endIndex = closeHtmlIndex + "</html>".length;
+
+  const before = trimmed.slice(0, startIndex).trim();
+  const htmlCode = trimmed.slice(startIndex, endIndex).trim();
+  const after = trimmed.slice(endIndex).trim();
 
   const parts: MessagePart[] = [];
-  if (before) parts.push({ type: "text", value: before });
-  parts.push({ type: "code", lang: "html", code: htmlCode });
-  if (after) parts.push({ type: "text", value: after });
+
+  if (before) {
+    parts.push({ type: "text", value: before });
+  }
+
+  parts.push({
+    type: "code",
+    lang: "html",
+    code: htmlCode,
+  });
+
+  if (after) {
+    parts.push({ type: "text", value: after });
+  }
+
   return parts;
 }
 
 function parseContent(raw: string): MessagePart[] {
   const parts: MessagePart[] = [];
   const regex = /```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g;
+
   let lastIndex = 0;
   let match: RegExpExecArray | null;
 
   while ((match = regex.exec(raw)) !== null) {
     if (match.index > lastIndex) {
-      parts.push({ type: "text", value: raw.slice(lastIndex, match.index) });
+      parts.push({
+        type: "text",
+        value: raw.slice(lastIndex, match.index),
+      });
     }
+
     parts.push({
       type: "code",
-      lang: (match[1] || "code").toLowerCase(),
+      lang: detectCodeLanguage(match[1], match[2]),
       code: match[2].replace(/\n$/, ""),
     });
+
     lastIndex = regex.lastIndex;
   }
 
+  const remaining = raw.slice(lastIndex);
+  const incompleteFence = /```([a-zA-Z0-9_-]*)\n([\s\S]*)$/.exec(remaining);
+
+  if (incompleteFence) {
+    const fenceIndex = lastIndex + incompleteFence.index;
+
+    if (fenceIndex > lastIndex) {
+      parts.push({
+        type: "text",
+        value: raw.slice(lastIndex, fenceIndex),
+      });
+    }
+
+    parts.push({
+      type: "code",
+      lang: detectCodeLanguage(incompleteFence[1], incompleteFence[2]),
+      code: incompleteFence[2],
+    });
+
+    lastIndex = raw.length;
+  }
+
   if (lastIndex < raw.length) {
-    parts.push({ type: "text", value: raw.slice(lastIndex) });
+    parts.push({
+      type: "text",
+      value: raw.slice(lastIndex),
+    });
   }
 
   if (parts.length > 0) {
-    const hasCode = parts.some((p) => p.type === "code");
+    const hasCode = parts.some((part) => part.type === "code");
+
     if (!hasCode) {
       const unfencedHtml = extractRawHtmlIfUnfenced(raw);
+
       if (unfencedHtml) return unfencedHtml;
     }
+
     return parts;
   }
 
   return [{ type: "text", value: raw }];
 }
+
+function detectCodeLanguage(declaredLanguage: string, code: string): string {
+  const language = declaredLanguage.trim().toLowerCase();
+
+  const aliases: Record<string, string> = {
+    csharp: "csharp",
+    cs: "csharp",
+    html: "html",
+    js: "javascript",
+    jsx: "javascript",
+    py: "python",
+    shell: "bash",
+    sh: "bash",
+    ts: "typescript",
+    tsx: "typescript",
+    xml: "xml",
+    yml: "yaml",
+  };
+
+  if (language) {
+    return aliases[language] || language;
+  }
+
+  const trimmedCode = code.trim();
+
+  if (
+    (trimmedCode.startsWith("{") || trimmedCode.startsWith("[")) &&
+    (() => {
+      try {
+        JSON.parse(trimmedCode);
+        return true;
+      } catch {
+        return false;
+      }
+    })()
+  ) {
+    return "json";
+  }
+
+  return "code";
+}
+
+function normalizeEscapedMarkdownDelimiters(value: string): string {
+  return value
+    .replace(/\\\*\\\*\\\*([^*\n]+?)\\\*\\\*\\\*/g, "***$1***")
+    .replace(/\\\*\\\*([^*\n]+?)\\\*\\*/g, "**$1**")
+    .replace(/\\__([^_\n]+?)\\__/g, "__$1__")
+    .replace(/\\\*([^*\n]+?)\\\*/g, "*$1*")
+    .replace(/\\_([^_\n]+?)\\_/g, "_$1_");
+}
+
+function renderFormattedText(value: string, keyPrefix: string): ReactNode[] {
+  const normalized = normalizeEscapedMarkdownDelimiters(value);
+  const tokens = normalized.split(
+    /(\*\*\*[^*\n]+?\*\*\*|___[^_\n]+?___|\*\*[^*\n]+?\*\*|__[^_\n]+?__|\*[^*\n]+?\*|(?<!\w)_[^_\n]+?_(?!\w))/g,
+  );
+
+  return tokens.map((token, index) => {
+    const isAsteriskBoldItalic =
+      token.startsWith("***") && token.endsWith("***");
+    const isUnderscoreBoldItalic =
+      token.startsWith("___") && token.endsWith("___");
+    const isAsteriskBold = token.startsWith("**") && token.endsWith("**");
+    const isUnderscoreBold = token.startsWith("__") && token.endsWith("__");
+    const isAsteriskItalic = token.startsWith("*") && token.endsWith("*");
+    const isUnderscoreItalic = token.startsWith("_") && token.endsWith("_");
+
+    if (isAsteriskBoldItalic || isUnderscoreBoldItalic) {
+      return (
+        <strong key={`${keyPrefix}-bold-italic-${index}`}>
+          <em>{token.slice(3, -3)}</em>
+        </strong>
+      );
+    }
+
+    if (isAsteriskBold || isUnderscoreBold) {
+      return (
+        <strong key={`${keyPrefix}-bold-${index}`}>{token.slice(2, -2)}</strong>
+      );
+    }
+
+    if (isAsteriskItalic || isUnderscoreItalic) {
+      return <em key={`${keyPrefix}-italic-${index}`}>{token.slice(1, -1)}</em>;
+    }
+
+    return token;
+  });
+}
+
+function renderInlineMarkdown(value: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const codePattern = /`([^`\n]*)`|\\`([^`\n]*)\\`/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let tokenIndex = 0;
+
+  while ((match = codePattern.exec(value)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(
+        ...renderFormattedText(
+          value.slice(lastIndex, match.index),
+          `${keyPrefix}-text-${tokenIndex}`,
+        ),
+      );
+    }
+
+    nodes.push(
+      <code
+        className="markdown-inline-code"
+        key={`${keyPrefix}-code-${tokenIndex}`}
+      >
+        {match[1] ?? match[2] ?? ""}
+      </code>,
+    );
+
+    lastIndex = codePattern.lastIndex;
+    tokenIndex += 1;
+  }
+
+  if (lastIndex < value.length) {
+    nodes.push(
+      ...renderFormattedText(
+        value.slice(lastIndex),
+        `${keyPrefix}-text-${tokenIndex}`,
+      ),
+    );
+  }
+
+  return nodes;
+}
+
+function renderTextLines(lines: string[], keyPrefix: string): ReactNode[] {
+  return lines.flatMap((line, index) => [
+    ...renderInlineMarkdown(line, `${keyPrefix}-${index}`),
+    ...(index < lines.length - 1
+      ? [<br key={`${keyPrefix}-break-${index}`} />]
+      : []),
+  ]);
+}
+
+function isTableDivider(line: string): boolean {
+  return /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/.test(line);
+}
+
+function splitTableRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, "")
+    .replace(/\|$/, "")
+    .split("|")
+    .map((cell) => cell.trim());
+}
+
+function isTableStart(lines: string[], index: number): boolean {
+  return lines[index].includes("|") && isTableDivider(lines[index + 1] || "");
+}
+
+function normalizeEscapedMarkdownBlockSyntax(line: string): string {
+  return line
+    .replace(/^(\s*)\\(>\s?)/, "$1$2")
+    .replace(/^(\s*)\\((?:---|\*\*\*|___)\s*)$/, "$1$2");
+}
+
+function isHorizontalRule(line: string): boolean {
+  return /^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/.test(line);
+}
+
+function MarkdownText({ content }: { content: string }) {
+  const lines = content
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map(normalizeEscapedMarkdownBlockSyntax);
+  const blocks: ReactNode[] = [];
+  let lineIndex = 0;
+
+  while (lineIndex < lines.length) {
+    const line = lines[lineIndex];
+
+    if (!line.trim()) {
+      lineIndex += 1;
+      continue;
+    }
+
+    const quoteMatch = /^\s*>\s?(.*)$/.exec(line);
+
+    if (quoteMatch) {
+      const quoteLines: string[] = [];
+
+      while (lineIndex < lines.length) {
+        const currentQuote = /^\s*>\s?(.*)$/.exec(lines[lineIndex]);
+
+        if (!currentQuote) break;
+
+        quoteLines.push(currentQuote[1]);
+        lineIndex += 1;
+      }
+
+      blocks.push(
+        <blockquote className="markdown-quote" key={`quote-${lineIndex}`}>
+          {renderTextLines(quoteLines, `quote-${lineIndex}`)}
+        </blockquote>,
+      );
+      continue;
+    }
+
+    if (isHorizontalRule(line)) {
+      blocks.push(<hr className="markdown-rule" key={`rule-${lineIndex}`} />);
+      lineIndex += 1;
+      continue;
+    }
+
+    const headingMatch = /^(#{1,6})\s+(.+?)\s*#*\s*$/.exec(line);
+
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      blocks.push(
+        <div
+          aria-level={level}
+          className={`markdown-heading markdown-heading-${level}`}
+          key={`heading-${lineIndex}`}
+          role="heading"
+        >
+          {renderInlineMarkdown(headingMatch[2], `heading-${lineIndex}`)}
+        </div>,
+      );
+      lineIndex += 1;
+      continue;
+    }
+
+    if (isTableStart(lines, lineIndex)) {
+      const headerCells = splitTableRow(line);
+      const rows: string[][] = [];
+      lineIndex += 2;
+
+      while (
+        lineIndex < lines.length &&
+        lines[lineIndex].trim().includes("|")
+      ) {
+        rows.push(splitTableRow(lines[lineIndex]));
+        lineIndex += 1;
+      }
+
+      blocks.push(
+        <div className="markdown-table-wrap" key={`table-${lineIndex}`}>
+          <table className="markdown-table">
+            <thead>
+              <tr>
+                {headerCells.map((cell, cellIndex) => (
+                  <th key={`header-${cellIndex}`}>
+                    {renderInlineMarkdown(cell, `table-header-${cellIndex}`)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={`row-${rowIndex}`}>
+                  {headerCells.map((_, cellIndex) => (
+                    <td key={`cell-${rowIndex}-${cellIndex}`}>
+                      {renderInlineMarkdown(
+                        row[cellIndex] || "",
+                        `table-${rowIndex}-${cellIndex}`,
+                      )}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>,
+      );
+      continue;
+    }
+
+    const unorderedMatch = /^\s*[-*+]\s+(.+)$/.exec(line);
+    const orderedMatch = /^\s*(\d+)\.\s+(.+)$/.exec(line);
+
+    if (unorderedMatch || orderedMatch) {
+      const isOrdered = Boolean(orderedMatch);
+      const items: string[] = [];
+      const start = orderedMatch ? Number(orderedMatch[1]) : undefined;
+
+      while (lineIndex < lines.length) {
+        const itemMatch = isOrdered
+          ? /^\s*\d+\.\s+(.+)$/.exec(lines[lineIndex])
+          : /^\s*[-*+]\s+(.+)$/.exec(lines[lineIndex]);
+
+        if (!itemMatch) break;
+
+        items.push(itemMatch[1]);
+        lineIndex += 1;
+      }
+
+      const listItems = items.map((item, itemIndex) => (
+        <li key={`item-${itemIndex}`}>
+          {renderInlineMarkdown(item, `list-${lineIndex}-${itemIndex}`)}
+        </li>
+      ));
+
+      blocks.push(
+        isOrdered ? (
+          <ol
+            className="markdown-list"
+            key={`ordered-${lineIndex}`}
+            start={start}
+          >
+            {listItems}
+          </ol>
+        ) : (
+          <ul className="markdown-list" key={`unordered-${lineIndex}`}>
+            {listItems}
+          </ul>
+        ),
+      );
+      continue;
+    }
+
+    const paragraphLines: string[] = [];
+
+    while (lineIndex < lines.length) {
+      const currentLine = lines[lineIndex];
+
+      if (
+        !currentLine.trim() ||
+        /^(#{1,6})\s+/.test(currentLine) ||
+        /^\s*(?:[-*+]|\d+\.)\s+/.test(currentLine) ||
+        isTableStart(lines, lineIndex)
+      ) {
+        break;
+      }
+
+      paragraphLines.push(currentLine);
+      lineIndex += 1;
+    }
+
+    blocks.push(
+      <p className="markdown-paragraph" key={`paragraph-${lineIndex}`}>
+        {renderTextLines(paragraphLines, `paragraph-${lineIndex}`)}
+      </p>,
+    );
+  }
+
+  return <div className="prose-text markdown-text">{blocks}</div>;
+}
+
+// ============================================================
+// CODE HIGHLIGHTING
+// ============================================================
 
 function highlightCode(code: string, lang: string): string {
   const normalized =
@@ -248,14 +973,20 @@ function highlightCode(code: string, lang: string): string {
             : lang;
 
   const grammar = Prism?.languages?.[normalized];
+
   if (grammar && typeof Prism?.highlight === "function") {
     return Prism.highlight(code, grammar, normalized);
   }
+
   return code
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
+
+// ============================================================
+// CODE BLOCK COMPONENT
+// ============================================================
 
 function CodeBlock({
   lang,
@@ -267,16 +998,19 @@ function CodeBlock({
   onPreview: (code: string, lang: string) => void;
 }) {
   const [copied, setCopied] = useState(false);
+
   const highlighted = useMemo(() => highlightCode(code, lang), [code, lang]);
+
   const canPreview = ["html", "markup", "svg", "css"].includes(lang);
 
   async function handleCopy() {
     try {
       await navigator.clipboard.writeText(code);
       setCopied(true);
+
       setTimeout(() => setCopied(false), 1500);
     } catch {
-      // ignore
+      // Clipboard access may be unavailable.
     }
   }
 
@@ -284,17 +1018,20 @@ function CodeBlock({
     <div className="code-block">
       <div className="code-header">
         <span className="code-lang">{lang}</span>
+
         <div className="code-btns">
           {canPreview && (
             <button className="mini-btn" onClick={() => onPreview(code, lang)}>
               Прев'ю
             </button>
           )}
+
           <button className="mini-btn" onClick={handleCopy}>
             {copied ? "Скопійовано ✓" : "Копіювати"}
           </button>
         </div>
       </div>
+
       <pre>
         <code dangerouslySetInnerHTML={{ __html: highlighted }} />
       </pre>
@@ -302,28 +1039,13 @@ function CodeBlock({
   );
 }
 
-function ThinkingBlock({
-  thinking,
-  isActive,
-}: {
-  thinking: string;
-  isActive: boolean;
-}) {
-  const [open, setOpen] = useState(false);
-
-  return (
-    <div className="thinking-box">
-      <button className="thinking-toggle" onClick={() => setOpen((v) => !v)}>
-        <span>{isActive ? "Хід думок моделі (думає...)" : "Хід думок моделі"}</span>
-        <span>{open ? "Згорнути ▲" : "Розгорнути ▼"}</span>
-      </button>
-      {open && <div className="thinking-content">{thinking}</div>}
-    </div>
-  );
-}
+// ============================================================
+// MAIN APP
+// ============================================================
 
 export function App() {
   const [models, setModels] = useState<string[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState<boolean>(false);
   const [selectedModel, setSelectedModel] = useState<string>("auto");
   const [modeSetting, setModeSetting] = useState<ModeOption>("auto");
   const [allowThinking, setAllowThinking] = useState<boolean>(false);
@@ -332,79 +1054,154 @@ export function App() {
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [elapsedSec, setElapsedSec] = useState<number>(0);
   const [previewHtml, setPreviewHtml] = useState<string | null>(null);
+
   const bottomRef = useRef<HTMLDivElement | null>(null);
+
+  // ----------------------------------------------------------
+  // LOAD PRISM LANGUAGES
+  // ----------------------------------------------------------
 
   useEffect(() => {
     void Promise.all([
       import("prismjs/components/prism-markup"),
       import("prismjs/components/prism-css"),
       import("prismjs/components/prism-javascript"),
+      import("prismjs/components/prism-json"),
       import("prismjs/components/prism-typescript"),
       import("prismjs/components/prism-java"),
       import("prismjs/components/prism-c"),
       import("prismjs/components/prism-python"),
-    ]).catch(() => {});
+    ]).catch(() => {
+      // Some Prism languages may fail to load.
+    });
   }, []);
+
+  // ----------------------------------------------------------
+  // LOAD OLLAMA MODELS
+  // ----------------------------------------------------------
 
   useEffect(() => {
     async function loadModels() {
       try {
-        const res = await fetch(`${OLLAMA_URL}/api/tags`);
-        if (!res.ok) return;
-        const data = await res.json();
+        const response = await fetch(`${OLLAMA_URL}/api/tags`);
+
+        if (!response.ok) return;
+
+        const data = await response.json();
+
         const names: string[] = (data.models || [])
-          .map((m: { name: string }) => m.name)
-          .filter((name: string) => !name.includes("embed"));
-        if (names.length > 0) {
-          setModels(names);
-        }
+          .map((model: { name: string }) => model.name)
+          .filter((name: string) => getModelProfile(name) !== null);
+
+        setModels(names);
       } catch {
-        // Ollama offline
+        // Ollama is offline or unavailable.
+      } finally {
+        setModelsLoaded(true);
       }
     }
-    loadModels();
+
+    void loadModels();
   }, []);
+
+  // ----------------------------------------------------------
+  // GENERATION TIMER
+  // ----------------------------------------------------------
 
   useEffect(() => {
     if (!isGenerating) return;
+
     const start = Date.now();
+
     setElapsedSec(0);
+
     const timer = setInterval(() => {
       setElapsedSec(Number(((Date.now() - start) / 1000).toFixed(1)));
     }, 100);
+
     return () => clearInterval(timer);
   }, [isGenerating]);
+
+  // ----------------------------------------------------------
+  // AUTO SCROLL
+  // ----------------------------------------------------------
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isGenerating]);
 
+  // ----------------------------------------------------------
+  // PREVIEW
+  // ----------------------------------------------------------
+
   function handleOpenPreview(code: string, lang: string) {
     if (lang === "css") {
       setPreviewHtml(
-        `<!DOCTYPE html><html><head><style>${code}</style></head><body><div style="padding:24px;font-family:sans-serif">CSS підключено</div></body></html>`
+        `<!DOCTYPE html>
+<html>
+<head>
+<style>${code}</style>
+</head>
+<body>
+<div style="padding:24px;font-family:sans-serif">
+CSS підключено
+</div>
+</body>
+</html>`,
       );
+
       return;
     }
+
     setPreviewHtml(code);
   }
 
+  // ----------------------------------------------------------
+  // SEND MESSAGE
+  // ----------------------------------------------------------
+
   async function handleSend() {
     const prompt = input.trim();
+
     if (!prompt || isGenerating) return;
 
     const userTime = formatNow();
     const startTime = Date.now();
-    const resolvedMode = detectIntent(prompt, modeSetting);
-    const modelToUse = pickModelForMode(resolvedMode, models, selectedModel);
+    const perfT0 = performance.now(); // [perf-diag]
 
-    setMessages((prev) => [
-      ...prev,
-      { role: "user", content: prompt, timestamp: userTime },
+    const resolvedMode = detectIntent(prompt, modeSetting);
+    const requiresModel = resolvedMode !== "image";
+
+    if (requiresModel && !modelsLoaded) return;
+
+    const modelToUse = requiresModel
+      ? pickModelForMode(
+          resolvedMode,
+          models,
+          selectedModel,
+          prompt,
+          modeSetting === "auto",
+        )
+      : "Image Generator";
+
+    if (!modelToUse) return;
+
+    const activeModel = modelToUse;
+    const modelProfile = requiresModel ? getModelProfile(modelToUse) : null;
+
+    if (requiresModel && !modelProfile) return;
+
+    // Add user message and an empty assistant message.
+    setMessages((previous) => [
+      ...previous,
+      {
+        role: "user",
+        content: prompt,
+        timestamp: userTime,
+      },
       {
         role: "assistant",
         content: "",
-        thinking: "",
         modeUsed: resolvedMode,
         modelUsed: modelToUse,
         timestamp: userTime,
@@ -414,10 +1211,16 @@ export function App() {
     setInput("");
     setIsGenerating(true);
 
+    // --------------------------------------------------------
+    // IMAGE MODE PLACEHOLDER
+    // --------------------------------------------------------
+
     if (resolvedMode === "image") {
       const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-      setMessages((prev) => {
-        const updated = [...prev];
+
+      setMessages((previous) => {
+        const updated = [...previous];
+
         updated[updated.length - 1] = {
           role: "assistant",
           modeUsed: "image",
@@ -428,123 +1231,259 @@ export function App() {
             `Запит розпізнано як генерацію зображення: \`${prompt}\`.\n\n` +
             `Генератор зображень підключимо наступним кроком.`,
         };
+
         return updated;
       });
+
       setIsGenerating(false);
       return;
     }
 
-    const shouldThink = resolvedMode === "code" ? allowThinking : false;
+    if (!modelProfile) return;
 
-    const historyMessages = messages.map((m) => ({
-      role: m.role,
-      content: m.content,
+    const userRequestedThinking = resolvedMode === "code" && allowThinking;
+
+    // The installed Pro AI Qwen3 template always opens the assistant turn
+    // inside <think>, even when `think: false` is sent. Request Ollama's
+    // separate thinking channel so that this reasoning is delivered as
+    // `message.thinking` instead of leaking into `message.content`.
+    // Gemma preserves the existing mode-toggle behavior.
+    const shouldUseThinkingChannel =
+      modelProfile === "pro-ai" || userRequestedThinking;
+
+    const historyMessages = messages.map((message) => ({
+      role: message.role,
+      content: message.content,
     }));
 
-    const systemPrompt =
-      resolvedMode === "chat" ? CHAT_SYSTEM_PROMPT : CODE_SYSTEM_PROMPT;
+    // [perf-diag] Metadata only: counts and lengths, never message text.
+    const perfTrace: PerfTrace = {
+      t0: perfT0,
+      model: modelToUse,
+      mode: resolvedMode,
+      modeSetting,
+      modelSelection: selectedModel === "auto" ? "auto" : "manual",
+      profile: modelProfile,
+      thinkingChannel: shouldUseThinkingChannel,
+      historyMessages: historyMessages.length,
+      historyChars: historyMessages.reduce(
+        (total, message) => total + message.content.length,
+        0,
+      ),
+      systemPromptChars: 0,
+      userPromptChars: prompt.length,
+      marks: {},
+      chunks: 0,
+      thinkingChunks: 0,
+      contentChunks: 0,
+      lineFailures: 0,
+      streamError: null,
+      final: null,
+    };
 
-    const apiMessages = [
-      { role: "system" as const, content: systemPrompt },
-      ...historyMessages,
-      { role: "user" as const, content: prompt },
-    ];
+    // --------------------------------------------------------
+    // RUNTIME INSTRUCTIONS + OLLAMA REQUEST
+    // --------------------------------------------------------
 
     try {
+      const runtimeInstructions = await invoke<string>(
+        "get_runtime_instructions",
+        { model: modelProfile },
+      );
+
+      perfMark(perfTrace, "instructions"); // [perf-diag]
+
+      const taskInstructions =
+        resolvedMode === "chat"
+          ? "Виконуй звичайне спілкування та інформаційні завдання. Відповідай природно, прямо й без зайвої багатослівності."
+          : "Виконуй завдання відповідно до запиту. Для програмування використовуй саме потрібну мову, технологію та формат. Не перетворюй кожне завдання на HTML або UI/UX-дизайн.";
+
+      const responseInstructions =
+        "Відповідай мовою останнього повідомлення користувача. Якщо користувач прямо просить переклад, текст або відповідь іншою мовою, виконай саме цю мовну вимогу. Зберігай звичні технічні терміни, коли це покращує зрозумілість. Використовуй стандартний Markdown: не екрануй звичайні розділювачі Markdown у звичайному тексті та не використовуй HTML-сутності для звичайного тексту. Зберігай точний вміст inline-коду й fenced code blocks. Не додавай до відповіді службові елементи інтерфейсу або їхні назви.";
+
+      const systemPrompt =
+        `${runtimeInstructions}\n\n` +
+        `# TASK INSTRUCTIONS\n${taskInstructions}\n\n` +
+        `# RESPONSE INSTRUCTIONS\n${responseInstructions}`;
+
+      perfTrace.systemPromptChars = systemPrompt.length; // [perf-diag]
+
+      const apiMessages = [
+        {
+          role: "system" as const,
+          content: systemPrompt,
+        },
+        ...historyMessages,
+        {
+          role: "user" as const,
+          content: prompt,
+        },
+      ];
+
       const response = await fetch(`${OLLAMA_URL}/api/chat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           model: modelToUse,
           stream: true,
-          think: shouldThink,
+          think: shouldUseThinkingChannel,
           messages: apiMessages,
         }),
       });
 
+      perfMark(perfTrace, "headers"); // [perf-diag]
+
       if (!response.ok || !response.body) {
-        throw new Error(`HTTP ${response.status}`);
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
+
+      // ------------------------------------------------------
+      // STREAM PROCESSING
+      // ------------------------------------------------------
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+
       let buffer = "";
       let rawFull = "";
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      function appendContent(contentChunk: string) {
+        if (!contentChunk) return;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
+        rawFull += contentChunk;
 
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const parsed = JSON.parse(line);
+        const answer = extractAnswer(rawFull);
 
-          const thinkingChunk = parsed.message?.thinking || "";
+        // [perf-diag] First non-empty answer text that reaches the UI.
+        if (answer && perfTrace.marks.firstVisible === undefined) {
+          perfMark(perfTrace, "firstVisible");
+          requestAnimationFrame(() =>
+            requestAnimationFrame(() => perfMark(perfTrace, "firstPaint")),
+          );
+        }
+
+        setMessages((previous) => {
+          const updated = [...previous];
+
+          const lastIndex = updated.length - 1;
+
+          updated[lastIndex] = {
+            ...updated[lastIndex],
+            role: "assistant",
+            content: answer,
+            modeUsed: resolvedMode,
+            modelUsed: activeModel,
+            timestamp: formatNow(),
+          };
+
+          return updated;
+        });
+      }
+
+      function processStreamLine(line: string) {
+        if (!line.trim()) return;
+
+        try {
+          const parsed = JSON.parse(line) as OllamaChatChunk;
+
+          perfObserveChunk(perfTrace, parsed); // [perf-diag]
+
+          // The private thinking channel is intentionally ignored.
+          // Only normal response content is displayed.
           const contentChunk = parsed.message?.content || "";
 
-          if (thinkingChunk) {
-            rawFull = rawFull.includes("<think>")
-              ? rawFull + thinkingChunk
-              : `<think>${thinkingChunk}`;
-          }
-          if (contentChunk) {
-            if (rawFull.includes("<think>") && !rawFull.includes("</think>")) {
-              rawFull += `</think>${contentChunk}`;
-            } else {
-              rawFull += contentChunk;
-            }
-          }
-
-          if (thinkingChunk || contentChunk) {
-            const { thinking, answer } = splitThinking(rawFull);
-
-            setMessages((prev) => {
-              const updated = [...prev];
-              updated[updated.length - 1] = {
-                role: "assistant",
-                content: answer,
-                thinking,
-                modeUsed: resolvedMode,
-                modelUsed: modelToUse,
-                timestamp: formatNow(),
-              };
-              return updated;
-            });
-          }
+          appendContent(contentChunk);
+        } catch {
+          perfTrace.lineFailures += 1; // [perf-diag]
+          // Ignore malformed or incomplete stream fragments.
         }
       }
 
+      while (true) {
+        const { done, value } = await reader.read();
+
+        if (done) break;
+
+        buffer += decoder.decode(value, {
+          stream: true,
+        });
+
+        const lines = buffer.split("\n");
+
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          processStreamLine(line);
+        }
+      }
+
+      // Flush any remaining bytes from the decoder.
+      buffer += decoder.decode();
+
+      // Process the final fragment if it does not end with a newline.
+      if (buffer.trim()) {
+        processStreamLine(buffer);
+      }
+
+      perfMark(perfTrace, "streamEnd"); // [perf-diag]
+      perfLogReport(perfTrace); // [perf-diag]
+
+      // ------------------------------------------------------
+      // FINISH RESPONSE
+      // ------------------------------------------------------
+
       const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-      setMessages((prev) => {
-        const updated = [...prev];
-        updated[updated.length - 1] = {
-          ...updated[updated.length - 1],
+
+      setMessages((previous) => {
+        const updated = [...previous];
+
+        const lastIndex = updated.length - 1;
+
+        updated[lastIndex] = {
+          ...updated[lastIndex],
           timestamp: formatNow(),
           durationSec: totalSec,
         };
+
         return updated;
       });
     } catch (err) {
-      const errMsg = err instanceof Error ? err.message : "Помилка з'єднання з Ollama";
-      setMessages((prev) => {
-        const updated = [...prev];
-        updated[updated.length - 1] = {
+      // ------------------------------------------------------
+      // ERROR HANDLING
+      // ------------------------------------------------------
+
+      const errMsg =
+        err instanceof Error ? err.message : "Помилка з'єднання з Ollama";
+
+      perfLogFailure(perfTrace, errMsg); // [perf-diag]
+
+      setMessages((previous) => {
+        const updated = [...previous];
+
+        const lastIndex = updated.length - 1;
+
+        updated[lastIndex] = {
           role: "assistant",
           modeUsed: resolvedMode,
           modelUsed: modelToUse,
-          content: `Не вдалося отримати відповідь від Ollama (${OLLAMA_URL}): ${errMsg}. Перевір, чи запущена Ollama.`,
+          content:
+            `Не вдалося отримати відповідь від Sonne або Ollama: ${errMsg}. ` +
+            `Перевір підключення та запуск Ollama.`,
           timestamp: formatNow(),
         };
+
         return updated;
       });
     } finally {
       setIsGenerating(false);
     }
   }
+
+  // ==========================================================
+  // RENDER
+  // ==========================================================
 
   return (
     <div className={`sonne-shell ${isGenerating ? "is-generating" : ""}`}>
@@ -559,7 +1498,7 @@ export function App() {
         <div className="header-actions">
           <button
             className="ghost-btn"
-            onClick={() => setAllowThinking((v) => !v)}
+            onClick={() => setAllowThinking((value) => !value)}
             disabled={isGenerating}
             title="Вмикає глибокі роздуми моделі для складних задач"
           >
@@ -569,7 +1508,9 @@ export function App() {
           <select
             className="model-select"
             value={modeSetting}
-            onChange={(e) => setModeSetting(e.target.value as ModeOption)}
+            onChange={(event) =>
+              setModeSetting(event.target.value as ModeOption)
+            }
             disabled={isGenerating}
           >
             <option value="auto">Режим: Авто</option>
@@ -594,13 +1535,14 @@ export function App() {
           <select
             className="model-select"
             value={selectedModel}
-            onChange={(e) => setSelectedModel(e.target.value)}
+            onChange={(event) => setSelectedModel(event.target.value)}
             disabled={isGenerating}
           >
             <option value="auto">Модель: Авто</option>
-            {models.map((m) => (
-              <option key={m} value={m}>
-                {m}
+
+            {models.map((model) => (
+              <option key={model} value={model}>
+                {model}
               </option>
             ))}
           </select>
@@ -613,50 +1555,55 @@ export function App() {
             {messages.length === 0 ? (
               <div className="empty-state">
                 <h2>Привіт, це Sonne</h2>
+
                 <p>
-                  Авторежим сам кидає прості запити на легку модель, а верстку та код — на сильну.
+                  Авторежим сам кидає прості запити на легку модель, а верстку
+                  та код — на сильну.
                 </p>
               </div>
             ) : (
-              messages.map((m, idx) => {
-                const isLastAssistant = isGenerating && idx === messages.length - 1;
+              messages.map((message, index) => {
+                const isLastAssistant =
+                  isGenerating && index === messages.length - 1;
+
                 const assistantLabel =
-                  isLastAssistant && !m.content ? "Sonne думає" : "Sonne";
+                  isLastAssistant && !message.content ? "Sonne думає" : "Sonne";
 
                 return (
-                  <div key={idx} className={`msg ${m.role}`}>
+                  <div key={index} className={`msg ${message.role}`}>
                     <div className="msg-meta">
                       <span className="msg-role-label">
-                        {m.role === "user" ? "Ти" : assistantLabel}
+                        {message.role === "user" ? "Ти" : assistantLabel}
                       </span>
+
                       <span className="msg-time">
-                        {m.timestamp}
-                        {m.durationSec ? ` · ${m.durationSec} с` : ""}
+                        {message.timestamp}
+                        {message.durationSec
+                          ? ` · ${message.durationSec} с`
+                          : ""}
                       </span>
                     </div>
 
-                    {m.role === "user" ? (
-                      <div>{m.content}</div>
+                    {message.role === "user" ? (
+                      <div>{message.content}</div>
                     ) : (
                       <>
-                        {m.thinking && !m.content && (
-                          <ThinkingBlock thinking={m.thinking} isActive={isLastAssistant} />
-                        )}
-
-                        {m.content &&
-                          parseContent(m.content).map((part, pIdx) =>
-                            part.type === "code" ? (
-                              <CodeBlock
-                                key={pIdx}
-                                lang={part.lang}
-                                code={part.code}
-                                onPreview={handleOpenPreview}
-                              />
-                            ) : (
-                              <div key={pIdx} className="prose-text">
-                                {part.value}
-                              </div>
-                            )
+                        {message.content &&
+                          parseContent(message.content).map(
+                            (part, partIndex) =>
+                              part.type === "code" ? (
+                                <CodeBlock
+                                  key={partIndex}
+                                  lang={part.lang}
+                                  code={part.code}
+                                  onPreview={handleOpenPreview}
+                                />
+                              ) : (
+                                <MarkdownText
+                                  content={part.value}
+                                  key={partIndex}
+                                />
+                              ),
                           )}
                       </>
                     )}
@@ -664,6 +1611,7 @@ export function App() {
                 );
               })
             )}
+
             <div ref={bottomRef} />
           </main>
 
@@ -672,18 +1620,19 @@ export function App() {
               <textarea
                 placeholder="Напиши запит... (Enter — надіслати, Shift+Enter — новий рядок)"
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    handleSend();
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    void handleSend();
                   }
                 }}
                 disabled={isGenerating}
               />
+
               <button
                 className="send-btn"
-                onClick={handleSend}
+                onClick={() => void handleSend()}
                 disabled={isGenerating || !input.trim()}
               >
                 {isGenerating ? `${elapsedSec.toFixed(0)} с...` : "Надіслати"}
@@ -696,10 +1645,12 @@ export function App() {
           <aside className="preview-pane">
             <div className="preview-header">
               <span>Live Preview</span>
+
               <button className="mini-btn" onClick={() => setPreviewHtml(null)}>
                 Закрити ✕
               </button>
             </div>
+
             <iframe
               className="preview-frame"
               srcDoc={previewHtml}

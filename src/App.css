@@ -213,6 +213,96 @@ body,
   margin-bottom: 0;
 }
 
+.markdown-text {
+  white-space: normal;
+}
+
+.markdown-text > :not(:last-child) {
+  margin-bottom: 10px;
+}
+
+.markdown-paragraph {
+  margin: 0;
+  white-space: normal;
+}
+
+.markdown-heading {
+  color: #f5f3ff;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.markdown-heading-1 {
+  font-size: 1.3rem;
+}
+
+.markdown-heading-2 {
+  font-size: 1.16rem;
+}
+
+.markdown-heading-3,
+.markdown-heading-4,
+.markdown-heading-5,
+.markdown-heading-6 {
+  font-size: 1.02rem;
+}
+
+.markdown-list {
+  margin: 0;
+  padding-left: 22px;
+}
+
+.markdown-list li + li {
+  margin-top: 4px;
+}
+
+.markdown-quote {
+  margin: 0;
+  padding-left: 12px;
+  border-left: 3px solid rgba(216, 180, 254, 0.72);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
+.markdown-rule {
+  height: 1px;
+  margin: 14px 0;
+  border: 0;
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.markdown-inline-code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(216, 180, 254, 0.14);
+  color: #e9d5ff;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+}
+
+.markdown-table-wrap {
+  overflow-x: auto;
+}
+
+.markdown-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.94em;
+}
+
+.markdown-table th,
+.markdown-table td {
+  padding: 7px 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  text-align: left;
+  vertical-align: top;
+}
+
+.markdown-table th {
+  background: rgba(255, 255, 255, 0.05);
+  color: #f5f3ff;
+}
+
 /* Вікно коду */
 .code-block {
   margin: 10px 0;

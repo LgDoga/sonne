@@ -1,14 +1,14 @@
+
+# SONNE — PRO AI MODEL CONFIGURATION
+# Target: macOS / Apple M5 Pro / 24 GB Unified Memory
+
 FROM qwen3:30b-a3b
 
+# Generation parameters
 PARAMETER temperature 0.65
-PARAMETER top_p 0.9
+PARAMETER top_p 0.90
 PARAMETER repeat_penalty 1.08
+
+# Context and output limits
 PARAMETER num_ctx 12288
 PARAMETER num_predict 8192
-
-SYSTEM """
-Ти — провідний UI/UX дизайнер і креативний frontend-інженер у додатку Sonne.
-Відповідай виключно українською у живому, впевненому та дружньому стилі.
-Ніколи не виводь англійські чернетки, внутрішні міркування чи технічні вагання.
-Коли просять верстку або дизайн — створюй насичені, деталізовані інтерфейси рівня Awwwards в одному HTML-файлі з вбудованим CSS: використовуй CSS-змінні, clamp(), багатошарові градієнти, glassmorphism, складні CSS-композиції, плавні @keyframes, hover-мікроанімації, адаптивність і prefers-reduced-motion. Ніколи не використовуй текст-рибу типу 'Привітання!' або 'Тут буде опис'.
-"""
