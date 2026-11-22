@@ -12,14 +12,23 @@ const Prism = (
 ).Prism;
 
 import "./App.css";
+import {
+  type BackendConfig,
+  type ExecutionBackend,
+  type ModeOption,
+  type ModelProfile,
+  type ResolvedMode,
+  buildChatRequestBody,
+  buildSystemPrompt,
+  detectIntent,
+  getSelectableModels,
+  isSupportedModelName,
+  routeRequest,
+} from "./modelRouting";
 
 // ============================================================
 // TYPES
 // ============================================================
-
-type ModeOption = "auto" | "chat" | "code" | "image";
-type ResolvedMode = "chat" | "code" | "image";
-type ModelProfile = "pro-ai" | "gemma";
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -58,11 +67,6 @@ type OllamaChatChunk = {
 
 const OLLAMA_URL = "http://127.0.0.1:11434";
 
-const MODEL_PROFILES: Record<string, ModelProfile> = {
-  "sonne-gemma:latest": "gemma",
-  "sonne-pro-ai:latest": "pro-ai",
-};
-
 // ============================================================
 // HELPERS
 // ============================================================
@@ -73,137 +77,6 @@ function formatNow(): string {
     minute: "2-digit",
     second: "2-digit",
   });
-}
-
-function detectIntent(prompt: string, modeSetting: ModeOption): ResolvedMode {
-  if (modeSetting !== "auto") return modeSetting;
-
-  const q = prompt.toLowerCase().trim();
-
-  const imageRequests = [
-    "намалюй",
-    "згенеруй картинку",
-    "згенеруй зображення",
-    "зроби картинку",
-    "зроби зображення",
-    "draw",
-    "generate image",
-    "create image",
-    "image of",
-  ];
-
-  if (imageRequests.some((request) => containsTerm(q, request))) {
-    return "image";
-  }
-
-  const formattingRequests = [
-    "markdown",
-    "inline code",
-    "жирний текст",
-    "курсив",
-    "таблиця",
-    "таблицею",
-    "форматування",
-  ];
-
-  if (formattingRequests.some((request) => containsTerm(q, request))) {
-    return "chat";
-  }
-
-  const codeTerms = [
-    "код",
-    "коді",
-    "коду",
-    "кодом",
-    "скрипт",
-    "скрипті",
-    "функція",
-    "функцію",
-    "компонент",
-    "компоненті",
-    "html",
-    "css",
-    "javascript",
-    "typescript",
-    "react",
-    "python",
-    "java",
-    "c++",
-    "sql",
-    "code",
-  ];
-
-  if (codeTerms.some((term) => containsTerm(q, term))) {
-    return "code";
-  }
-
-  if (isComplexTechnicalRequest(q)) {
-    return "code";
-  }
-
-  return "chat";
-}
-
-function containsTerm(text: string, term: string): boolean {
-  const escaped = term.replace(/[.*+?^\${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(
-    `(^|[^\\p{L}\\p{N}_])${escaped}(?=$|[^\\p{L}\\p{N}_])`,
-    "iu",
-  );
-
-  return pattern.test(text);
-}
-
-function isComplexTechnicalRequest(prompt: string): boolean {
-  const complexRequests = [
-    "повноцінну систему авторизації",
-    "архітектуру проєкту",
-    "архітектуру проекту",
-    "рефакторинг багатьох файлів",
-    "рефакторинг кількох файлів",
-    "багатофайлові зміни",
-    "multi-file",
-    "складний дебагінг",
-    "complex debugging",
-    "складний алгоритм",
-    "оптимальний алгоритм",
-  ];
-
-  return complexRequests.some((request) => containsTerm(prompt, request));
-}
-
-function pickModelForMode(
-  resolvedMode: ResolvedMode,
-  availableModels: string[],
-  selectedModel: string,
-  prompt: string,
-  isAutoMode: boolean,
-): string | null {
-  // Manual model selection always has priority.
-  if (selectedModel !== "auto" && availableModels.includes(selectedModel)) {
-    return selectedModel;
-  }
-
-  const gemmaModel = availableModels.find(
-    (model) => getModelProfile(model) === "gemma",
-  );
-  const proModel = availableModels.find(
-    (model) => getModelProfile(model) === "pro-ai",
-  );
-
-  // Explicit code mode preserves its existing Pro AI behavior.
-  if (
-    resolvedMode === "code" &&
-    (!isAutoMode || isComplexTechnicalRequest(prompt))
-  ) {
-    return proModel || gemmaModel || null;
-  }
-
-  return gemmaModel || proModel || null;
-}
-
-function getModelProfile(modelName: string): ModelProfile | null {
-  return MODEL_PROFILES[modelName.trim().toLowerCase()] || null;
 }
 
 /**
@@ -257,6 +130,7 @@ type PerfTrace = {
   modeSetting: ModeOption;
   modelSelection: "auto" | "manual";
   profile: ModelProfile;
+  backend: ExecutionBackend;
   thinkingChannel: boolean;
   historyMessages: number;
   historyChars: number;
@@ -363,6 +237,7 @@ function perfBuildReport(trace: PerfTrace): Record<string, string> {
     mode_setting: trace.modeSetting,
     model_selection: trace.modelSelection,
     profile: trace.profile,
+    backend: trace.backend,
     thinking_channel_requested: String(trace.thinkingChannel),
 
     wall_total: wallMs === undefined ? "N/A" : `${wallMs.toFixed(0)} ms`,
@@ -424,6 +299,7 @@ function perfLogFailure(trace: PerfTrace, message: string): void {
 
   console.warn("[Sonne perf] request failed", {
     model: trace.model,
+    backend: trace.backend,
     mode: trace.mode,
     elapsed: `${(performance.now() - trace.t0).toFixed(0)} ms`,
     time_to_response_headers: perfSince(trace, "headers"),
@@ -1091,7 +967,7 @@ export function App() {
 
         const names: string[] = (data.models || [])
           .map((model: { name: string }) => model.name)
-          .filter((name: string) => getModelProfile(name) !== null);
+          .filter((name: string) => isSupportedModelName(name));
 
         setModels(names);
       } catch {
@@ -1174,22 +1050,48 @@ CSS підключено
 
     if (requiresModel && !modelsLoaded) return;
 
-    const modelToUse = requiresModel
-      ? pickModelForMode(
+    // Profile and execution backend are resolved together. Pro AI has two
+    // backends (Thinking / Instruct); a missing backend is an explicit error,
+    // never a silent substitution.
+    const route = requiresModel
+      ? routeRequest(
           resolvedMode,
           models,
           selectedModel,
           prompt,
           modeSetting === "auto",
+          allowThinking,
         )
-      : "Image Generator";
+      : null;
 
-    if (!modelToUse) return;
+    if (route && !route.ok) {
+      const unavailableText = route.message;
 
+      setMessages((previous) => [
+        ...previous,
+        {
+          role: "user",
+          content: prompt,
+          timestamp: userTime,
+        },
+        {
+          role: "assistant",
+          content: unavailableText,
+          modeUsed: resolvedMode,
+          timestamp: userTime,
+        },
+      ]);
+
+      setInput("");
+      return;
+    }
+
+    const backendConfig: BackendConfig | null = route && route.ok ? route.backend : null;
+    const modelToUse = backendConfig ? backendConfig.ollamaModel : "Image Generator";
     const activeModel = modelToUse;
-    const modelProfile = requiresModel ? getModelProfile(modelToUse) : null;
+    const modelProfile = backendConfig ? backendConfig.profile : null;
 
-    if (requiresModel && !modelProfile) return;
+    if (requiresModel && !backendConfig) return;
 
     // Add user message and an empty assistant message.
     setMessages((previous) => [
@@ -1241,15 +1143,13 @@ CSS підключено
 
     if (!modelProfile) return;
 
-    const userRequestedThinking = resolvedMode === "code" && allowThinking;
+    if (!backendConfig) return;
 
-    // The installed Pro AI Qwen3 template always opens the assistant turn
-    // inside <think>, even when `think: false` is sent. Request Ollama's
-    // separate thinking channel so that this reasoning is delivered as
-    // `message.thinking` instead of leaking into `message.content`.
-    // Gemma preserves the existing mode-toggle behavior.
-    const shouldUseThinkingChannel =
-      modelProfile === "pro-ai" || userRequestedThinking;
+    // The router already applied the Thinking override and resolved `think`
+    // for the chosen backend (Pro Thinking: true, Pro Instruct: false,
+    // Gemma: user-controlled). App.tsx only consumes the result.
+    const userRequestedThinking = route && route.ok ? route.userRequestedThinking : false;
+    const shouldUseThinkingChannel = route && route.ok ? route.think : false;
 
     const historyMessages = messages.map((message) => ({
       role: message.role,
@@ -1264,6 +1164,7 @@ CSS підключено
       modeSetting,
       modelSelection: selectedModel === "auto" ? "auto" : "manual",
       profile: modelProfile,
+      backend: backendConfig.backend,
       thinkingChannel: shouldUseThinkingChannel,
       historyMessages: historyMessages.length,
       historyChars: historyMessages.reduce(
@@ -1293,18 +1194,9 @@ CSS підключено
 
       perfMark(perfTrace, "instructions"); // [perf-diag]
 
-      const taskInstructions =
-        resolvedMode === "chat"
-          ? "Виконуй звичайне спілкування та інформаційні завдання. Відповідай природно, прямо й без зайвої багатослівності."
-          : "Виконуй завдання відповідно до запиту. Для програмування використовуй саме потрібну мову, технологію та формат. Не перетворюй кожне завдання на HTML або UI/UX-дизайн.";
-
-      const responseInstructions =
-        "Відповідай мовою останнього повідомлення користувача. Якщо користувач прямо просить переклад, текст або відповідь іншою мовою, виконай саме цю мовну вимогу. Зберігай звичні технічні терміни, коли це покращує зрозумілість. Використовуй стандартний Markdown: не екрануй звичайні розділювачі Markdown у звичайному тексті та не використовуй HTML-сутності для звичайного тексту. Зберігай точний вміст inline-коду й fenced code blocks. Не додавай до відповіді службові елементи інтерфейсу або їхні назви.";
-
-      const systemPrompt =
-        `${runtimeInstructions}\n\n` +
-        `# TASK INSTRUCTIONS\n${taskInstructions}\n\n` +
-        `# RESPONSE INSTRUCTIONS\n${responseInstructions}`;
+      // Both Pro AI backends receive the same profile instructions and the
+      // same task/response assembly (see buildSystemPrompt).
+      const systemPrompt = buildSystemPrompt(runtimeInstructions, resolvedMode);
 
       perfTrace.systemPromptChars = systemPrompt.length; // [perf-diag]
 
@@ -1325,12 +1217,13 @@ CSS підключено
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          model: modelToUse,
-          stream: true,
-          think: shouldUseThinkingChannel,
-          messages: apiMessages,
-        }),
+        body: JSON.stringify(
+          buildChatRequestBody(
+            backendConfig,
+            apiMessages,
+            userRequestedThinking,
+          ),
+        ),
       });
 
       perfMark(perfTrace, "headers"); // [perf-diag]
@@ -1540,7 +1433,7 @@ CSS підключено
           >
             <option value="auto">Модель: Авто</option>
 
-            {models.map((model) => (
+            {getSelectableModels(models).map((model) => (
               <option key={model} value={model}>
                 {model}
               </option>
