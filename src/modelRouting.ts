@@ -518,6 +518,79 @@ export function isComplexRequest(prompt: string): boolean {
 }
 
 // ------------------------------------------------------------
+
+// ------------------------------------------------------------
+// ROUTER 2.0 — TASK CLASSIFICATION
+// ------------------------------------------------------------
+
+export type TaskType =
+  | "conversation"
+  | "explanation"
+  | "coding"
+  | "analysis"
+  | "planning"
+  | "translation"
+  | "debugging"
+  | "comparison"
+  | "writing";
+
+export type TaskClassification = {
+  type: TaskType;
+};
+
+export function classifyTask(prompt: string): TaskClassification {
+  const q = prompt.toLowerCase().trim();
+
+  if (isTranslationRequest(q)) return { type: "translation" };
+
+  if (
+    /(?:виправ|налагод|знайди помилк|debug|fix the bug|troubleshoot)/iu.test(q)
+  ) {
+    return { type: "debugging" };
+  }
+
+  if (
+    /(?:порівняй|порівняти|compare|contrast|відмінност)/iu.test(q)
+  ) {
+    return { type: "comparison" };
+  }
+
+  if (
+    /(?:спроєктуй|спроектуй|сплануй|спланувати|архітектур|design the architecture|plan the system)/iu.test(q)
+  ) {
+    return { type: "planning" };
+  }
+
+  if (
+    /(?:проаналізуй|аналіз|досліди|оцінити|evaluate|analy[sz]e|investigate)/iu.test(q)
+  ) {
+    return { type: "analysis" };
+  }
+
+  if (
+    /(?:напиши|створи|реалізуй|розроби|write|create|implement|build|develop)/iu.test(q) &&
+    /(?:функці|function|код|code|скрипт|script|компонент|component|модул|module|endpoint|ендпоїнт|api)/iu.test(q)
+  ) {
+    return { type: "coding" };
+  }
+
+  if (
+    /(?:напиши|створи|склади|сформулюй|write|draft|compose)/iu.test(q) &&
+    /(?:лист|повідомлення|статт|опис|есе|cover letter|email|message|article|post)/iu.test(q)
+  ) {
+    return { type: "writing" };
+  }
+
+  if (
+    /(?:поясни|пояснити|як працює|що таке|розкажи про|explain|how does|what is)/iu.test(q) &&
+    (isTechnicalExplanationRequest(q) || /(?:javascript|typescript|react|python|html|css|sql|api|docker|websocket)/iu.test(q))
+  ) {
+    return { type: "explanation" };
+  }
+
+  return { type: "conversation" };
+}
+
 // ROUTING
 // ------------------------------------------------------------
 
