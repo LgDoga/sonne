@@ -551,7 +551,7 @@ const AUTO_UNCHANGED = [
   ["Give me a short explanation of Docker.", "pro-instruct"],
   ["Коротко поясни, що таке Docker", "pro-instruct"],
   ["Design a REST API for a todo list", "pro-instruct"],
-  ["Спроєктуй архітектуру блогу", "gemma"],
+  ["Спроєктуй архітектуру блогу", "pro-instruct"],
   ["Compare frontend and backend", "pro-instruct"],
   ["Optimize this SQL query", "pro-instruct"],
   ["Translate this technical paragraph: the architecture of a multi-model system with a router, shared memory and streaming error recovery.", "gemma"],
