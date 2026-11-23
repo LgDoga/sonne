@@ -31,8 +31,8 @@ export type ContextModelConfig = {
  * automatically, so it can never drift from what Ollama is actually given.
  */
 export const MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
-  // "sonne-gemma:latest": 8192,
-  // "sonne-pro-ai:latest": 12288,
+  "sonne-gemma:latest": 8192,
+  "sonne-pro-ai:latest": 12288,
 };
 
 /** Used for any model without a known window. Equals Ollama's classic default. */
