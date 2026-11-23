@@ -556,18 +556,6 @@ export function classifyTask(prompt: string): TaskClassification {
   }
 
   if (
-    /(?:спроєктуй|спроектуй|сплануй|спланувати|архітектур|design the architecture|plan the system)/iu.test(q)
-  ) {
-    return { type: "planning" };
-  }
-
-  if (
-    /(?:проаналізуй|аналіз|досліди|оцінити|evaluate|analy[sz]e|investigate)/iu.test(q)
-  ) {
-    return { type: "analysis" };
-  }
-
-  if (
     /(?:напиши|створи|реалізуй|розроби|write|create|implement|build|develop)/iu.test(q) &&
     /(?:функці|function|код|code|скрипт|script|компонент|component|модул|module|endpoint|ендпоїнт|api)/iu.test(q)
   ) {
@@ -582,8 +570,23 @@ export function classifyTask(prompt: string): TaskClassification {
   }
 
   if (
+    /(?:спроєктуй|спроектуй|проєктуй|проектуй|сплануй|спланувати|design the architecture|plan the system)/iu.test(q)
+  ) {
+    return { type: "planning" };
+  }
+
+  if (
+    /(?:проаналізуй|аналіз|досліди|оцінити|evaluate|analy[sz]e|investigate)/iu.test(q)
+  ) {
+    return { type: "analysis" };
+  }
+
+  if (
     /(?:поясни|пояснити|як працює|що таке|розкажи про|explain|how does|what is)/iu.test(q) &&
-    (isTechnicalExplanationRequest(q) || /(?:javascript|typescript|react|python|html|css|sql|api|docker|websocket)/iu.test(q))
+    (
+      isTechnicalExplanationRequest(q) ||
+      /(?:javascript|typescript|react|python|html|css|sql|api|docker|websocket|архітектур|мікросервіс|microservice)/iu.test(q)
+    )
   ) {
     return { type: "explanation" };
   }
@@ -687,6 +690,50 @@ export function wantedBackend(
   const profile = wantedProfile(resolvedMode, selectedModel, prompt, isAutoMode);
 
   return profile === "pro-ai" ? chooseProBackend(prompt, allowThinking) : "gemma";
+}
+
+/**
+ * Router 2.0: task-aware backend selection.
+ * Kept separate from wantedBackend() until V2 behavior is verified.
+ */
+export function wantedBackendV2(
+  resolvedMode: ResolvedMode,
+  selectedModel: string,
+  prompt: string,
+  isAutoMode: boolean,
+  allowThinking: boolean,
+): ExecutionBackend {
+  const manual = selectedModel !== "auto"
+    ? getBackendByModelName(selectedModel)
+    : null;
+
+  // Manual model selection always keeps priority.
+  if (manual?.profile === "gemma") return "gemma";
+
+  // Explicit Code mode keeps its existing Pro AI behavior.
+  if (resolvedMode === "code") {
+    return chooseProBackend(prompt, allowThinking);
+  }
+
+  // Explicit non-auto modes do not use automatic task classification.
+  if (!isAutoMode) return manual?.profile === "pro-ai"
+    ? chooseProBackend(prompt, allowThinking)
+    : "gemma";
+
+  const task = classifyTask(prompt).type;
+
+  const proTasks: TaskType[] = [
+    "explanation",
+    "coding",
+    "debugging",
+    "analysis",
+    "planning",
+    "comparison",
+  ];
+
+  if (!proTasks.includes(task)) return "gemma";
+
+  return chooseProBackend(prompt, allowThinking);
 }
 
 export function unavailableMessage(backend: ExecutionBackend): string {
