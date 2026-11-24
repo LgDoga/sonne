@@ -47,6 +47,8 @@ type ChatMessage = {
   modelUsed?: string;
   timestamp: string;
   durationSec?: string;
+  includeInHistory?: boolean;
+  turnId?: number;
 };
 
 type MessagePart =
@@ -1161,9 +1163,11 @@ CSS підключено
         role: "user",
         content: prompt,
         timestamp: userTime,
+        turnId: generationId,
       },
       {
         id: generationId,
+        turnId: generationId,
         role: "assistant",
         content: "",
         modeUsed: resolvedMode,
@@ -1217,10 +1221,12 @@ CSS підключено
 
     // Full stored conversation (UI state is never modified). Only the model
     // input is reduced, later, by selectHistory().
-    const fullHistory = messages.map((message) => ({
-      role: message.role,
-      content: message.content,
-    }));
+    const fullHistory = messages
+      .filter((message) => message.includeInHistory === true)
+      .map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
 
     // [perf-diag] Metadata only: counts and lengths, never message text.
     const perfTrace: PerfTrace = {
@@ -1255,20 +1261,23 @@ CSS підключено
     let animationFrame: number | null = null;
 
     function updateAssistant(update: Partial<ChatMessage>) {
-      setMessages((previous) => {
-        const assistantIndex = previous.findIndex(
-          (message) => message.id === generationId,
-        );
+      setMessages((previous) =>
+        previous.map((message) => {
+          if (message.id === generationId) {
+            return { ...message, ...update };
+          }
 
-        if (assistantIndex === -1) return previous;
+          if (
+            update.includeInHistory === true &&
+            message.role === "user" &&
+            message.turnId === generationId
+          ) {
+            return { ...message, includeInHistory: true };
+          }
 
-        const updated = [...previous];
-        updated[assistantIndex] = {
-          ...updated[assistantIndex],
-          ...update,
-        };
-        return updated;
-      });
+          return message;
+        }),
+      );
     }
 
     function flushPendingContent() {
@@ -1325,6 +1334,10 @@ CSS підключено
         { model: modelProfile },
       );
 
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        return;
+      }
+
       perfMark(perfTrace, "instructions"); // [perf-diag]
 
       // Both Pro AI backends receive the same profile instructions and the
@@ -1352,8 +1365,11 @@ CSS підключено
       if (contextSelection.stats.status === "fixed-content-exceeds-budget") {
         console.warn(
           "[Sonne context] system prompt + current message exceed the estimated input budget; sent without history, not truncated.",
+          contextSelection.stats,
         );
       }
+
+
 
       const apiMessages = [
         {
@@ -1380,6 +1396,11 @@ CSS підключено
       perfMark(perfTrace, "headers"); // [perf-diag]
 
       activeGeneration.request = activeRequest;
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        activeRequest.abort();
+        throw new DOMException("Generation cancelled", "AbortError");
+      }
 
       // ------------------------------------------------------
       // STREAM PROCESSING
@@ -1437,6 +1458,7 @@ CSS підключено
       updateAssistant({
         timestamp: formatNow(),
         durationSec: totalSec,
+        includeInHistory: true,
       });
     } catch (err) {
       // ------------------------------------------------------

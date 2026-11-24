@@ -174,30 +174,17 @@ export function detectIntent(
     return "chat";
   }
 
-  const codeTerms = [
-    "код",
-    "коді",
-    "коду",
-    "кодом",
-    "скрипт",
-    "скрипті",
-    "функція",
-    "функцію",
-    "компонент",
-    "компоненті",
-    "html",
-    "css",
-    "javascript",
-    "typescript",
-    "react",
-    "python",
-    "java",
-    "c++",
-    "sql",
-    "code",
-  ];
+  const task = classifyTask(q).type;
 
-  if (codeTerms.some((term) => containsTerm(q, term))) {
+  const explainsCode =
+    task === "explanation" &&
+    /(?:цей|цей\s+самий|наведен\p{L}*)\s+код|код(?:у)?\s+(?:на|мовою)|(?:this|the|following)\s+(?:code|snippet)|code\s+snippet/iu.test(q);
+
+  if (
+    task === "coding" ||
+    task === "debugging" ||
+    explainsCode
+  ) {
     return "code";
   }
 
@@ -267,7 +254,7 @@ const TRANSLATION_PATTERN = new RegExp(
 const SOFTWARE_AUTHORING_PATTERN = new RegExp(
   `${WORD_START}(?:напиш|написа|створ|реаліз|розроб|write|create|implement|build|develop)` +
     `\\p{L}*[^.!?\\n]{0,60}?` +
-    `(?<artifact>функці|function|скрипт|script|компонент|component|модул|module|` +
+    `(?<artifact>функці|function|скрипт|(?<!\\p{L})script(?!\\p{L})|компонент|component|модул|module|` +
     `бібліотек|librar|endpoint|ендпоїнт|(?:api|код|коду|code)${WORD_END})`,
   "iu",
 );
@@ -337,7 +324,15 @@ export function isTechnicalExplanationRequest(prompt: string): boolean {
 
   if (isTranslationRequest(q)) return false;
 
-  return TECHNICAL_TERMS.some((term) => containsTerm(q, term));
+  const clauses = q.split(/(?<=[.!?;])\s+|\n+/u);
+
+  return clauses.some((clause) => {
+    const asksForExplanation =
+      /(?:^|[^\p{L}\p{N}_])(?:explain|explanation|describe|how does|how do|how is|what is|what are|why does|why is|поясни\p{L}*|розкажи\p{L}*|як працює|як працюють|що таке|чому|яка різниця|чим\p{L}*.{0,80}?відрізняється)(?=$|[^\p{L}\p{N}_])/u.test(clause);
+
+    return asksForExplanation &&
+      TECHNICAL_TERMS.some((term) => containsTerm(clause, term));
+  });
 }
 
 /**
@@ -578,7 +573,8 @@ export function classifyTask(prompt: string): TaskClassification {
   }
 
   if (
-    /(?:спроєктуй|спроектуй|проєктуй|проектуй|сплануй|спланувати|design the architecture|plan the system)/iu.test(q)
+    /(?:спроєктуй|спроектуй|проєктуй|проектуй|сплануй|спланувати|design|architect|plan the system)/iu.test(q) &&
+    /(?:api|архітектур|architecture|system|систем|database|баз[а-яіїєґ]* даних|backend|бекенд|інфраструктур|infrastructure|pipeline|пайплайн|компонент|component|модул|module)/iu.test(q)
   ) {
     return { type: "planning" };
   }

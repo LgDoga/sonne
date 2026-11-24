@@ -38,6 +38,10 @@ function createAbortableFetch(
     sdkSignal?.addEventListener("abort", abort, { once: true });
     registerCleanup(cleanup);
 
+    if (signal.aborted || sdkSignal?.aborted) {
+      abort();
+    }
+
     try {
       return await fetch(input, { ...init, signal: controller.signal });
     } catch (error) {
