@@ -1,5 +1,8 @@
-import { MarkdownText, parseContent } from "./components/MarkdownText";
-import CodeBlock from "./components/CodeBlock";
+import LivePreview from "./components/LivePreview";
+import EmptyState from "./components/EmptyState";
+import ChatHeader from "./components/ChatHeader";
+import ChatInput from "./components/ChatInput";
+import ChatMessageItem, { type ChatMessage } from "./components/ChatMessage";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "prismjs";
@@ -23,7 +26,6 @@ import {
   buildChatRequestBody,
   buildSystemPrompt,
   detectIntent,
-  getSelectableModels,
   isSupportedModelName,
   routeRequest,
 } from "./modelRouting";
@@ -41,17 +43,7 @@ import {
 // TYPES
 // ============================================================
 
-type ChatMessage = {
-  id?: number;
-  role: "user" | "assistant";
-  content: string;
-  modeUsed?: ResolvedMode;
-  modelUsed?: string;
-  timestamp: string;
-  durationSec?: string;
-  includeInHistory?: boolean;
-  turnId?: number;
-};
+
 
 type OllamaChatChunk = {
   message?: {
@@ -461,6 +453,9 @@ export function App() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState<string>("");
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [modelActivity, setModelActivity] = useState<{
+    model: string; profile: string; backend: string; thinking: boolean;
+  } | null>(null);
   const [elapsedSec, setElapsedSec] = useState<number>(0);
   const [previewHtml, setPreviewHtml] = useState<string | null>(null);
 
@@ -637,6 +632,14 @@ CSS підключено
     const modelToUse = backendConfig ? backendConfig.ollamaModel : "Image Generator";
     const activeModel = modelToUse;
     const modelProfile = backendConfig ? backendConfig.profile : null;
+    if (backendConfig && route && route.ok) {
+      setModelActivity({
+        model: backendConfig.ollamaModel,
+        profile: backendConfig.profile,
+        backend: backendConfig.backend,
+        thinking: Boolean(route.think),
+      });
+    }
 
     if (requiresModel && !backendConfig) return;
 
@@ -998,185 +1001,58 @@ CSS підключено
     <div className={`sonne-shell ${isGenerating ? "is-generating" : ""}`}>
       <div className="ambient-layer" />
 
-      <header className="sonne-header">
-        <div className="brand-wrap">
-          <span className="brand-dot" />
-          <span className="brand-title">Sonne</span>
-        </div>
-
-        <div className="header-actions">
-          <button
-            className="ghost-btn"
-            onClick={() => setAllowThinking((value) => !value)}
-            disabled={isGenerating}
-            title="Вмикає глибокі роздуми моделі для складних задач"
-          >
-            {allowThinking ? "Думати: УВІМК" : "Думати: ВИМК"}
-          </button>
-
-          <select
-            className="model-select"
-            value={modeSetting}
-            onChange={(event) =>
-              setModeSetting(event.target.value as ModeOption)
-            }
-            disabled={isGenerating}
-          >
-            <option value="auto">Режим: Авто</option>
-            <option value="chat">Режим: Чат</option>
-            <option value="code">Режим: Код</option>
-            <option value="image">Режим: Зображення</option>
-          </select>
-
-          {messages.length > 0 && (
-            <button
-              className="ghost-btn"
-              onClick={() => {
-                setMessages([]);
-                setPreviewHtml(null);
-              }}
-              disabled={isGenerating}
-            >
-              Новий чат
-            </button>
-          )}
-
-          <select
-            className="model-select"
-            value={selectedModel}
-            onChange={(event) => setSelectedModel(event.target.value)}
-            disabled={isGenerating}
-          >
-            <option value="auto">Модель: Авто</option>
-
-            {getSelectableModels(models).map((model) => (
-              <option key={model} value={model}>
-                {model}
-              </option>
-            ))}
-          </select>
-        </div>
-      </header>
+      <ChatHeader
+        models={models}
+        selectedModel={selectedModel}
+        onSelectedModelChange={setSelectedModel}
+        modeSetting={modeSetting}
+        onModeSettingChange={setModeSetting}
+        allowThinking={allowThinking}
+        onToggleThinking={() => setAllowThinking((value) => !value)}
+        messagesLength={messages.length}
+        onNewChat={() => {
+          setMessages([]);
+          setPreviewHtml(null);
+        }}
+        isGenerating={isGenerating}
+        modelActivity={modelActivity}
+        elapsedSec={elapsedSec}
+      />
 
       <div className="sonne-workspace">
         <div className="chat-pane">
           <main className="sonne-messages">
             {messages.length === 0 ? (
-              <div className="empty-state">
-                <h2>Привіт, це Sonne</h2>
-
-                <p>
-                  Авторежим сам кидає прості запити на легку модель, а верстку
-                  та код — на сильну.
-                </p>
-              </div>
+              <EmptyState />
             ) : (
-              messages.map((message, index) => {
-                const isLastAssistant =
-                  isGenerating && index === messages.length - 1;
-
-                const assistantLabel =
-                  isLastAssistant && !message.content ? "Sonne думає" : "Sonne";
-
-                return (
-                  <div key={index} className={`msg ${message.role}`}>
-                    <div className="msg-meta">
-                      <span className="msg-role-label">
-                        {message.role === "user" ? "Ти" : assistantLabel}
-                      </span>
-
-                      <span className="msg-time">
-                        {message.timestamp}
-                        {message.durationSec
-                          ? ` · ${message.durationSec} с`
-                          : ""}
-                      </span>
-                    </div>
-
-                    {message.role === "user" ? (
-                      <div>{message.content}</div>
-                    ) : (
-                      <>
-                        {message.content &&
-                          parseContent(message.content).map(
-                            (part, partIndex) =>
-                              part.type === "code" ? (
-                                <CodeBlock
-                                  key={partIndex}
-                                  lang={part.lang}
-                                  code={part.code}
-                                  onPreview={handleOpenPreview}
-                                
-                                  highlightCode={highlightCode}
-/>
-                              ) : (
-                                <MarkdownText
-                                  content={part.value}
-                                  key={partIndex}
-                                />
-                              ),
-                          )}
-                      </>
-                    )}
-                  </div>
-                );
-              })
+              messages.map((message, index) => (
+                <ChatMessageItem
+                  key={index}
+                  message={message}
+                  index={index}
+                  totalMessages={messages.length}
+                  isGenerating={isGenerating}
+                  onPreview={handleOpenPreview}
+                  highlightCode={highlightCode}
+                />
+              ))
             )}
 
             <div ref={bottomRef} />
           </main>
 
-          <div className="sonne-input-wrap">
-            <div className="input-box">
-              <textarea
-                placeholder="Напиши запит... (Enter — надіслати, Shift+Enter — новий рядок)"
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" && !event.shiftKey) {
-                    event.preventDefault();
-                    void handleSend();
-                  }
-                }}
-                disabled={isGenerating}
-              />
-
-              <button
-                className="send-btn"
-                onClick={() => {
-                  if (isGenerating) {
-                    handleStopGeneration();
-                  } else {
-                    void handleSend();
-                  }
-                }}
-                disabled={!isGenerating && !input.trim()}
-              >
-                {isGenerating
-                  ? `Зупинити · ${elapsedSec.toFixed(0)} с`
-                  : "Надіслати"}
-              </button>
-            </div>
-          </div>
+          <ChatInput
+            input={input}
+            onInputChange={setInput}
+            isGenerating={isGenerating}
+            elapsedSec={elapsedSec}
+            onSend={handleSend}
+            onStop={handleStopGeneration}
+          />
         </div>
 
         {previewHtml !== null && (
-          <aside className="preview-pane">
-            <div className="preview-header">
-              <span>Live Preview</span>
-
-              <button className="mini-btn" onClick={() => setPreviewHtml(null)}>
-                Закрити ✕
-              </button>
-            </div>
-
-            <iframe
-              className="preview-frame"
-              srcDoc={previewHtml}
-              sandbox="allow-scripts"
-              title="Live Preview"
-            />
-          </aside>
+          <LivePreview html={previewHtml} onClose={() => setPreviewHtml(null)} />
         )}
       </div>
     </div>

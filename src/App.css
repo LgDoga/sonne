@@ -576,3 +576,125 @@ body,
   max-height: 220px;
   overflow-y: auto;
 }
+
+
+/* Model activity */
+.model-activity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.activity-indicator {
+  flex: 0 0 8px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #77717f;
+}
+
+.model-activity.is-active .activity-indicator {
+  background: #c92188;
+  box-shadow: 0 0 12px rgba(201, 33, 136, 0.75);
+  animation: model-activity-pulse 1.4s ease-in-out infinite;
+}
+
+.activity-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.activity-model {
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.activity-details,
+.activity-status {
+  color: rgba(255, 255, 255, 0.52);
+  font-size: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-status {
+  margin-left: auto;
+  padding-left: 8px;
+}
+
+@keyframes model-activity-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.78); }
+}
+
+@media (max-width: 760px) {
+  .model-activity {
+    gap: 7px;
+    padding: 7px 9px;
+  }
+
+  .activity-status {
+    display: none;
+  }
+}
+
+
+/* Text generation indicator */
+.generation-indicator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: fit-content;
+  margin-top: 14px;
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 12px;
+}
+
+.generation-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.generation-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #c92188;
+  animation: generation-dot 1.2s ease-in-out infinite;
+}
+
+.generation-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.generation-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes generation-dot {
+  0%, 60%, 100% {
+    opacity: 0.3;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .generation-dots span {
+    animation: none;
+    opacity: 0.8;
+  }
+}
