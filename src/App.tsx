@@ -1,4 +1,5 @@
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import CodeBlock from "./components/CodeBlock";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "prismjs";
 
@@ -910,58 +911,6 @@ function highlightCode(code: string, lang: string): string {
 // CODE BLOCK COMPONENT
 // ============================================================
 
-function CodeBlock({
-  lang,
-  code,
-  onPreview,
-}: {
-  lang: string;
-  code: string;
-  onPreview: (code: string, lang: string) => void;
-}) {
-  const [copied, setCopied] = useState(false);
-
-  const highlighted = useMemo(() => highlightCode(code, lang), [code, lang]);
-
-  const canPreview = ["html", "markup", "svg", "css"].includes(lang);
-
-  async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(code);
-      setCopied(true);
-
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard access may be unavailable.
-    }
-  }
-
-  return (
-    <div className="code-block">
-      <div className="code-header">
-        <span className="code-lang">{lang}</span>
-
-        <div className="code-btns">
-          {canPreview && (
-            <button className="mini-btn" onClick={() => onPreview(code, lang)}>
-              Прев'ю
-            </button>
-          )}
-
-          <button className="mini-btn" onClick={handleCopy}>
-            {copied ? "Скопійовано ✓" : "Копіювати"}
-          </button>
-        </div>
-      </div>
-
-      <pre>
-        <code dangerouslySetInnerHTML={{ __html: highlighted }} />
-      </pre>
-    </div>
-  );
-}
-
-// ============================================================
 // MAIN APP
 // ============================================================
 
@@ -1619,7 +1568,9 @@ CSS підключено
                                   lang={part.lang}
                                   code={part.code}
                                   onPreview={handleOpenPreview}
-                                />
+                                
+                                  highlightCode={highlightCode}
+/>
                               ) : (
                                 <MarkdownText
                                   content={part.value}
