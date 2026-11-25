@@ -1,7 +1,14 @@
+import { copyText } from "./clipboard";
 import LivePreview from "./components/LivePreview";
+import FilePreviewPane from "./components/FilePreviewPane";
 import EmptyState from "./components/EmptyState";
 import ChatHeader from "./components/ChatHeader";
 import ChatInput from "./components/ChatInput";
+import type { AttachmentReference } from "./components/FileAttachments";
+import type { ArchiveContextItem } from "./components/ArchiveBrowser";
+import { EXTRACTOR_ID, EXTRACTOR_VERSION, loadStoredAttachment } from "./fileReader";
+import { generateDocumentSummary } from "./documentSummaries";
+// Вміст вкладень береться зі збереженого індексу SQLite.
 import ChatMessageItem, { type ChatMessage } from "./components/ChatMessage";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -19,6 +26,7 @@ const Prism = (
 import "./App.css";
 import {
   type BackendConfig,
+  type ChatMessageBody,
   type ExecutionBackend,
   type ModeOption,
   type ModelProfile,
@@ -31,10 +39,12 @@ import {
 } from "./modelRouting";
 import {
   createChatStream,
+  createEmbeddings,
   type ActiveOllamaChatStream,
 } from "./ollamaClient";
 import {
   type ContextStats,
+  estimateMessageTokens,
   resolveContextBudget,
   selectHistory,
 } from "./contextManager";
@@ -452,6 +462,99 @@ export function App() {
   const [allowThinking, setAllowThinking] = useState<boolean>(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState<string>("");
+  const [attachments, setAttachments] = useState<AttachmentReference[]>([]);
+  const [selectedAttachmentId, setSelectedAttachmentId] = useState<string | null>(null);
+  const [archiveContextFiles, setArchiveContextFiles] = useState<ArchiveContextItem[]>([]);
+  const [chatId, setChatId] = useState<string>("");
+
+  useEffect(() => {
+    let active = true;
+    const startupSession = chatSessionRef.current;
+
+    async function restoreChat() {
+      try {
+        const chats = await invoke<Array<{
+          id: string;
+          title: string;
+          createdAt: number;
+          updatedAt: number;
+        }>>("list_chats");
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+
+        if (chats.length === 0) {
+          const chat = await invoke<{ id: string }>("create_chat", {
+            title: "Новий чат",
+          });
+          if (!active || startupSession !== chatSessionRef.current) return;
+          setChatId(chat.id);
+          return;
+        }
+
+        const latestChat = chats[0];
+        if (!active || startupSession !== chatSessionRef.current) return;
+        setChatId(latestChat.id);
+
+        const [storedMessages, composerAttachments] = await Promise.all([
+          invoke<Array<{
+            id: string;
+            chatId: string;
+            role: "user" | "assistant" | "system";
+            content: string;
+            promptContent: string | null;
+            modelUsed: string | null;
+            modeUsed: string | null;
+            createdAt: number;
+          }>>("list_messages", { chatId: latestChat.id }),
+          invoke<AttachmentReference[]>("list_composer_attachments", {
+            chatId: latestChat.id,
+          }),
+        ]);
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+
+        const restoredMessages = await Promise.all(
+          storedMessages
+            .filter((message) => message.role !== "system")
+            .map(async (message): Promise<ChatMessage> => {
+              const messageAttachments = await invoke<AttachmentReference[]>(
+                "list_message_attachments",
+                { messageId: message.id },
+              );
+
+              return {
+                dbId: message.id,
+                role: message.role as "user" | "assistant",
+                content: message.content,
+                promptContent: message.promptContent ?? undefined,
+                modelUsed: message.modelUsed ?? undefined,
+                modeUsed: (message.modeUsed ?? undefined) as ResolvedMode | undefined,
+                attachments: messageAttachments,
+                timestamp: new Date(message.createdAt).toLocaleTimeString("uk-UA", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  second: "2-digit",
+                }),
+                includeInHistory: true,
+              };
+            }),
+        );
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+        setMessages(restoredMessages);
+        setAttachments(composerAttachments);
+      } catch (error) {
+        console.error("Не вдалося відновити історію чату:", error);
+      }
+    }
+
+    void restoreChat();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+  const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null);
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [modelActivity, setModelActivity] = useState<{
     model: string; profile: string; backend: string; thinking: boolean;
@@ -460,6 +563,8 @@ export function App() {
   const [previewHtml, setPreviewHtml] = useState<string | null>(null);
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
+  const sendLockRef = useRef(false);
+  const chatSessionRef = useRef(0);
   const activeGenerationRef = useRef<ActiveGeneration | null>(null);
   const generationIdRef = useRef(0);
 
@@ -564,14 +669,52 @@ CSS підключено
 
   function handleStopGeneration() {
     const active = activeGenerationRef.current;
-
     if (!active) return;
 
-    active.flush();
+    try {
+      active.flush();
+    } catch (error) {
+      console.error("[Sonne] Помилка фінального flush під час скасування:", error);
+    }
+
     active.cancelled = true;
     active.controller.abort();
-    active.request?.abort();
+
+    try {
+      active.request?.abort();
+    } catch (error) {
+      console.error("[Sonne] Помилка abort Ollama request:", error);
+    }
+
     setIsGenerating(false);
+  }
+
+  async function handleCopy(content: string) {
+    try {
+      await copyText(content);
+    } catch (error) {
+      console.error("[Sonne] Не вдалося скопіювати повідомлення:", error);
+    }
+  }
+
+  function handleEdit(index: number) {
+    if (isGenerating) handleStopGeneration();
+
+    const message = messages[index];
+    if (!message || message.role !== "user") return;
+
+    const attachmentLabel = message.attachments?.length
+      ? `\n\n📎 ${message.attachments.map((file) => file.fileName).join(", ")}`
+      : "";
+
+    const editableContent =
+      attachmentLabel && message.content.endsWith(attachmentLabel)
+        ? message.content.slice(0, -attachmentLabel.length)
+        : message.content;
+
+    setInput(editableContent);
+    setAttachments([...(message.attachments ?? [])]);
+    setEditingMessageIndex(index);
   }
 
   // ----------------------------------------------------------
@@ -579,7 +722,28 @@ CSS підключено
   // ----------------------------------------------------------
 
   async function handleSend() {
-    const prompt = input.trim();
+    if (sendLockRef.current) return;
+
+    sendLockRef.current = true;
+
+    try {
+      await handleSendInternal();
+    } finally {
+      sendLockRef.current = false;
+    }
+  }
+
+  async function handleSendInternal() {
+    const sendSession = chatSessionRef.current;
+    const isEditing = editingMessageIndex !== null;
+    const baseMessages = isEditing
+      ? messages.slice(0, editingMessageIndex)
+      : messages;
+    const attachmentFiles = [...attachments];
+    const archiveFiles = [...archiveContextFiles];
+    const prompt = input.trim() || (attachmentFiles.length || archiveFiles.length
+      ? "Проаналізуй прикріплені файли та вибраний вміст архівів і надай змістовну відповідь."
+      : "");
 
     if (!prompt || isGenerating) return;
 
@@ -609,15 +773,63 @@ CSS підключено
     if (route && !route.ok) {
       const unavailableText = route.message;
 
-      setMessages((previous) => [
-        ...previous,
+      if (!chatId) {
+        console.error("Чат ще не ініціалізовано.");
+        return;
+      }
+
+      let rewindMessageId: string | null = null;
+      if (isEditing) {
+        const editedMessage = messages[editingMessageIndex!];
+        if (!editedMessage?.dbId) {
+          console.error("Не вдалося визначити повідомлення для редагування.");
+          return;
+        }
+        rewindMessageId = editedMessage.dbId;
+      }
+
+      const contextLabels = [
+        ...attachmentFiles.map((file) => file.fileName),
+        ...archiveFiles.map((file) => file.name),
+      ];
+      const userContent = prompt + (contextLabels.length
+        ? `
+
+📎 ${contextLabels.join(", ")}`
+        : "");
+
+      const startedTurn = await invoke<{
+        userMessage: { id: string };
+        assistantMessage: { id: string };
+        attachments: AttachmentReference[];
+      }>("start_turn", {
+        chatId,
+        rewindMessageId,
+        userContent,
+        promptContent: prompt,
+        assistantContent: unavailableText,
+        assistantModel: null,
+        assistantMode: resolvedMode,
+      });
+
+      if (sendSession !== chatSessionRef.current) return;
+      const savedUser = startedTurn.userMessage;
+      const savedAssistant = startedTurn.assistantMessage;
+      const promotedAttachments = startedTurn.attachments;
+
+      setMessages([
+        ...baseMessages,
         {
           role: "user",
-          content: prompt,
+          dbId: savedUser.id,
+          content: userContent,
+          promptContent: prompt,
+          attachments: promotedAttachments,
           timestamp: userTime,
         },
         {
           role: "assistant",
+          dbId: savedAssistant.id,
           content: unavailableText,
           modeUsed: resolvedMode,
           timestamp: userTime,
@@ -625,6 +837,9 @@ CSS підключено
       ]);
 
       setInput("");
+      setAttachments([]);
+      setArchiveContextFiles([]);
+      setEditingMessageIndex(null);
       return;
     }
 
@@ -646,54 +861,107 @@ CSS підключено
     const generationId = requiresModel ? ++generationIdRef.current : undefined;
     const generationController = requiresModel ? new AbortController() : null;
 
+    if (!chatId) {
+      console.error("Чат ще не ініціалізовано.");
+      return;
+    }
+
+    let rewindMessageId: string | null = null;
+    if (isEditing) {
+      const editedMessage = messages[editingMessageIndex!];
+      if (!editedMessage?.dbId) {
+        console.error("Не вдалося визначити повідомлення для редагування.");
+        return;
+      }
+      rewindMessageId = editedMessage.dbId;
+    }
+
+      // Validate text-generation dependencies before creating the SQLite turn.
+      if (
+        resolvedMode !== "image" &&
+        (!modelProfile || !backendConfig || !generationController || generationId === undefined)
+      ) {
+        console.error("Не вдалося підготувати текстову генерацію: відсутні параметри моделі.");
+        return;
+      }
+
+    const contextLabels = [
+      ...attachmentFiles.map((file) => file.fileName),
+      ...archiveFiles.map((file) => file.name),
+    ];
+    const userContent = prompt + (contextLabels.length
+      ? `
+
+📎 ${contextLabels.join(", ")}`
+      : "");
+
+    const imageUnavailableText =
+      "Режим генерації зображень поки не підключений. Запит збережено; " +
+      "реальну генерацію додамо після інтеграції рушія.";
+
+    const startedTurn = await invoke<{
+      userMessage: { id: string };
+      assistantMessage: { id: string };
+      attachments: AttachmentReference[];
+    }>("start_turn", {
+      chatId,
+      rewindMessageId,
+      userContent,
+      promptContent: prompt,
+      assistantContent: resolvedMode === "image" ? imageUnavailableText : "",
+      assistantModel: resolvedMode === "image" ? null : modelToUse,
+      assistantMode: resolvedMode,
+    });
+
+    if (sendSession !== chatSessionRef.current) return;
+    const savedUser = startedTurn.userMessage;
+    const savedAssistant = startedTurn.assistantMessage;
+    const promotedAttachments = startedTurn.attachments;
+
     // Add user message and an empty assistant message.
-    setMessages((previous) => [
-      ...previous,
+    setMessages([
+      ...baseMessages,
       {
         role: "user",
-        content: prompt,
+        dbId: savedUser.id,
+        content: userContent,
+        promptContent: prompt,
+        attachments: promotedAttachments,
         timestamp: userTime,
         turnId: generationId,
       },
       {
         id: generationId,
+        dbId: savedAssistant.id,
         turnId: generationId,
         role: "assistant",
-        content: "",
+        content: resolvedMode === "image" ? imageUnavailableText : "",
         modeUsed: resolvedMode,
-        modelUsed: modelToUse,
+        modelUsed: resolvedMode === "image" ? undefined : modelToUse,
         timestamp: userTime,
       },
     ]);
 
     setInput("");
-    setIsGenerating(true);
+    setAttachments([]);
+    setArchiveContextFiles([]);
+    setEditingMessageIndex(null);
 
     // --------------------------------------------------------
-    // IMAGE MODE PLACEHOLDER
+    // IMAGE MODE — GENERATOR NOT CONNECTED
     // --------------------------------------------------------
 
     if (resolvedMode === "image") {
-      const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
-
       setMessages((previous) => {
         const updated = [...previous];
-
         updated[updated.length - 1] = {
           role: "assistant",
           modeUsed: "image",
-          modelUsed: "Image Generator",
           timestamp: formatNow(),
-          durationSec: totalSec,
-          content:
-            `Запит розпізнано як генерацію зображення: \`${prompt}\`.\n\n` +
-            `Генератор зображень підключимо наступним кроком.`,
+          content: imageUnavailableText,
         };
-
         return updated;
       });
-
-      setIsGenerating(false);
       return;
     }
 
@@ -703,6 +971,8 @@ CSS підключено
 
     if (!generationController || generationId === undefined) return;
 
+    setIsGenerating(true);
+
     // The router already applied the Thinking override and resolved `think`
     // for the chosen backend (Pro Thinking: true, Pro Instruct: false,
     // Gemma: user-controlled). App.tsx only consumes the result.
@@ -711,11 +981,11 @@ CSS підключено
 
     // Full stored conversation (UI state is never modified). Only the model
     // input is reduced, later, by selectHistory().
-    const fullHistory = messages
+    const fullHistory = baseMessages
       .filter((message) => message.includeInHistory === true)
       .map((message) => ({
         role: message.role,
-        content: message.content,
+        content: message.promptContent ?? message.content,
       }));
 
     // [perf-diag] Metadata only: counts and lengths, never message text.
@@ -751,6 +1021,7 @@ CSS підключено
     let animationFrame: number | null = null;
 
     function updateAssistant(update: Partial<ChatMessage>) {
+      if (sendSession !== chatSessionRef.current) return;
       setMessages((previous) =>
         previous.map((message) => {
           if (message.id === generationId) {
@@ -813,6 +1084,20 @@ CSS підключено
     };
 
     activeGenerationRef.current = activeGeneration;
+    async function persistAssistantMessage(content: string) {
+      try {
+        await invoke("update_message", {
+          messageId: savedAssistant.id,
+          content,
+          promptContent: null,
+          modelUsed: modelToUse,
+          modeUsed: resolvedMode,
+        });
+      } catch (error) {
+        console.error("[Sonne] Не вдалося зберегти відповідь у SQLite:", error);
+      }
+    }
+
 
     // --------------------------------------------------------
     // RUNTIME INSTRUCTIONS + OLLAMA REQUEST
@@ -825,7 +1110,7 @@ CSS підключено
       );
 
       if (activeGeneration.cancelled || generationController.signal.aborted) {
-        return;
+        throw new DOMException("Generation cancelled", "AbortError");
       }
 
       perfMark(perfTrace, "instructions"); // [perf-diag]
@@ -836,12 +1121,251 @@ CSS підключено
 
       perfTrace.systemPromptChars = systemPrompt.length; // [perf-diag]
 
-      // Context Budget + Smart History: choose what part of the stored
-      // conversation the model receives. Token numbers are estimates.
+      // SQLite transaction is the source of truth: process exactly the
+      // attachments promoted into this message by start_turn.
+      const attachmentResults: Array<{
+        name: string;
+        format: string;
+        content: string;
+      }> = [];
+
+      if (promotedAttachments.length > 0) {
+        try {
+          const queryVectors = await createEmbeddings(OLLAMA_URL, [prompt]);
+          const queryEmbedding = queryVectors[0];
+
+          if (!queryEmbedding || queryEmbedding.length !== 768) {
+            throw new Error("Не вдалося створити embedding запиту.");
+          }
+
+          const searchResults = await invoke<Array<{
+            chunkId: string;
+            fileName: string;
+            detectedFormat: string | null;
+            content: string;
+          }>>("search_attachment_documents", {
+            chatId,
+            query: prompt,
+            queryEmbedding,
+            limit: 12,
+          });
+
+          attachmentResults.push(
+            ...searchResults.map((result) => ({
+              name: result.fileName || "Документ",
+              format: result.detectedFormat || "невідомий формат",
+              content: result.content || "",
+            })),
+          );
+        } catch (error) {
+          console.warn(
+            "[Sonne] Гібридний пошук недоступний, використовую резервне читання:",
+            error,
+          );
+        }
+
+        if (attachmentResults.length === 0) {
+          const totalAttachmentBudget = 2 * 1024 * 1024;
+          const attachmentBudget = Math.max(
+            1,
+            Math.floor(totalAttachmentBudget / promotedAttachments.length),
+          );
+
+          const fallbackResults = await Promise.all(
+            promotedAttachments.map(async (file) => {
+              const document = await invoke<{
+                documentId: string;
+                fileName: string;
+                detectedFormat: string | null;
+                language: string | null;
+                metadata: unknown;
+                content: string;
+                truncated: boolean;
+              }>("get_attachment_document_context", {
+                referenceId: file.id,
+                chatId: file.chatId || chatId,
+                extractor: EXTRACTOR_ID,
+                extractorVersion: EXTRACTOR_VERSION,
+                maxBytes: attachmentBudget,
+              });
+
+              return {
+                name: document.fileName || file.fileName,
+                format:
+                  document.detectedFormat ||
+                  file.mimeType ||
+                  "невідомий формат",
+                content: document.content || "",
+              };
+            }),
+          );
+
+          attachmentResults.push(...fallbackResults);
+        }
+
+        if (backendConfig) {
+          for (const file of promotedAttachments) {
+            try {
+              const statusArgs = {
+                chatId: file.chatId || chatId,
+                referenceId: file.id,
+                extractor: EXTRACTOR_ID,
+                extractorVersion: EXTRACTOR_VERSION,
+              };
+
+              let processing: {
+                documentId: string | null;
+                status: string | null;
+              } | null = null;
+
+              for (let attempt = 0; attempt < 120; attempt++) {
+                if (generationController?.signal.aborted) {
+                  throw new DOMException("Операцію скасовано", "AbortError");
+                }
+
+                processing = await invoke<{
+                  documentId: string | null;
+                  status: string | null;
+                }>("get_attachment_processing_status", statusArgs);
+
+                if (processing.status === "completed" && processing.documentId) {
+                  break;
+                }
+
+                if (processing.status === "failed") {
+                  throw new Error("Індексація вкладення завершилася помилкою.");
+                }
+
+                await new Promise((resolve) => setTimeout(resolve, 500));
+              }
+
+              if (
+                processing?.status !== "completed" ||
+                !processing.documentId
+              ) {
+                throw new Error("Не дочекалися завершення індексації вкладення.");
+              }
+
+              const summary = await generateDocumentSummary(
+                processing.documentId,
+                backendConfig.ollamaModel,
+                backendConfig.options,
+                generationController?.signal,
+              );
+
+              if (summary.trim()) {
+                attachmentResults.push({
+                  name: `${file.fileName} — повний підсумок`,
+                  format: "Map-Reduce summary",
+                  content: summary,
+                });
+              }
+            } catch (error) {
+              console.warn(
+                `[Sonne] Не вдалося створити повний підсумок для ${file.fileName}:`,
+                error,
+              );
+            }
+          }
+        }
+      }
+
+      const attachmentContext = attachmentResults.map((file, index) =>
+        `\n\n--- Вкладений файл: ${file.name} (${file.format}), фрагмент ${index + 1} ---\n${file.content || "Текстовий вміст не знайдено в індексі."}`,
+      ).join("");
+
+      const archiveContext = archiveFiles.map((file) =>
+        `\n\n--- Вміст архіву: ${file.name} ---\n${file.content}`,
+      ).join("");
+
+      const modelPrompt = attachmentContext || archiveContext
+        ? `${prompt}\n\nВміст вкладень та архівів:${attachmentContext}${archiveContext}`
+        : prompt;
+
+      // Gemma 3 supports native image input. Qwen 3 remains OCR-only.
+      const visionImages: Uint8Array[] = [];
+      const maxVisionBytes = 20 * 1024 * 1024;
+      let visionBytes = 0;
+
+      if (backendConfig.backend === "gemma") {
+        for (const attachment of attachmentFiles) {
+          if (visionImages.length >= 4 || visionBytes >= maxVisionBytes) break;
+
+          const supportedImage =
+            /^image\/(png|jpeg|webp)$/i.test(attachment.mimeType) ||
+            /\.(png|jpe?g|webp)$/i.test(attachment.fileName);
+
+          if (
+            !supportedImage ||
+            attachment.originalSize <= 0 ||
+            attachment.originalSize > maxVisionBytes ||
+            visionBytes + attachment.originalSize > maxVisionBytes
+          ) continue;
+
+          try {
+            const imageFile = await loadStoredAttachment({
+              id: attachment.id,
+              chatId: attachment.chatId || chatId,
+              fileName: attachment.fileName,
+              mimeType: attachment.mimeType,
+              originalSize: attachment.originalSize,
+            });
+            const imageBytes = new Uint8Array(await imageFile.arrayBuffer());
+
+            if (imageBytes.byteLength > 0 && visionBytes + imageBytes.byteLength <= maxVisionBytes) {
+              visionImages.push(imageBytes);
+              visionBytes += imageBytes.byteLength;
+            }
+          } catch (error) {
+            console.warn("[Sonne Vision] Не вдалося прочитати зображення; доступний OCR-контекст.", error);
+          }
+        }
+      }
+
+      const baseContextBudget = resolveContextBudget(
+        backendConfig,
+        shouldUseThinkingChannel,
+      );
+      const contextBudget = {
+        ...baseContextBudget,
+        inputBudget: Math.max(0, baseContextBudget.inputBudget - visionImages.length * 512),
+      };
+
+      const fixedTokens =
+        estimateMessageTokens({ content: systemPrompt }) +
+        estimateMessageTokens({ content: modelPrompt });
+
+      if (fixedTokens > contextBudget.inputBudget) {
+        throw new Error(
+          `Системний промпт і вкладення потребують приблизно ${fixedTokens} токенів, ` +
+          `але доступний бюджет — ${contextBudget.inputBudget}. ` +
+          `Розділи документи на менші частини або надішли менше вмісту за раз.`,
+        );
+      }
+
+      if (modelPrompt !== prompt) {
+        await invoke("update_message", {
+          messageId: savedUser.id,
+          content: userContent,
+          promptContent: modelPrompt,
+          modelUsed: null,
+          modeUsed: resolvedMode,
+        });
+
+        setMessages((previous) =>
+          previous.map((message) =>
+            message.dbId === savedUser.id
+              ? { ...message, promptContent: modelPrompt }
+              : message,
+          ),
+        );
+      }
+
+      // Smart History: older conversation turns are omitted first.
       const contextSelection = selectHistory(fullHistory, {
         systemPrompt,
-        userPrompt: prompt,
-        budget: resolveContextBudget(backendConfig, shouldUseThinkingChannel),
+        userPrompt: modelPrompt,
+        budget: contextBudget,
       });
       const historyMessages = contextSelection.history;
 
@@ -861,17 +1385,21 @@ CSS підключено
 
 
 
-      const apiMessages = [
+      const apiMessages: ChatMessageBody[] = [
         {
-          role: "system" as const,
+          role: "system",
           content: systemPrompt,
         },
         ...historyMessages,
         {
-          role: "user" as const,
-          content: prompt,
+          role: "user",
+          content: modelPrompt,
         },
       ];
+
+      if (visionImages.length > 0) {
+        apiMessages[apiMessages.length - 1].images = visionImages;
+      }
 
       const activeRequest = await createChatStream(
         OLLAMA_URL,
@@ -950,13 +1478,20 @@ CSS підключено
         durationSec: totalSec,
         includeInHistory: true,
       });
+
+      await persistAssistantMessage(extractAnswer(rawFull));
     } catch (err) {
       // ------------------------------------------------------
       // ERROR HANDLING
       // ------------------------------------------------------
 
+      console.error("[Sonne] Raw request error:", err);
       const errMsg =
-        err instanceof Error ? err.message : "Помилка з'єднання з Ollama";
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : "Помилка з'єднання з Ollama";
 
       flushPendingContent();
 
@@ -968,6 +1503,7 @@ CSS підключено
           timestamp: formatNow(),
           durationSec: ((Date.now() - startTime) / 1000).toFixed(1),
         });
+        await persistAssistantMessage(extractAnswer(rawFull));
         return;
       }
 
@@ -977,14 +1513,23 @@ CSS підключено
         role: "assistant",
         modeUsed: resolvedMode,
         modelUsed: modelToUse,
-        content:
-          `Не вдалося отримати відповідь від Sonne або Ollama: ${errMsg}. ` +
-          `Перевір підключення та запуск Ollama.`,
+        content: `Не вдалося обробити запит: ${errMsg}`,
         timestamp: formatNow(),
       });
+
+      await persistAssistantMessage(`Не вдалося обробити запит: ${errMsg}`);
     } finally {
-      flushPendingContent();
-      activeGeneration.request?.dispose();
+      try {
+        flushPendingContent();
+      } catch (error) {
+        console.error("[Sonne] Помилка фінального оновлення UI:", error);
+      }
+
+      try {
+        activeGeneration.request?.dispose();
+      } catch (error) {
+        console.error("[Sonne] Помилка очищення Ollama request:", error);
+      }
 
       if (activeGenerationRef.current?.id === generationId) {
         activeGenerationRef.current = null;
@@ -1011,8 +1556,26 @@ CSS підключено
         onToggleThinking={() => setAllowThinking((value) => !value)}
         messagesLength={messages.length}
         onNewChat={() => {
-          setMessages([]);
-          setPreviewHtml(null);
+          chatSessionRef.current += 1;
+          handleStopGeneration();
+          void (async () => {
+            try {
+              const chat = await invoke<{ id: string }>("create_chat", {
+                title: "Новий чат",
+              });
+
+              setChatId(chat.id);
+              setMessages([]);
+              setInput("");
+              setAttachments([]);
+              setSelectedAttachmentId(null);
+              setArchiveContextFiles([]);
+              setEditingMessageIndex(null);
+              setPreviewHtml(null);
+            } catch (error) {
+              console.error("Не вдалося створити новий чат:", error);
+            }
+          })();
         }}
         isGenerating={isGenerating}
         modelActivity={modelActivity}
@@ -1034,6 +1597,8 @@ CSS підключено
                   isGenerating={isGenerating}
                   onPreview={handleOpenPreview}
                   highlightCode={highlightCode}
+                  onCopy={handleCopy}
+                  onEdit={handleEdit}
                 />
               ))
             )}
@@ -1044,13 +1609,33 @@ CSS підключено
           <ChatInput
             input={input}
             onInputChange={setInput}
+            attachments={attachments}
+            onAttachmentsChange={setAttachments}
             isGenerating={isGenerating}
             elapsedSec={elapsedSec}
             onSend={handleSend}
             onStop={handleStopGeneration}
+            chatId={chatId}
+            hasArchiveContext={archiveContextFiles.length > 0}
+            onPreviewAttachment={(attachment) => {
+              setSelectedAttachmentId(attachment.id);
+              setPreviewHtml(null);
+            }}
+            onArchiveContent={(item) => setArchiveContextFiles((current) => [
+              ...current.filter((entry) =>
+                entry.referenceId !== item.referenceId || entry.entryId !== item.entryId
+              ),
+              item,
+            ])}
           />
         </div>
 
+        {selectedAttachmentId && attachments.find((item) => item.id === selectedAttachmentId) && (
+          <FilePreviewPane
+            attachment={attachments.find((item) => item.id === selectedAttachmentId)!}
+            onClose={() => setSelectedAttachmentId(null)}
+          />
+        )}
         {previewHtml !== null && (
           <LivePreview html={previewHtml} onClose={() => setPreviewHtml(null)} />
         )}

@@ -83,3 +83,44 @@ export async function createChatStream(
     throw error;
   }
 }
+
+export async function createVisionDescription(
+  host: string,
+  image: Uint8Array,
+): Promise<string> {
+  const client = new Ollama({ host });
+  const response = await client.chat({
+    model: "sonne-gemma:latest",
+    stream: false,
+    messages: [{
+      role: "user",
+      content:
+        "Опиши це зображення для пошуку в документах. Визнач основні об'єкти, " +
+        "схеми, графіки, взаємозв'язки та важливі деталі. Якщо є текст, " +
+        "передай лише той, який можна впевнено прочитати. Не вигадуй відсутніх " +
+        "даних і не роби припущень. Пиши українською, стисло та інформативно.",
+      images: [image],
+    }],
+    options: { temperature: 0.2, num_predict: 256 },
+  });
+  return response.message.content.trim();
+}
+
+export const OLLAMA_HOST = "http://127.0.0.1:11434";
+
+export async function createEmbeddings(
+  host: string,
+  input: string[],
+): Promise<number[][]> {
+  if (input.length === 0) return [];
+
+  const client = new Ollama({ host });
+  const response = await client.embed({
+    model: "nomic-embed-text:latest",
+    input,
+    truncate: false,
+  });
+
+  return response.embeddings;
+}
+

@@ -1,3 +1,4 @@
+import { copyText } from "../clipboard";
 import { useMemo, useState } from "react";
 
 interface CodeBlockProps {
@@ -24,7 +25,7 @@ export default function CodeBlock({
 
   async function handleCopy() {
     try {
-      await navigator.clipboard.writeText(code);
+      await copyText(code);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {

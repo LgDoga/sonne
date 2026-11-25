@@ -834,7 +834,11 @@ export function resolveThink(
   return userRequestedThinking;
 }
 
-export type ChatMessageBody = { role: "system" | "user" | "assistant"; content: string };
+export type ChatMessageBody = {
+  role: "system" | "user" | "assistant";
+  content: string;
+  images?: string[] | Uint8Array[];
+};
 
 export type OllamaChatRequestBody = {
   model: string;

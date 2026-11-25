@@ -1,0 +1,5793 @@
+SONNE — CURRENT FILE SYSTEM IMPLEMENTATION CONTEXT
+Generated: 2026-11-25T17:19:38
+Project: /Users/mironmashtalir/Projects/sonne
+
+
+==========================================================================================
+FILE: src/App.tsx
+==========================================================================================
+import LivePreview from "./components/LivePreview";
+import EmptyState from "./components/EmptyState";
+import ChatHeader from "./components/ChatHeader";
+import ChatInput from "./components/ChatInput";
+import type { AttachmentReference } from "./components/FileAttachments";
+import { readStoredAttachment } from "./fileReader";
+import ChatMessageItem, { type ChatMessage } from "./components/ChatMessage";
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import "prismjs";
+
+const Prism = (
+  globalThis as unknown as {
+    Prism?: {
+      languages?: Record<string, unknown>;
+      highlight?: (code: string, grammar: unknown, lang: string) => string;
+    };
+  }
+).Prism;
+
+import "./App.css";
+import {
+  type BackendConfig,
+  type ExecutionBackend,
+  type ModeOption,
+  type ModelProfile,
+  type ResolvedMode,
+  buildChatRequestBody,
+  buildSystemPrompt,
+  detectIntent,
+  isSupportedModelName,
+  routeRequest,
+} from "./modelRouting";
+import {
+  createChatStream,
+  type ActiveOllamaChatStream,
+} from "./ollamaClient";
+import {
+  type ContextStats,
+  estimateMessageTokens,
+  resolveContextBudget,
+  selectHistory,
+} from "./contextManager";
+
+// ============================================================
+// TYPES
+// ============================================================
+
+
+
+type OllamaChatChunk = {
+  message?: {
+    thinking?: string;
+    content?: string;
+  };
+  done?: boolean;
+  // [perf-diag] Fields present on Ollama's final (done: true) chunk.
+  model?: string;
+  done_reason?: string;
+  error?: string;
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
+  eval_count?: number;
+  eval_duration?: number;
+};
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const OLLAMA_URL = "http://127.0.0.1:11434";
+
+type ActiveGeneration = {
+  id: number;
+  controller: AbortController;
+  request: ActiveOllamaChatStream | null;
+  cancelled: boolean;
+  flush: () => void;
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function formatNow(): string {
+  return new Date().toLocaleTimeString("uk-UA", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+/**
+ * Removes an embedded <think>...</think> block if a model
+ * accidentally includes one in its normal response content.
+ *
+ * The separate Ollama thinking channel is never displayed.
+ */
+function extractAnswer(raw: string): string {
+  const thinkOpen = raw.indexOf("<think>");
+
+  if (thinkOpen === -1) {
+    return raw.trim();
+  }
+
+  const thinkClose = raw.indexOf("</think>", thinkOpen);
+
+  if (thinkClose === -1) {
+    return raw.slice(0, thinkOpen).trim();
+  }
+
+  return (
+    raw.slice(0, thinkOpen) + raw.slice(thinkClose + "</think>".length)
+  ).trim();
+}
+
+// ============================================================
+// [perf-diag] TEMPORARY PERFORMANCE DIAGNOSTICS
+// Logs timing metrics to the developer console only. Never logs
+// message text, system instructions or any other private data.
+// To remove: delete this block and every line tagged [perf-diag].
+// ============================================================
+
+const PERF_DIAGNOSTICS_ENABLED = true;
+
+type PerfMarkName =
+  | "instructions"
+  | "headers"
+  | "firstChunk"
+  | "firstThinking"
+  | "firstContent"
+  | "firstVisible"
+  | "firstPaint"
+  | "doneChunk"
+  | "streamEnd";
+
+type PerfTrace = {
+  t0: number;
+  model: string;
+  mode: ResolvedMode;
+  modeSetting: ModeOption;
+  modelSelection: "auto" | "manual";
+  profile: ModelProfile;
+  backend: ExecutionBackend;
+  thinkingChannel: boolean;
+  historyMessages: number;
+  historyChars: number;
+  context: ContextStats | null; // estimates from contextManager
+  systemPromptChars: number;
+  userPromptChars: number;
+  marks: Partial<Record<PerfMarkName, number>>;
+  chunks: number;
+  thinkingChunks: number;
+  contentChunks: number;
+  lineFailures: number;
+  streamError: string | null;
+  cancelled: boolean;
+  final: OllamaChatChunk | null;
+};
+
+function perfMark(trace: PerfTrace, name: PerfMarkName): void {
+  // Only the first occurrence of each mark is recorded.
+  if (trace.marks[name] === undefined) {
+    trace.marks[name] = performance.now();
+  }
+}
+
+function perfObserveChunk(trace: PerfTrace, chunk: OllamaChatChunk): void {
+  trace.chunks += 1;
+
+  const hasThinking = Boolean(chunk.message?.thinking);
+  const hasContent = Boolean(chunk.message?.content);
+
+  if (hasThinking) {
+    trace.thinkingChunks += 1;
+    perfMark(trace, "firstThinking");
+  }
+
+  if (hasContent) {
+    trace.contentChunks += 1;
+    perfMark(trace, "firstContent");
+  }
+
+  if (hasThinking || hasContent) {
+    perfMark(trace, "firstChunk");
+  }
+
+  if (typeof chunk.error === "string" && trace.streamError === null) {
+    trace.streamError = chunk.error.slice(0, 200);
+  }
+
+  if (chunk.done === true) {
+    trace.final = chunk;
+    perfMark(trace, "doneChunk");
+  }
+}
+
+function perfIsValidNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/** Ollama reports durations in nanoseconds. Absent value -> "N/A". */
+function perfNsToMs(value: unknown): string {
+  return perfIsValidNumber(value) ? `${(value / 1e6).toFixed(0)} ms` : "N/A";
+}
+
+/** Milliseconds elapsed from t0 to a mark. Missing mark -> "N/A". */
+function perfSince(trace: PerfTrace, name: PerfMarkName): string {
+  const mark = trace.marks[name];
+
+  return mark === undefined ? "N/A" : `${(mark - trace.t0).toFixed(0)} ms`;
+}
+
+/** Tokens per second from an Ollama count and a nanosecond duration. */
+function perfRate(count: unknown, durationNs: unknown): string {
+  if (!perfIsValidNumber(count) || !perfIsValidNumber(durationNs)) {
+    return "N/A";
+  }
+
+  if (count === 0 || durationNs === 0) return "N/A";
+
+  return `${(count / (durationNs / 1e9)).toFixed(1)} tok/s`;
+}
+
+function perfCount(value: unknown): string {
+  return perfIsValidNumber(value) ? String(value) : "N/A";
+}
+
+function perfDiff(later?: number, earlier?: number): string {
+  if (later === undefined || earlier === undefined) return "N/A";
+
+  return `${(later - earlier).toFixed(0)} ms`;
+}
+
+// Context Manager metrics. All "est_" values are local estimates; the actual
+// prompt size is prompt_tokens_prompt_eval_count (Ollama). Metadata only.
+function perfContextReport(ctx: ContextStats | null): Record<string, string> {
+  if (!ctx) return { context_optimization: "N/A" };
+
+  return {
+    context_optimization: ctx.optimized ? "active" : "not needed",
+    context_status: ctx.status,
+    context_window: `${ctx.contextWindow} (${ctx.windowSource})`,
+    context_input_budget_est: String(ctx.inputBudget),
+    context_output_reserve: String(ctx.outputReserve),
+    history_messages_total: String(ctx.totalHistoryMessages),
+    history_messages_omitted: String(ctx.omittedHistoryMessages),
+    est_history_tokens_original: String(ctx.estOriginalHistoryTokens),
+    est_history_tokens_retained: String(ctx.estSelectedHistoryTokens),
+    est_history_tokens_removed: String(ctx.estRemovedHistoryTokens),
+    est_fixed_tokens_system_plus_user: String(ctx.estFixedTokens),
+    est_input_tokens_total: String(ctx.estInputTokens),
+  };
+}
+
+function perfBuildReport(trace: PerfTrace): Record<string, string> {
+  const final = trace.final;
+  const marks = trace.marks;
+
+  const wallMs =
+    marks.streamEnd !== undefined ? marks.streamEnd - trace.t0 : undefined;
+
+  const ollamaTotalMs = perfIsValidNumber(final?.total_duration)
+    ? final.total_duration / 1e6
+    : undefined;
+
+  return {
+    model_requested: trace.model,
+    model_reported_by_ollama: final?.model ?? "N/A",
+    mode_resolved: trace.mode,
+    mode_setting: trace.modeSetting,
+    model_selection: trace.modelSelection,
+    profile: trace.profile,
+    backend: trace.backend,
+    thinking_channel_requested: String(trace.thinkingChannel),
+
+    wall_total: wallMs === undefined ? "N/A" : `${wallMs.toFixed(0)} ms`,
+    ollama_total_duration: perfNsToMs(final?.total_duration),
+    client_overhead_wall_minus_ollama:
+      wallMs === undefined || ollamaTotalMs === undefined
+        ? "N/A"
+        : `${(wallMs - ollamaTotalMs).toFixed(0)} ms`,
+    ollama_load_duration: perfNsToMs(final?.load_duration),
+    ollama_prompt_eval_duration: perfNsToMs(final?.prompt_eval_duration),
+    ollama_eval_duration: perfNsToMs(final?.eval_duration),
+
+    ttft_first_visible_token_queued: perfSince(trace, "firstVisible"),
+    ttft_first_visible_token_painted_approx: perfSince(trace, "firstPaint"),
+    time_to_first_any_chunk: perfSince(trace, "firstChunk"),
+    time_to_first_thinking_chunk: perfSince(trace, "firstThinking"),
+    time_to_first_content_chunk: perfSince(trace, "firstContent"),
+    thinking_phase_first_thinking_to_first_content: perfDiff(
+      marks.firstContent,
+      marks.firstThinking,
+    ),
+    time_to_instructions_ready: perfSince(trace, "instructions"),
+    time_to_response_headers: perfSince(trace, "headers"),
+    time_to_done_chunk: perfSince(trace, "doneChunk"),
+
+    prompt_tokens_prompt_eval_count: perfCount(final?.prompt_eval_count),
+    output_tokens_eval_count: perfCount(final?.eval_count),
+    prompt_eval_rate: perfRate(
+      final?.prompt_eval_count,
+      final?.prompt_eval_duration,
+    ),
+    generation_rate: perfRate(final?.eval_count, final?.eval_duration),
+
+    done_chunk_received: String(trace.final !== null),
+    done_reason: final?.done_reason ?? "N/A",
+    stream_error: trace.streamError ?? "none",
+    stream_cancelled: String(trace.cancelled),
+    stream_completed: String(trace.final !== null && !trace.cancelled),
+    stream_chunks_total: String(trace.chunks),
+    stream_chunks_thinking: String(trace.thinkingChunks),
+    stream_chunks_content: String(trace.contentChunks),
+    stream_line_failures: String(trace.lineFailures),
+
+    history_messages_sent: String(trace.historyMessages),
+    history_chars_sent: String(trace.historyChars),
+    ...perfContextReport(trace.context),
+    system_prompt_chars: String(trace.systemPromptChars),
+    user_prompt_chars: String(trace.userPromptChars),
+  };
+}
+
+function perfLogReport(trace: PerfTrace): void {
+  if (!PERF_DIAGNOSTICS_ENABLED) return;
+
+  console.info("[Sonne perf] response metrics");
+  console.table(perfBuildReport(trace));
+  void perfLogOllamaResidency(trace.model);
+}
+
+function perfLogFailure(trace: PerfTrace, message: string): void {
+  if (!PERF_DIAGNOSTICS_ENABLED) return;
+
+  console.warn("[Sonne perf] request failed", {
+    model: trace.model,
+    backend: trace.backend,
+    mode: trace.mode,
+    elapsed: `${(performance.now() - trace.t0).toFixed(0)} ms`,
+    time_to_response_headers: perfSince(trace, "headers"),
+    error: message.slice(0, 200),
+  });
+}
+
+/**
+ * Read-only check of which models Ollama currently keeps in memory
+ * (GET /api/ps). Does not change the keep-alive timer.
+ */
+async function perfLogOllamaResidency(requestedModel: string): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+
+  try {
+    const response = await fetch(`${OLLAMA_URL}/api/ps`, {
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      console.info(`[Sonne perf] /api/ps unavailable: HTTP ${response.status}`);
+      return;
+    }
+
+    const data = (await response.json()) as {
+      models?: Array<{
+        name?: string;
+        model?: string;
+        size?: number;
+        size_vram?: number;
+        context_length?: number;
+        expires_at?: string;
+      }>;
+    };
+
+    const gib = (bytes: unknown) =>
+      perfIsValidNumber(bytes) ? (bytes / 1024 ** 3).toFixed(2) : "N/A";
+
+    const rows = (data.models ?? []).map((entry) => {
+      const name = entry.name ?? entry.model ?? "N/A";
+      const expires = entry.expires_at ? Date.parse(entry.expires_at) : NaN;
+
+      return {
+        model: name,
+        is_requested_model: String(name === requestedModel),
+        size_gib: gib(entry.size),
+        vram_gib: gib(entry.size_vram),
+        gpu_share:
+          perfIsValidNumber(entry.size) &&
+          entry.size > 0 &&
+          perfIsValidNumber(entry.size_vram)
+            ? `${((entry.size_vram / entry.size) * 100).toFixed(0)}%`
+            : "N/A",
+        context_length: perfCount(entry.context_length),
+        unloads_in: Number.isFinite(expires)
+          ? `${Math.max(0, Math.round((expires - Date.now()) / 1000))} s`
+          : "N/A",
+      };
+    });
+
+    console.info(
+      `[Sonne perf] models resident in Ollama after response: ${rows.length}`,
+    );
+
+    if (rows.length > 0) console.table(rows);
+  } catch {
+    console.info("[Sonne perf] /api/ps request failed or timed out");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ============================================================
+// CONTENT PARSING
+// ============================================================
+
+function highlightCode(code: string, lang: string): string {
+  const normalized =
+    lang === "html" || lang === "xml" || lang === "svg"
+      ? "markup"
+      : lang === "js"
+        ? "javascript"
+        : lang === "ts"
+          ? "typescript"
+          : lang === "py"
+            ? "python"
+            : lang;
+
+  const grammar = Prism?.languages?.[normalized];
+
+  if (grammar && typeof Prism?.highlight === "function") {
+    return Prism.highlight(code, grammar, normalized);
+  }
+
+  return code
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ============================================================
+// CODE BLOCK COMPONENT
+// ============================================================
+
+// MAIN APP
+// ============================================================
+
+export function App() {
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState<boolean>(false);
+  const [selectedModel, setSelectedModel] = useState<string>("auto");
+  const [modeSetting, setModeSetting] = useState<ModeOption>("auto");
+  const [allowThinking, setAllowThinking] = useState<boolean>(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState<string>("");
+  const [attachments, setAttachments] = useState<AttachmentReference[]>([]);
+  const [chatId, setChatId] = useState<string>("");
+
+  useEffect(() => {
+    let active = true;
+    const startupSession = chatSessionRef.current;
+
+    async function restoreChat() {
+      try {
+        const chats = await invoke<Array<{
+          id: string;
+          title: string;
+          createdAt: number;
+          updatedAt: number;
+        }>>("list_chats");
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+
+        if (chats.length === 0) {
+          const chat = await invoke<{ id: string }>("create_chat", {
+            title: "Новий чат",
+          });
+          if (!active || startupSession !== chatSessionRef.current) return;
+          setChatId(chat.id);
+          return;
+        }
+
+        const latestChat = chats[0];
+        if (!active || startupSession !== chatSessionRef.current) return;
+        setChatId(latestChat.id);
+
+        const [storedMessages, composerAttachments] = await Promise.all([
+          invoke<Array<{
+            id: string;
+            chatId: string;
+            role: "user" | "assistant" | "system";
+            content: string;
+            promptContent: string | null;
+            modelUsed: string | null;
+            modeUsed: string | null;
+            createdAt: number;
+          }>>("list_messages", { chatId: latestChat.id }),
+          invoke<AttachmentReference[]>("list_composer_attachments", {
+            chatId: latestChat.id,
+          }),
+        ]);
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+
+        const restoredMessages = await Promise.all(
+          storedMessages
+            .filter((message) => message.role !== "system")
+            .map(async (message): Promise<ChatMessage> => {
+              const messageAttachments = await invoke<AttachmentReference[]>(
+                "list_message_attachments",
+                { messageId: message.id },
+              );
+
+              return {
+                dbId: message.id,
+                role: message.role as "user" | "assistant",
+                content: message.content,
+                promptContent: message.promptContent ?? undefined,
+                modelUsed: message.modelUsed ?? undefined,
+                modeUsed: (message.modeUsed ?? undefined) as ResolvedMode | undefined,
+                attachments: messageAttachments,
+                timestamp: new Date(message.createdAt).toLocaleTimeString("uk-UA", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  second: "2-digit",
+                }),
+                includeInHistory: true,
+              };
+            }),
+        );
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+        setMessages(restoredMessages);
+        setAttachments(composerAttachments);
+      } catch (error) {
+        console.error("Не вдалося відновити історію чату:", error);
+      }
+    }
+
+    void restoreChat();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+  const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null);
+  const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [modelActivity, setModelActivity] = useState<{
+    model: string; profile: string; backend: string; thinking: boolean;
+  } | null>(null);
+  const [elapsedSec, setElapsedSec] = useState<number>(0);
+  const [previewHtml, setPreviewHtml] = useState<string | null>(null);
+
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const sendLockRef = useRef(false);
+  const chatSessionRef = useRef(0);
+  const activeGenerationRef = useRef<ActiveGeneration | null>(null);
+  const generationIdRef = useRef(0);
+
+  // ----------------------------------------------------------
+  // LOAD PRISM LANGUAGES
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    void Promise.all([
+      import("prismjs/components/prism-markup"),
+      import("prismjs/components/prism-css"),
+      import("prismjs/components/prism-javascript"),
+      import("prismjs/components/prism-json"),
+      import("prismjs/components/prism-typescript"),
+      import("prismjs/components/prism-java"),
+      import("prismjs/components/prism-c"),
+      import("prismjs/components/prism-python"),
+    ]).catch(() => {
+      // Some Prism languages may fail to load.
+    });
+  }, []);
+
+  // ----------------------------------------------------------
+  // LOAD OLLAMA MODELS
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    async function loadModels() {
+      try {
+        const response = await fetch(`${OLLAMA_URL}/api/tags`);
+
+        if (!response.ok) return;
+
+        const data = await response.json();
+
+        const names: string[] = (data.models || [])
+          .map((model: { name: string }) => model.name)
+          .filter((name: string) => isSupportedModelName(name));
+
+        setModels(names);
+      } catch {
+        // Ollama is offline or unavailable.
+      } finally {
+        setModelsLoaded(true);
+      }
+    }
+
+    void loadModels();
+  }, []);
+
+  // ----------------------------------------------------------
+  // GENERATION TIMER
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    if (!isGenerating) return;
+
+    const start = Date.now();
+
+    setElapsedSec(0);
+
+    const timer = setInterval(() => {
+      setElapsedSec(Number(((Date.now() - start) / 1000).toFixed(1)));
+    }, 100);
+
+    return () => clearInterval(timer);
+  }, [isGenerating]);
+
+  // ----------------------------------------------------------
+  // AUTO SCROLL
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isGenerating]);
+
+  // ----------------------------------------------------------
+  // PREVIEW
+  // ----------------------------------------------------------
+
+  function handleOpenPreview(code: string, lang: string) {
+    if (lang === "css") {
+      setPreviewHtml(
+        `<!DOCTYPE html>
+<html>
+<head>
+<style>${code}</style>
+</head>
+<body>
+<div style="padding:24px;font-family:sans-serif">
+CSS підключено
+</div>
+</body>
+</html>`,
+      );
+
+      return;
+    }
+
+    setPreviewHtml(code);
+  }
+
+  function handleStopGeneration() {
+    const active = activeGenerationRef.current;
+    if (!active) return;
+
+    try {
+      active.flush();
+    } catch (error) {
+      console.error("[Sonne] Помилка фінального flush під час скасування:", error);
+    }
+
+    active.cancelled = true;
+    active.controller.abort();
+
+    try {
+      active.request?.abort();
+    } catch (error) {
+      console.error("[Sonne] Помилка abort Ollama request:", error);
+    }
+
+    setIsGenerating(false);
+  }
+
+  async function handleCopy(content: string) {
+    try {
+      await navigator.clipboard.writeText(content);
+    } catch (error) {
+      console.error("[Sonne] Не вдалося скопіювати повідомлення:", error);
+    }
+  }
+
+  function handleEdit(index: number) {
+    if (isGenerating) handleStopGeneration();
+
+    const message = messages[index];
+    if (!message || message.role !== "user") return;
+
+    const attachmentLabel = message.attachments?.length
+      ? `\n\n📎 ${message.attachments.map((file) => file.fileName).join(", ")}`
+      : "";
+
+    const editableContent =
+      attachmentLabel && message.content.endsWith(attachmentLabel)
+        ? message.content.slice(0, -attachmentLabel.length)
+        : message.content;
+
+    setInput(editableContent);
+    setAttachments([...(message.attachments ?? [])]);
+    setEditingMessageIndex(index);
+  }
+
+  // ----------------------------------------------------------
+  // SEND MESSAGE
+  // ----------------------------------------------------------
+
+  async function handleSend() {
+    if (sendLockRef.current) return;
+
+    sendLockRef.current = true;
+
+    try {
+      await handleSendInternal();
+    } finally {
+      sendLockRef.current = false;
+    }
+  }
+
+  async function handleSendInternal() {
+    const sendSession = chatSessionRef.current;
+    const isEditing = editingMessageIndex !== null;
+    const baseMessages = isEditing
+      ? messages.slice(0, editingMessageIndex)
+      : messages;
+    const attachmentFiles = [...attachments];
+    const prompt = input.trim() || (attachmentFiles.length
+      ? "Проаналізуй прикріплені файли та надай змістовну відповідь."
+      : "");
+
+    if (!prompt || isGenerating) return;
+
+    const userTime = formatNow();
+    const startTime = Date.now();
+    const perfT0 = performance.now(); // [perf-diag]
+
+    const resolvedMode = detectIntent(prompt, modeSetting);
+    const requiresModel = resolvedMode !== "image";
+
+    if (requiresModel && !modelsLoaded) return;
+
+    // Profile and execution backend are resolved together. Pro AI has two
+    // backends (Thinking / Instruct); a missing backend is an explicit error,
+    // never a silent substitution.
+    const route = requiresModel
+      ? routeRequest(
+          resolvedMode,
+          models,
+          selectedModel,
+          prompt,
+          modeSetting === "auto",
+          allowThinking,
+        )
+      : null;
+
+    if (route && !route.ok) {
+      const unavailableText = route.message;
+
+      if (!chatId) {
+        console.error("Чат ще не ініціалізовано.");
+        return;
+      }
+
+      let rewindMessageId: string | null = null;
+      if (isEditing) {
+        const editedMessage = messages[editingMessageIndex!];
+        if (!editedMessage?.dbId) {
+          console.error("Не вдалося визначити повідомлення для редагування.");
+          return;
+        }
+        rewindMessageId = editedMessage.dbId;
+      }
+
+      const userContent = prompt + (attachmentFiles.length
+        ? `\\n\\n📎 ${attachmentFiles.map((file) => file.fileName).join(", ")}`
+        : "");
+
+      const startedTurn = await invoke<{
+        userMessage: { id: string };
+        assistantMessage: { id: string };
+        attachments: AttachmentReference[];
+      }>("start_turn", {
+        chatId,
+        rewindMessageId,
+        userContent,
+        promptContent: prompt,
+        assistantContent: unavailableText,
+        assistantModel: null,
+        assistantMode: resolvedMode,
+      });
+
+      if (sendSession !== chatSessionRef.current) return;
+      const savedUser = startedTurn.userMessage;
+      const savedAssistant = startedTurn.assistantMessage;
+      const promotedAttachments = startedTurn.attachments;
+
+      setMessages([
+        ...baseMessages,
+        {
+          role: "user",
+          dbId: savedUser.id,
+          content: userContent,
+          promptContent: prompt,
+          attachments: promotedAttachments,
+          timestamp: userTime,
+        },
+        {
+          role: "assistant",
+          dbId: savedAssistant.id,
+          content: unavailableText,
+          modeUsed: resolvedMode,
+          timestamp: userTime,
+        },
+      ]);
+
+      setInput("");
+      setAttachments([]);
+      setEditingMessageIndex(null);
+      return;
+    }
+
+    const backendConfig: BackendConfig | null = route && route.ok ? route.backend : null;
+    const modelToUse = backendConfig ? backendConfig.ollamaModel : "Image Generator";
+    const activeModel = modelToUse;
+    const modelProfile = backendConfig ? backendConfig.profile : null;
+    if (backendConfig && route && route.ok) {
+      setModelActivity({
+        model: backendConfig.ollamaModel,
+        profile: backendConfig.profile,
+        backend: backendConfig.backend,
+        thinking: Boolean(route.think),
+      });
+    }
+
+    if (requiresModel && !backendConfig) return;
+
+    const generationId = requiresModel ? ++generationIdRef.current : undefined;
+    const generationController = requiresModel ? new AbortController() : null;
+
+    if (!chatId) {
+      console.error("Чат ще не ініціалізовано.");
+      return;
+    }
+
+    let rewindMessageId: string | null = null;
+    if (isEditing) {
+      const editedMessage = messages[editingMessageIndex!];
+      if (!editedMessage?.dbId) {
+        console.error("Не вдалося визначити повідомлення для редагування.");
+        return;
+      }
+      rewindMessageId = editedMessage.dbId;
+    }
+
+      // Validate text-generation dependencies before creating the SQLite turn.
+      if (
+        resolvedMode !== "image" &&
+        (!modelProfile || !backendConfig || !generationController || generationId === undefined)
+      ) {
+        console.error("Не вдалося підготувати текстову генерацію: відсутні параметри моделі.");
+        return;
+      }
+
+    const userContent = prompt + (attachmentFiles.length
+      ? `
+
+📎 ${attachmentFiles.map((file) => file.fileName).join(", ")}`
+      : "");
+
+    const imageUnavailableText =
+      "Режим генерації зображень поки не підключений. Запит збережено; " +
+      "реальну генерацію додамо після інтеграції рушія.";
+
+    const startedTurn = await invoke<{
+      userMessage: { id: string };
+      assistantMessage: { id: string };
+      attachments: AttachmentReference[];
+    }>("start_turn", {
+      chatId,
+      rewindMessageId,
+      userContent,
+      promptContent: prompt,
+      assistantContent: resolvedMode === "image" ? imageUnavailableText : "",
+      assistantModel: resolvedMode === "image" ? null : modelToUse,
+      assistantMode: resolvedMode,
+    });
+
+    if (sendSession !== chatSessionRef.current) return;
+    const savedUser = startedTurn.userMessage;
+    const savedAssistant = startedTurn.assistantMessage;
+    const promotedAttachments = startedTurn.attachments;
+
+    // Add user message and an empty assistant message.
+    setMessages([
+      ...baseMessages,
+      {
+        role: "user",
+        dbId: savedUser.id,
+        content: userContent,
+        promptContent: prompt,
+        attachments: promotedAttachments,
+        timestamp: userTime,
+        turnId: generationId,
+      },
+      {
+        id: generationId,
+        dbId: savedAssistant.id,
+        turnId: generationId,
+        role: "assistant",
+        content: resolvedMode === "image" ? imageUnavailableText : "",
+        modeUsed: resolvedMode,
+        modelUsed: resolvedMode === "image" ? undefined : modelToUse,
+        timestamp: userTime,
+      },
+    ]);
+
+    setInput("");
+    setAttachments([]);
+    setEditingMessageIndex(null);
+
+    // --------------------------------------------------------
+    // IMAGE MODE — GENERATOR NOT CONNECTED
+    // --------------------------------------------------------
+
+    if (resolvedMode === "image") {
+      setMessages((previous) => {
+        const updated = [...previous];
+        updated[updated.length - 1] = {
+          role: "assistant",
+          modeUsed: "image",
+          timestamp: formatNow(),
+          content: imageUnavailableText,
+        };
+        return updated;
+      });
+      return;
+    }
+
+    if (!modelProfile) return;
+
+    if (!backendConfig) return;
+
+    if (!generationController || generationId === undefined) return;
+
+    setIsGenerating(true);
+
+    // The router already applied the Thinking override and resolved `think`
+    // for the chosen backend (Pro Thinking: true, Pro Instruct: false,
+    // Gemma: user-controlled). App.tsx only consumes the result.
+    const userRequestedThinking = route && route.ok ? route.userRequestedThinking : false;
+    const shouldUseThinkingChannel = route && route.ok ? route.think : false;
+
+    // Full stored conversation (UI state is never modified). Only the model
+    // input is reduced, later, by selectHistory().
+    const fullHistory = baseMessages
+      .filter((message) => message.includeInHistory === true)
+      .map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
+
+    // [perf-diag] Metadata only: counts and lengths, never message text.
+    const perfTrace: PerfTrace = {
+      t0: perfT0,
+      model: modelToUse,
+      mode: resolvedMode,
+      modeSetting,
+      modelSelection: selectedModel === "auto" ? "auto" : "manual",
+      profile: modelProfile,
+      backend: backendConfig.backend,
+      thinkingChannel: shouldUseThinkingChannel,
+      historyMessages: fullHistory.length,
+      context: null,
+      historyChars: fullHistory.reduce(
+        (total, message) => total + message.content.length,
+        0,
+      ),
+      systemPromptChars: 0,
+      userPromptChars: prompt.length,
+      marks: {},
+      chunks: 0,
+      thinkingChunks: 0,
+      contentChunks: 0,
+      lineFailures: 0,
+      streamError: null,
+      cancelled: false,
+      final: null,
+    };
+
+    let rawFull = "";
+    let pendingContent = "";
+    let animationFrame: number | null = null;
+
+    function updateAssistant(update: Partial<ChatMessage>) {
+      if (sendSession !== chatSessionRef.current) return;
+      setMessages((previous) =>
+        previous.map((message) => {
+          if (message.id === generationId) {
+            return { ...message, ...update };
+          }
+
+          if (
+            update.includeInHistory === true &&
+            message.role === "user" &&
+            message.turnId === generationId
+          ) {
+            return { ...message, includeInHistory: true };
+          }
+
+          return message;
+        }),
+      );
+    }
+
+    function flushPendingContent() {
+      if (animationFrame !== null) {
+        cancelAnimationFrame(animationFrame);
+        animationFrame = null;
+      }
+
+      if (activeGeneration.cancelled) {
+        pendingContent = "";
+        return;
+      }
+
+      if (!pendingContent) return;
+
+      rawFull += pendingContent;
+      pendingContent = "";
+
+      const answer = extractAnswer(rawFull);
+
+      // [perf-diag] First non-empty answer text that reaches the UI.
+      if (answer && perfTrace.marks.firstVisible === undefined) {
+        perfMark(perfTrace, "firstVisible");
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => perfMark(perfTrace, "firstPaint")),
+        );
+      }
+
+      updateAssistant({
+        content: answer,
+        modeUsed: resolvedMode,
+        modelUsed: activeModel,
+        timestamp: formatNow(),
+      });
+    }
+
+    const activeGeneration: ActiveGeneration = {
+      id: generationId,
+      controller: generationController,
+      request: null,
+      cancelled: false,
+      flush: flushPendingContent,
+    };
+
+    activeGenerationRef.current = activeGeneration;
+    async function persistAssistantMessage(content: string) {
+      try {
+        await invoke("update_message", {
+          messageId: savedAssistant.id,
+          content,
+          promptContent: null,
+          modelUsed: modelToUse,
+          modeUsed: resolvedMode,
+        });
+      } catch (error) {
+        console.error("[Sonne] Не вдалося зберегти відповідь у SQLite:", error);
+      }
+    }
+
+
+    // --------------------------------------------------------
+    // RUNTIME INSTRUCTIONS + OLLAMA REQUEST
+    // --------------------------------------------------------
+
+    try {
+      const runtimeInstructions = await invoke<string>(
+        "get_runtime_instructions",
+        { model: modelProfile },
+      );
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        throw new DOMException("Generation cancelled", "AbortError");
+      }
+
+      perfMark(perfTrace, "instructions"); // [perf-diag]
+
+      // Both Pro AI backends receive the same profile instructions and the
+      // same task/response assembly (see buildSystemPrompt).
+      const systemPrompt = buildSystemPrompt(runtimeInstructions, resolvedMode);
+
+      perfTrace.systemPromptChars = systemPrompt.length; // [perf-diag]
+
+      // SQLite transaction is the source of truth: process exactly the
+      // attachments promoted into this message by start_turn.
+      const attachmentResults = await Promise.all(
+        promotedAttachments.map((file) => readStoredAttachment(file)),
+      );
+
+      const attachmentContext = attachmentResults.map((file) =>
+        `\n\n--- Вкладений файл: ${file.name} (${file.type}) ---\n${file.content}`,
+      ).join("");
+
+      const modelPrompt = attachmentContext
+        ? `${prompt}\n\nВміст вкладених файлів:${attachmentContext}`
+        : prompt;
+
+      const contextBudget = resolveContextBudget(
+        backendConfig,
+        shouldUseThinkingChannel,
+      );
+
+      const fixedTokens =
+        estimateMessageTokens({ content: systemPrompt }) +
+        estimateMessageTokens({ content: modelPrompt });
+
+      if (fixedTokens > contextBudget.inputBudget) {
+        throw new Error(
+          `Системний промпт і вкладення потребують приблизно ${fixedTokens} токенів, ` +
+          `але доступний бюджет — ${contextBudget.inputBudget}. ` +
+          `Розділи документи на менші частини або надішли менше вмісту за раз.`,
+        );
+      }
+
+      // Smart History: older conversation turns are omitted first.
+      const contextSelection = selectHistory(fullHistory, {
+        systemPrompt,
+        userPrompt: modelPrompt,
+        budget: contextBudget,
+      });
+      const historyMessages = contextSelection.history;
+
+      perfTrace.context = contextSelection.stats; // [perf-diag]
+      perfTrace.historyMessages = historyMessages.length; // [perf-diag]
+      perfTrace.historyChars = historyMessages.reduce(
+        (total, message) => total + message.content.length,
+        0,
+      ); // [perf-diag]
+
+      if (contextSelection.stats.status === "fixed-content-exceeds-budget") {
+        console.warn(
+          "[Sonne context] system prompt + current message exceed the estimated input budget; sent without history, not truncated.",
+          contextSelection.stats,
+        );
+      }
+
+
+
+      const apiMessages = [
+        {
+          role: "system" as const,
+          content: systemPrompt,
+        },
+        ...historyMessages,
+        {
+          role: "user" as const,
+          content: modelPrompt,
+        },
+      ];
+
+      const activeRequest = await createChatStream(
+        OLLAMA_URL,
+        buildChatRequestBody(
+          backendConfig,
+          apiMessages,
+          userRequestedThinking,
+        ),
+        generationController.signal,
+      );
+
+      perfMark(perfTrace, "headers"); // [perf-diag]
+
+      activeGeneration.request = activeRequest;
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        activeRequest.abort();
+        throw new DOMException("Generation cancelled", "AbortError");
+      }
+
+      // ------------------------------------------------------
+      // STREAM PROCESSING
+      // ------------------------------------------------------
+
+      function queueContent(contentChunk: string) {
+        if (
+          !contentChunk ||
+          activeGeneration.cancelled ||
+          activeGenerationRef.current?.id !== generationId
+        ) {
+          return;
+        }
+
+        pendingContent += contentChunk;
+
+        if (animationFrame === null) {
+          animationFrame = requestAnimationFrame(() => {
+            animationFrame = null;
+            if (activeGeneration.cancelled) return;
+            flushPendingContent();
+          });
+        }
+      }
+
+      for await (const chunk of activeRequest.stream) {
+        if (
+          activeGeneration.cancelled ||
+          generationController.signal.aborted
+        ) {
+          break;
+        }
+
+        perfObserveChunk(perfTrace, chunk); // [perf-diag]
+
+        // The private thinking channel is intentionally ignored.
+        // Only normal response content is displayed.
+        queueContent(chunk.message?.content || "");
+      }
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        throw new DOMException("Generation cancelled", "AbortError");
+      }
+
+      flushPendingContent();
+      perfMark(perfTrace, "streamEnd"); // [perf-diag]
+      perfLogReport(perfTrace); // [perf-diag]
+
+      // ------------------------------------------------------
+      // FINISH RESPONSE
+      // ------------------------------------------------------
+
+      const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      updateAssistant({
+        timestamp: formatNow(),
+        durationSec: totalSec,
+        includeInHistory: true,
+      });
+
+      await persistAssistantMessage(extractAnswer(rawFull));
+    } catch (err) {
+      // ------------------------------------------------------
+      // ERROR HANDLING
+      // ------------------------------------------------------
+
+      const errMsg =
+        err instanceof Error ? err.message : "Помилка з'єднання з Ollama";
+
+      flushPendingContent();
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        perfTrace.cancelled = true; // [perf-diag]
+        perfMark(perfTrace, "streamEnd"); // [perf-diag]
+        perfLogReport(perfTrace); // [perf-diag]
+        updateAssistant({
+          timestamp: formatNow(),
+          durationSec: ((Date.now() - startTime) / 1000).toFixed(1),
+        });
+        await persistAssistantMessage(extractAnswer(rawFull));
+        return;
+      }
+
+      perfLogFailure(perfTrace, errMsg); // [perf-diag]
+
+      updateAssistant({
+        role: "assistant",
+        modeUsed: resolvedMode,
+        modelUsed: modelToUse,
+        content: `Не вдалося обробити запит: ${errMsg}`,
+        timestamp: formatNow(),
+      });
+
+      await persistAssistantMessage(`Не вдалося обробити запит: ${errMsg}`);
+    } finally {
+      try {
+        flushPendingContent();
+      } catch (error) {
+        console.error("[Sonne] Помилка фінального оновлення UI:", error);
+      }
+
+      try {
+        activeGeneration.request?.dispose();
+      } catch (error) {
+        console.error("[Sonne] Помилка очищення Ollama request:", error);
+      }
+
+      if (activeGenerationRef.current?.id === generationId) {
+        activeGenerationRef.current = null;
+        setIsGenerating(false);
+      }
+    }
+  }
+
+  // ==========================================================
+  // RENDER
+  // ==========================================================
+
+  return (
+    <div className={`sonne-shell ${isGenerating ? "is-generating" : ""}`}>
+      <div className="ambient-layer" />
+
+      <ChatHeader
+        models={models}
+        selectedModel={selectedModel}
+        onSelectedModelChange={setSelectedModel}
+        modeSetting={modeSetting}
+        onModeSettingChange={setModeSetting}
+        allowThinking={allowThinking}
+        onToggleThinking={() => setAllowThinking((value) => !value)}
+        messagesLength={messages.length}
+        onNewChat={() => {
+          chatSessionRef.current += 1;
+          handleStopGeneration();
+          void (async () => {
+            try {
+              const chat = await invoke<{ id: string }>("create_chat", {
+                title: "Новий чат",
+              });
+
+              setChatId(chat.id);
+              setMessages([]);
+              setInput("");
+              setAttachments([]);
+              setEditingMessageIndex(null);
+              setPreviewHtml(null);
+            } catch (error) {
+              console.error("Не вдалося створити новий чат:", error);
+            }
+          })();
+        }}
+        isGenerating={isGenerating}
+        modelActivity={modelActivity}
+        elapsedSec={elapsedSec}
+      />
+
+      <div className="sonne-workspace">
+        <div className="chat-pane">
+          <main className="sonne-messages">
+            {messages.length === 0 ? (
+              <EmptyState />
+            ) : (
+              messages.map((message, index) => (
+                <ChatMessageItem
+                  key={index}
+                  message={message}
+                  index={index}
+                  totalMessages={messages.length}
+                  isGenerating={isGenerating}
+                  onPreview={handleOpenPreview}
+                  highlightCode={highlightCode}
+                  onCopy={handleCopy}
+                  onEdit={handleEdit}
+                />
+              ))
+            )}
+
+            <div ref={bottomRef} />
+          </main>
+
+          <ChatInput
+            input={input}
+            onInputChange={setInput}
+            attachments={attachments}
+            onAttachmentsChange={setAttachments}
+            isGenerating={isGenerating}
+            elapsedSec={elapsedSec}
+            onSend={handleSend}
+            onStop={handleStopGeneration}
+          chatId={chatId}
+            />
+        </div>
+
+        {previewHtml !== null && (
+          <LivePreview html={previewHtml} onClose={() => setPreviewHtml(null)} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default App;
+
+
+==========================================================================================
+FILE: src/fileReader.ts
+==========================================================================================
+import { invoke } from "@tauri-apps/api/core";
+import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
+import mammoth from "mammoth";
+
+GlobalWorkerOptions.workerSrc = new URL(
+  "pdfjs-dist/build/pdf.worker.min.mjs",
+  import.meta.url,
+).toString();
+
+export type SupportedFileType = "text" | "pdf" | "docx";
+
+export type ReadFileResult = {
+  name: string;
+  type: SupportedFileType;
+  size: number;
+  content: string;
+};
+
+const TEXT_EXTENSIONS = new Set([
+  "txt", "md", "json", "csv", "html", "htm", "css",
+  "js", "jsx", "ts", "tsx", "py", "java", "c", "cpp",
+  "h", "hpp", "cs", "go", "rs", "php", "rb", "swift",
+  "kt", "sql", "xml", "yaml", "yml", "toml", "ini",
+  "sh", "bash", "zsh", "env", "log", "gitignore",
+  "dockerfile",
+]);
+
+export function getFileType(file: File): SupportedFileType {
+  const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
+
+  if (extension === "pdf") return "pdf";
+  if (extension === "docx") return "docx";
+  if (TEXT_EXTENSIONS.has(extension)) return "text";
+
+  throw new Error(
+    `Непідтримуваний формат файлу: ${extension || "unknown"}`,
+  );
+}
+
+async function readTextFile(file: File): Promise<string> {
+  return file.text();
+}
+
+async function readPdfFile(file: File): Promise<string> {
+  const data = new Uint8Array(await file.arrayBuffer());
+  const pdf = await getDocument({ data }).promise;
+
+  try {
+    const pages: string[] = [];
+
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+      const page = await pdf.getPage(pageNumber);
+      const textContent = await page.getTextContent();
+
+      const pageText = textContent.items
+        .filter((item) => "str" in item)
+        .map((item) => ("str" in item ? item.str : ""))
+        .join(" ");
+
+      pages.push(
+        `--- Сторінка ${pageNumber} ---\n${pageText}`,
+      );
+    }
+
+    return pages.join("\n\n");
+  } finally {
+    await pdf.cleanup();
+  }
+}
+
+async function readDocxFile(file: File): Promise<string> {
+  const arrayBuffer = await file.arrayBuffer();
+  const result = await mammoth.extractRawText({ arrayBuffer });
+  return result.value;
+}
+
+export async function readFile(file: File): Promise<ReadFileResult> {
+  const type = getFileType(file);
+  let content: string;
+
+  switch (type) {
+    case "text":
+      content = await readTextFile(file);
+      break;
+    case "pdf":
+      content = await readPdfFile(file);
+      break;
+    case "docx":
+      content = await readDocxFile(file);
+      break;
+  }
+
+  if (!content.trim()) {
+    throw new Error(`Не вдалося отримати текст із файлу "${file.name}".`);
+  }
+
+  return {
+    name: file.name,
+    type,
+    size: file.size,
+    content,
+  };
+}
+
+
+export interface StoredAttachmentInput {
+  id: string;
+  chatId: string;
+  fileName: string;
+  mimeType: string;
+  originalSize: number;
+}
+
+export async function readStoredAttachment(
+  attachment: StoredAttachmentInput,
+): Promise<ReadFileResult> {
+  const CHUNK_SIZE = 256 * 1024;
+  const chunks: ArrayBuffer[] = [];
+  let offset = 0;
+
+  while (offset < attachment.originalSize) {
+    const length = Math.min(
+      CHUNK_SIZE,
+      attachment.originalSize - offset,
+    );
+
+    const bytes = await invoke<number[]>("read_attachment_chunk", {
+      chatId: attachment.chatId,
+      referenceId: attachment.id,
+      offset,
+      length,
+    });
+
+    if (!bytes.length || bytes.length > length) {
+      throw new Error(
+        `Не вдалося прочитати вкладення "${attachment.fileName}" повністю.`,
+      );
+    }
+
+    const chunk = Uint8Array.from(bytes);
+    chunks.push(chunk.buffer as ArrayBuffer);
+    offset += bytes.length;
+  }
+
+  if (offset !== attachment.originalSize) {
+    throw new Error(
+      `Розмір прочитаного файлу "${attachment.fileName}" не збігається з оригіналом.`,
+    );
+  }
+
+  const file = new File(chunks, attachment.fileName, {
+    type: attachment.mimeType || "application/octet-stream",
+  });
+
+  return readFile(file);
+}
+
+
+==========================================================================================
+FILE: src/contextManager.ts
+==========================================================================================
+// ============================================================
+// SONNE CONTEXT MANAGER (pure, UI-independent, no imports)
+//
+// Phase 2A: Context Budget + Smart History.
+//
+// Decides which part of the conversation is sent to the model. It works
+// on a COPY of the history that is about to be sent; the conversation
+// shown in the UI and stored by Sonne is never touched.
+//
+// All token numbers here are LOCAL ESTIMATES, not Ollama token counts.
+// The real number is `prompt_eval_count` on Ollama's final chunk.
+// ============================================================
+
+export type ContextMessage = { role: "user" | "assistant"; content: string };
+
+/** Structural subset of BackendConfig (modelRouting.ts), so this file needs no imports. */
+export type ContextModelConfig = {
+  ollamaModel: string;
+  options?: { num_ctx: number; num_predict: number };
+};
+
+// ------------------------------------------------------------
+// CONFIGURATION (single place to maintain)
+// ------------------------------------------------------------
+
+/**
+ * Context windows (num_ctx) for models whose window is NOT sent per request,
+ * i.e. models with a Sonne Modelfile. Keyed by exact Ollama model name.
+ * Fill in from each Modelfile's `PARAMETER num_ctx`; do not guess.
+ * Models with request-level `options.num_ctx` (Pro Instruct) use that value
+ * automatically, so it can never drift from what Ollama is actually given.
+ */
+export const MODEL_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
+  "sonne-gemma:latest": 8192,
+  "sonne-pro-ai:latest": 12288,
+};
+
+/** Used for any model without a known window. Equals Ollama's classic default. */
+export const FALLBACK_CONTEXT_WINDOW = 4096;
+
+/** Share of the window kept free for the answer (more when the model thinks). */
+export const OUTPUT_RESERVE_RATIO = 0.25;
+export const OUTPUT_RESERVE_RATIO_THINKING = 0.35;
+export const MIN_OUTPUT_RESERVE_TOKENS = 512;
+
+/** Extra headroom because the estimator is approximate. */
+export const SAFETY_MARGIN_RATIO = 0.05;
+
+/** Rough per-message cost of role/template tokens. */
+export const MESSAGE_OVERHEAD_TOKENS = 4;
+
+// ------------------------------------------------------------
+// TOKEN ESTIMATION (estimate only; deliberately on the high side)
+// ------------------------------------------------------------
+
+/**
+ * Weighted character count, no tokenizer. Roughly: Cyrillic 2 chars/token,
+ * Latin ~3 chars/token, punctuation/digits/symbols 2 chars/token, whitespace
+ * cheap, other scripts 1 token/char. Not exact; tuned to over- not under-count.
+ */
+export function estimateTokens(text: string): number {
+  let weight = 0;
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+
+    if (c === 32 || c === 10 || c === 9 || c === 13) weight += 0.15;
+    else if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) weight += 0.32;
+    else if (c >= 0x0400 && c <= 0x052f) weight += 0.5; // Cyrillic
+    else if (c < 128) weight += 0.5; // digits, punctuation, symbols
+    else if (c >= 0xd800 && c <= 0xdfff) weight += 0.75; // surrogate half (emoji etc.)
+    else weight += 1; // CJK and other scripts
+
+  }
+
+  return Math.ceil(weight);
+}
+
+export function estimateMessageTokens(message: { content: string }): number {
+  return estimateTokens(message.content) + MESSAGE_OVERHEAD_TOKENS;
+}
+
+// ------------------------------------------------------------
+// CONTEXT BUDGET
+// ------------------------------------------------------------
+
+export type ContextBudget = {
+  contextWindow: number;
+  windowSource: "request-options" | "model-table" | "fallback";
+  outputReserve: number;
+  safetyMargin: number;
+  /** Max estimated tokens for system prompt + history + current message. */
+  inputBudget: number;
+};
+
+export function resolveContextBudget(
+  config: ContextModelConfig,
+  thinking: boolean,
+): ContextBudget {
+  let contextWindow = FALLBACK_CONTEXT_WINDOW;
+  let windowSource: ContextBudget["windowSource"] = "fallback";
+
+  if (config.options && config.options.num_ctx > 0) {
+    contextWindow = config.options.num_ctx;
+    windowSource = "request-options";
+  } else if (MODEL_CONTEXT_WINDOWS[config.ollamaModel] > 0) {
+    contextWindow = MODEL_CONTEXT_WINDOWS[config.ollamaModel];
+    windowSource = "model-table";
+  }
+
+  const ratio = thinking ? OUTPUT_RESERVE_RATIO_THINKING : OUTPUT_RESERVE_RATIO;
+  let outputReserve = Math.max(MIN_OUTPUT_RESERVE_TOKENS, Math.floor(contextWindow * ratio));
+
+  // A smaller configured output limit needs no larger reserve.
+  if (config.options && config.options.num_predict > 0) {
+    outputReserve = Math.min(outputReserve, config.options.num_predict);
+  }
+
+  const safetyMargin = Math.ceil(contextWindow * SAFETY_MARGIN_RATIO);
+  const inputBudget = Math.max(0, contextWindow - outputReserve - safetyMargin);
+
+  return { contextWindow, windowSource, outputReserve, safetyMargin, inputBudget };
+}
+
+// ------------------------------------------------------------
+// SMART HISTORY (recent-first, whole turns, deterministic)
+// ------------------------------------------------------------
+
+export type HistorySelectionStatus =
+  | "within-budget" // everything fits; history unchanged
+  | "trimmed" // oldest turns omitted
+  | "fixed-content-exceeds-budget"; // system prompt + current message alone exceed the budget
+
+export type ContextStats = {
+  status: HistorySelectionStatus;
+  /** True when any history was omitted from the model input. */
+  optimized: boolean;
+  contextWindow: number;
+  windowSource: ContextBudget["windowSource"];
+  inputBudget: number;
+  outputReserve: number;
+  // All token values below are ESTIMATES (not Ollama's prompt_eval_count).
+  estFixedTokens: number; // system prompt + current user message
+  estOriginalHistoryTokens: number;
+  estSelectedHistoryTokens: number;
+  estRemovedHistoryTokens: number;
+  estInputTokens: number; // fixed + selected history
+  totalHistoryMessages: number;
+  selectedHistoryMessages: number;
+  omittedHistoryMessages: number;
+};
+
+export type HistorySelection = {
+  /** New array; the input array and its message objects are never modified. */
+  history: ContextMessage[];
+  stats: ContextStats;
+};
+
+export function selectHistory(
+  history: readonly ContextMessage[],
+  input: { systemPrompt: string; userPrompt: string; budget: ContextBudget },
+): HistorySelection {
+  const { budget } = input;
+  const costs = history.map(estimateMessageTokens);
+  const originalTokens = costs.reduce((sum, cost) => sum + cost, 0);
+  const fixedTokens =
+    estimateMessageTokens({ content: input.systemPrompt }) +
+    estimateMessageTokens({ content: input.userPrompt });
+  const available = budget.inputBudget - fixedTokens;
+
+  let keepFrom = 0;
+  let status: HistorySelectionStatus = "within-budget";
+
+  if (available < 0) {
+    // System prompt and current message are never cut. Send them as they are
+    // without history and let the caller surface the overflow.
+    keepFrom = history.length;
+    status = "fixed-content-exceeds-budget";
+  } else if (originalTokens > available) {
+    status = "trimmed";
+    keepFrom = history.length;
+
+    // Walk back one turn at a time (a user message plus the replies that
+    // follow it). A turn that does not fit stops the walk, so what is kept
+    // is always a contiguous, whole-turn tail of the conversation.
+    let used = 0;
+    let end = history.length;
+
+    while (end > 0) {
+      let start = end - 1;
+
+      while (start > 0 && history[start].role !== "user") start--;
+
+      // Replies with no user message before them would be orphaned.
+      if (history[start].role !== "user") break;
+
+      let turnCost = 0;
+
+      for (let i = start; i < end; i++) turnCost += costs[i];
+      if (used + turnCost > available) break;
+
+      used += turnCost;
+      keepFrom = start;
+      end = start;
+    }
+  }
+
+  const selected = history.slice(keepFrom).map((message) => ({
+    role: message.role,
+    content: message.content,
+  }));
+  const selectedTokens = costs.slice(keepFrom).reduce((sum, cost) => sum + cost, 0);
+  const omitted = history.length - selected.length;
+
+  return {
+    history: selected,
+    stats: {
+      status,
+      optimized: omitted > 0,
+      contextWindow: budget.contextWindow,
+      windowSource: budget.windowSource,
+      inputBudget: budget.inputBudget,
+      outputReserve: budget.outputReserve,
+      estFixedTokens: fixedTokens,
+      estOriginalHistoryTokens: originalTokens,
+      estSelectedHistoryTokens: selectedTokens,
+      estRemovedHistoryTokens: originalTokens - selectedTokens,
+      estInputTokens: fixedTokens + selectedTokens,
+      totalHistoryMessages: history.length,
+      selectedHistoryMessages: selected.length,
+      omittedHistoryMessages: omitted,
+    },
+  };
+}
+
+
+==========================================================================================
+FILE: src/components/ArchiveBrowser.tsx
+==========================================================================================
+import { useEffect, useMemo, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+
+interface ArchiveEntry {
+  id: string;
+  documentId: string;
+  parentId: string | null;
+  entryPath: string;
+  entryName: string;
+  entryType: string;
+  nestedDepth: number;
+  compressionMethod: string | null;
+  compressedSize: number;
+  uncompressedSize: number;
+  blobSha256: string | null;
+  nestedDocumentId: string | null;
+  extractionStatus: string;
+  errorMessage: string | null;
+  ordinal: number;
+  createdAt: string;
+}
+
+export interface ArchiveContextItem {
+  referenceId: string;
+  entryId: string;
+  name: string;
+  content: string;
+}
+
+interface ArchiveBrowserProps {
+  chatId: string;
+  referenceId: string;
+  onClose: () => void;
+  onAddToContext: (item: ArchiveContextItem) => void;
+}
+
+const CHUNK_SIZE = 256 * 1024;
+const MAX_TEXT_PREVIEW_BYTES = 8 * 1024 * 1024;
+
+const TEXT_EXTENSIONS = new Set([
+  "txt", "md", "markdown", "json", "jsonc", "csv", "tsv",
+  "html", "htm", "xml", "css", "scss", "sass", "less",
+  "js", "jsx", "mjs", "cjs", "ts", "tsx",
+  "py", "rs", "go", "java", "kt", "swift", "c", "h", "cpp",
+  "hpp", "cs", "php", "rb", "sh", "bash", "zsh", "sql",
+  "yaml", "yml", "toml", "ini", "env", "gitignore",
+  "dockerfile", "vue", "svelte", "graphql", "gql",
+]);
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function extensionOf(name: string): string {
+  const index = name.lastIndexOf(".");
+  return index >= 0 ? name.slice(index + 1).toLowerCase() : "";
+}
+
+function isTextEntry(entry: ArchiveEntry): boolean {
+  return TEXT_EXTENSIONS.has(extensionOf(entry.entryName));
+}
+
+function getEntryIcon(entry: ArchiveEntry): string {
+  if (entry.entryType === "directory") return "▸";
+  if (entry.entryType === "archive" || entry.nestedDocumentId) return "▣";
+  return "▤";
+}
+
+export default function ArchiveBrowser({
+  chatId,
+  referenceId,
+  onClose,
+  onAddToContext,
+}: ArchiveBrowserProps) {
+  const [entries, setEntries] = useState<ArchiveEntry[]>([]);
+  const [nestedStack, setNestedStack] = useState<
+    Array<{ id: string; name: string }>
+  >([]);
+  const [loading, setLoading] = useState(false);
+  const [readingId, setReadingId] = useState<string | null>(null);
+  const [selectedEntry, setSelectedEntry] = useState<ArchiveEntry | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [previewNotice, setPreviewNotice] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const currentNestedEntryId = nestedStack.at(-1)?.id ?? null;
+
+  const breadcrumbs = useMemo(
+    () => [{ id: null as string | null, name: "Архів" }, ...nestedStack],
+    [nestedStack],
+  );
+
+  useEffect(() => {
+    let active = true;
+
+    async function loadEntries() {
+      setLoading(true);
+      setError(null);
+      setSelectedEntry(null);
+      setPreview(null);
+      setPreviewNotice("");
+
+      try {
+        const result = await invoke<ArchiveEntry[]>("list_archive_entries", {
+          chatId,
+          referenceId,
+          nestedEntryId: currentNestedEntryId,
+        });
+
+        if (active) setEntries(result);
+      } catch (cause) {
+        if (active) {
+          setEntries([]);
+          setError(
+            cause instanceof Error
+              ? cause.message
+              : String(cause),
+          );
+        }
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+
+    void loadEntries();
+
+    return () => {
+      active = false;
+    };
+  }, [chatId, referenceId, currentNestedEntryId]);
+
+  async function openTextEntry(entry: ArchiveEntry) {
+    setSelectedEntry(entry);
+    setPreview(null);
+    setPreviewNotice("");
+    setError(null);
+    setReadingId(entry.id);
+
+    try {
+      if (!isTextEntry(entry)) {
+        setPreviewNotice(
+          "Попередній перегляд цього формату буде доступний після підключення універсального обробника файлів.",
+        );
+        return;
+      }
+
+      if (entry.uncompressedSize > MAX_TEXT_PREVIEW_BYTES) {
+        setPreviewNotice(
+          `Файл завеликий для вбудованого текстового перегляду (${formatBytes(entry.uncompressedSize)}). Ліміт перегляду — ${formatBytes(MAX_TEXT_PREVIEW_BYTES)}.`,
+        );
+        return;
+      }
+
+      const chunks: Uint8Array[] = [];
+      let offset = 0;
+
+      while (offset < entry.uncompressedSize) {
+        const requestedLength = Math.min(
+          CHUNK_SIZE,
+          entry.uncompressedSize - offset,
+        );
+
+        const bytes = await invoke<number[]>("read_archive_entry_chunk", {
+          chatId,
+          referenceId,
+          entryId: entry.id,
+          offset,
+          length: requestedLength,
+        });
+
+        if (!bytes.length) break;
+
+        chunks.push(new Uint8Array(bytes));
+        offset += bytes.length;
+
+        if (bytes.length < requestedLength) break;
+      }
+
+      const combined = new Uint8Array(offset);
+      let position = 0;
+
+      for (const chunk of chunks) {
+        combined.set(chunk, position);
+        position += chunk.length;
+      }
+
+      setPreview(new TextDecoder("utf-8", { fatal: false }).decode(combined));
+
+      if (offset < entry.uncompressedSize) {
+        setPreviewNotice(
+          `Показано ${formatBytes(offset)} із ${formatBytes(entry.uncompressedSize)}.`,
+        );
+      }
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setReadingId(null);
+    }
+  }
+
+  function openNestedArchive(entry: ArchiveEntry) {
+    if (!entry.nestedDocumentId) return;
+
+    setNestedStack((current) => [
+      ...current,
+      { id: entry.id, name: entry.entryName },
+    ]);
+  }
+
+  function navigateToBreadcrumb(index: number) {
+    setNestedStack((current) => current.slice(0, index));
+  }
+
+  return (
+    <section className="archive-browser" aria-label="Перегляд архіву">
+      <header className="archive-browser__header">
+        <div className="archive-browser__heading">
+          <strong>Вміст архіву</strong>
+          <span>{entries.length} елементів</span>
+        </div>
+        <button
+          type="button"
+          className="archive-browser__close"
+          onClick={onClose}
+          aria-label="Закрити перегляд архіву"
+        >
+          ×
+        </button>
+      </header>
+
+      <nav className="archive-browser__breadcrumbs" aria-label="Шлях в архіві">
+        {breadcrumbs.map((item, index) => (
+          <span className="archive-browser__breadcrumb" key={item.id ?? "root"}>
+            {index > 0 && <span aria-hidden="true">/</span>}
+            <button
+              type="button"
+              onClick={() => navigateToBreadcrumb(index)}
+              disabled={index === breadcrumbs.length - 1}
+            >
+              {item.name}
+            </button>
+          </span>
+        ))}
+      </nav>
+
+      {error && <p className="archive-browser__error">{error}</p>}
+
+      <div className="archive-browser__content">
+        <div className="archive-browser__list">
+          {loading ? (
+            <p className="archive-browser__status">Завантаження вмісту…</p>
+          ) : entries.length === 0 ? (
+            <p className="archive-browser__status">
+              У цьому архіві немає доступних елементів.
+            </p>
+          ) : (
+            entries.map((entry) => {
+              const isNestedArchive =
+                entry.entryType === "archive" && !!entry.nestedDocumentId;
+              const isDirectory = entry.entryType === "directory";
+
+              return (
+                <button
+                  type="button"
+                  key={entry.id}
+                  className={`archive-browser__entry${
+                    selectedEntry?.id === entry.id
+                      ? " archive-browser__entry--selected"
+                      : ""
+                  }`}
+                  onClick={() => {
+                    if (isNestedArchive) openNestedArchive(entry);
+                    else if (!isDirectory) void openTextEntry(entry);
+                  }}
+                  disabled={
+                    isDirectory ||
+                    (!isNestedArchive &&
+                      entry.extractionStatus !== "completed")
+                  }
+                  title={entry.errorMessage ?? entry.entryPath}
+                >
+                  <span className="archive-browser__entry-icon">
+                    {getEntryIcon(entry)}
+                  </span>
+                  <span className="archive-browser__entry-name">
+                    {entry.entryName}
+                  </span>
+                  <span className="archive-browser__entry-size">
+                    {formatBytes(entry.uncompressedSize)}
+                  </span>
+                  {isNestedArchive && (
+                    <span className="archive-browser__entry-arrow">›</span>
+                  )}
+                  {entry.extractionStatus !== "completed" && (
+                    <span className="archive-browser__entry-status">
+                      Недоступний
+                    </span>
+                  )}
+                </button>
+              );
+            })
+          )}
+        </div>
+
+        <div className="archive-browser__preview">
+          {!selectedEntry ? (
+            <p className="archive-browser__status">
+              Вибери файл, щоб переглянути його вміст.
+            </p>
+          ) : (
+            <>
+              <div className="archive-browser__preview-header">
+                <strong>{selectedEntry.entryName}</strong>
+                <span>{formatBytes(selectedEntry.uncompressedSize)}</span>
+              </div>
+              {readingId === selectedEntry.id ? (
+                <p className="archive-browser__status">Читання файла…</p>
+              ) : preview !== null ? (
+                <div className="archive-browser__text-result">
+                  <pre className="archive-browser__text-preview">{preview}</pre>
+                  <button
+                    type="button"
+                    className="archive-browser__add-context"
+                    onClick={() => onAddToContext({
+                      referenceId,
+                      entryId: selectedEntry.id,
+                      name: selectedEntry.entryPath,
+                      content: preview,
+                    })}
+                  >
+                    Додати в контекст
+                  </button>
+                </div>
+              ) : (
+                <p className="archive-browser__status">
+                  {previewNotice || "Попередній перегляд недоступний."}
+                </p>
+              )}
+              {previewNotice && preview !== null && (
+                <p className="archive-browser__notice">{previewNotice}</p>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+
+==========================================================================================
+FILE: src/components/FileAttachments.tsx
+==========================================================================================
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import ArchiveBrowser, { type ArchiveContextItem } from "./ArchiveBrowser";
+
+export interface AttachmentReference {
+  id: string;
+  chatId: string;
+  messageId: string | null;
+  attachmentVersionId: string;
+  attachmentId: string;
+  versionNumber: number;
+  fileName: string;
+  extension: string;
+  mimeType: string;
+  blobSha256: string;
+  originalSize: number;
+  position: number;
+  purpose: string;
+  createdAt: string;
+}
+
+interface FileAttachmentsProps {
+  chatId: string;
+  attachments: AttachmentReference[];
+  onAttachmentsChange: (attachments: AttachmentReference[]) => void;
+  onArchiveContent: (item: ArchiveContextItem) => void;
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+export default function FileAttachments({
+  chatId,
+  attachments,
+  onAttachmentsChange,
+  onArchiveContent,
+}: FileAttachmentsProps) {
+  const [isDragging, setIsDragging] = useState(false);
+  const [error, setError] = useState("");
+  const [isImporting, setIsImporting] = useState(false);
+  const importInProgress = useRef(false);
+  const [archiveReferenceId, setArchiveReferenceId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenDrop: (() => void) | undefined;
+    let unlistenImported: (() => void) | undefined;
+    let unlistenError: (() => void) | undefined;
+
+    async function setupListeners() {
+      const importedListener = await listen<AttachmentReference[]>(
+        "attachments-imported",
+        (event) => {
+          if (disposed) return;
+          onAttachmentsChange(event.payload);
+          setError("");
+          setIsImporting(false);
+          importInProgress.current = false;
+        },
+      );
+
+      const errorListener = await listen<string>(
+        "attachments-import-error",
+        (event) => {
+          if (disposed) return;
+          setError(event.payload);
+          setIsImporting(false);
+          importInProgress.current = false;
+        },
+      );
+
+      const dropListener = await getCurrentWebview().onDragDropEvent(
+        (event) => {
+          if (disposed) return;
+
+          switch (event.payload.type) {
+            case "enter":
+            case "over":
+              setIsDragging(true);
+              break;
+
+            case "leave":
+              setIsDragging(false);
+              break;
+
+            case "drop": {
+              setIsDragging(false);
+              const paths = event.payload.paths;
+
+              if (paths.length > 0) {
+                void importPaths(paths);
+              }
+              break;
+            }
+          }
+        },
+      );
+
+      if (disposed) {
+        importedListener();
+        errorListener();
+        dropListener();
+        return;
+      }
+
+      unlistenImported = importedListener;
+      unlistenError = errorListener;
+      unlistenDrop = dropListener;
+    }
+
+    void setupListeners().catch((cause) => {
+      if (!disposed) {
+        setError(
+          cause instanceof Error
+            ? cause.message
+            : "Не вдалося підключити обробники вкладень.",
+        );
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlistenImported?.();
+      unlistenError?.();
+      unlistenDrop?.();
+    };
+  }, [chatId, onAttachmentsChange]);
+
+  async function importPaths(paths: string[]) {
+    if (importInProgress.current || paths.length === 0) return;
+
+    importInProgress.current = true;
+    setIsImporting(true);
+    setError("");
+
+    try {
+      await invoke("import_files", { chatId, paths });
+    } catch (cause) {
+      importInProgress.current = false;
+      setIsImporting(false);
+      setError(
+        cause instanceof Error ? cause.message : "Не вдалося імпортувати файли.",
+      );
+    }
+  }
+
+  async function openFileDialog() {
+    if (importInProgress.current) return;
+
+    setError("");
+
+    try {
+      await invoke("import_attachments", { chatId });
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Не вдалося відкрити діалог вибору файлів.",
+      );
+    }
+  }
+
+  async function removeAttachment(referenceId: string) {
+    setError("");
+
+    try {
+      await invoke("remove_attachment_reference", {
+        referenceId,
+      });
+
+      const updated = await invoke<AttachmentReference[]>(
+        "list_composer_attachments",
+        { chatId },
+      );
+
+      onAttachmentsChange(updated);
+    } catch (cause) {
+      setError(
+        cause instanceof Error
+          ? cause.message
+          : "Не вдалося видалити вкладення.",
+      );
+    }
+  }
+
+  return (
+    <div className={`file-attachments ${isDragging ? "is-dragging" : ""}`}>
+      <button
+        type="button"
+        className="file-attach-btn"
+        onClick={() => void openFileDialog()}
+        disabled={isImporting}
+        title="Додати файли"
+      >
+        <span aria-hidden="true">＋</span> Додати файли
+      </button>
+
+      {attachments.length > 0 && (
+        <div className="file-attachments-list">
+          {attachments.map((attachment) => (
+            <div className="file-attachment" key={attachment.id}>
+              <div className="file-attachment-preview">
+                <span className="file-attachment-name">
+                  {attachment.fileName}
+                </span>
+                <span className="file-attachment-size">
+                  {formatFileSize(attachment.originalSize)}
+                </span>
+
+                {/\.(zip|tar|gz|tgz)$/i.test(attachment.fileName) && (
+                  <button
+                    type="button"
+                    className="file-attachment-open"
+                    onClick={() => setArchiveReferenceId(attachment.id)}
+                    title="Переглянути вміст архіву"
+                    aria-label={`Переглянути архів ${attachment.fileName}`}
+                  >
+                    Переглянути
+                  </button>
+                )}
+              </div>
+
+              <button
+                type="button"
+                className="file-attachment-remove"
+                onClick={() => void removeAttachment(attachment.id)}
+                aria-label={`Видалити ${attachment.fileName}`}
+                title="Видалити файл"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {archiveReferenceId && (
+        <ArchiveBrowser
+          key={`${chatId}:${archiveReferenceId}`}
+          chatId={chatId}
+          referenceId={archiveReferenceId}
+          onClose={() => setArchiveReferenceId(null)}
+    onAddToContext={onArchiveContent}
+        />
+      )}
+
+      {isImporting && (
+        <div className="file-attachments-status">Імпорт файлів...</div>
+      )}
+
+      {error && (
+        <div className="file-attachments-error" role="alert">
+          {error}
+        </div>
+      )}
+
+      {isDragging && (
+        <div className="file-drop-overlay">
+          Відпусти файли, щоб додати їх
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+==========================================================================================
+FILE: src/components/ChatInput.tsx
+==========================================================================================
+import FileAttachments, {
+  type AttachmentReference,
+} from "./FileAttachments";
+import type { ArchiveContextItem } from "./ArchiveBrowser";
+
+interface ChatInputProps {
+  input: string;
+  onInputChange: (value: string) => void;
+  isGenerating: boolean;
+  elapsedSec: number;
+  onSend: () => void | Promise<void>;
+  onStop: () => void;
+  chatId: string;
+  attachments: AttachmentReference[];
+  onAttachmentsChange: (attachments: AttachmentReference[]) => void;
+  hasArchiveContext: boolean;
+  onArchiveContent: (item: ArchiveContextItem) => void;
+}
+
+export default function ChatInput({
+  input,
+  onInputChange,
+  isGenerating,
+  elapsedSec,
+  onSend,
+  onStop,
+  chatId,
+  attachments,
+  onAttachmentsChange,
+  hasArchiveContext,
+  onArchiveContent,
+}: ChatInputProps) {
+  return (
+    <div className="sonne-input-wrap">
+      <FileAttachments
+        chatId={chatId}
+        attachments={attachments}
+        onAttachmentsChange={onAttachmentsChange}
+        onArchiveContent={onArchiveContent}
+      />
+
+      <div className="input-box">
+        <textarea
+          placeholder="Напиши запит... (Enter — надіслати, Shift+Enter — новий рядок)"
+          value={input}
+          onChange={(event) => onInputChange(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey && !isGenerating) {
+              event.preventDefault();
+              void onSend();
+            }
+          }}
+        />
+
+        <button
+          className="send-btn"
+          onClick={() => {
+            if (isGenerating) onStop();
+            else void onSend();
+          }}
+          disabled={
+            !isGenerating && !input.trim() && attachments.length === 0 && !hasArchiveContext
+          }
+        >
+          {isGenerating ? `Зупинити · ${elapsedSec.toFixed(0)} с` : "Надіслати"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+
+==========================================================================================
+FILE: src/components/LivePreview.tsx
+==========================================================================================
+interface LivePreviewProps {
+  html: string;
+  onClose: () => void;
+}
+
+export default function LivePreview({ html, onClose }: LivePreviewProps) {
+  return (
+    <aside className="preview-pane">
+      <div className="preview-header">
+        <span>Live Preview</span>
+        <button className="mini-btn" onClick={onClose}>
+          Закрити ✕
+        </button>
+      </div>
+
+      <iframe
+        className="preview-frame"
+        srcDoc={html}
+        sandbox="allow-scripts"
+        title="Live Preview"
+      />
+    </aside>
+  );
+}
+
+
+==========================================================================================
+FILE: src-tauri/src/storage/mod.rs
+==========================================================================================
+mod schema;
+pub mod archive;
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use rusqlite::{Connection, OpenFlags};
+use schema::{INITIAL_SCHEMA, MIGRATION_1_TO_2, SCHEMA_VERSION};
+
+pub(super) const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_IMPORT_BATCH_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+pub(super) const MAX_IMPORT_FILES: usize = 100;
+
+pub struct Storage {
+    connection: Connection,
+    root_dir: PathBuf,
+}
+
+impl Storage {
+    pub fn initialize(app_data_dir: &Path) -> Result<Self, String> {
+        let root_dir = app_data_dir.join("storage");
+
+        for directory in [
+            root_dir.join("blobs"),
+            root_dir.join("temp"),
+            root_dir.join("extracted"),
+            root_dir.join("indexes"),
+        ] {
+            fs::create_dir_all(&directory)
+                .map_err(|error| format!("Cannot create storage directory: {error}"))?;
+        }
+
+        let database_path = root_dir.join("sonne.db");
+
+        let mut connection = Connection::open_with_flags(
+            &database_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+        )
+        .map_err(|error| format!("Cannot open Sonne database: {error}"))?;
+
+        connection
+            .busy_timeout(Duration::from_secs(10))
+            .map_err(|error| format!("Cannot configure database timeout: {error}"))?;
+
+        connection
+            .execute_batch(
+                "
+                PRAGMA foreign_keys = ON;
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                PRAGMA temp_store = MEMORY;
+                PRAGMA mmap_size = 268435456;
+                ",
+            )
+            .map_err(|error| format!("Cannot configure SQLite: {error}"))?;
+
+        let current_version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(|error| format!("Cannot read database version: {error}"))?;
+
+        if current_version > SCHEMA_VERSION {
+            return Err(format!(
+                "Database version {current_version} is newer than supported version {SCHEMA_VERSION}"
+            ));
+        }
+
+        if current_version < SCHEMA_VERSION {
+            let transaction = connection
+                .transaction()
+                .map_err(|error| format!("Cannot begin schema migration: {error}"))?;
+
+            match current_version {
+                0 => {
+                    transaction
+                        .execute_batch(INITIAL_SCHEMA)
+                        .map_err(|error| format!("Cannot initialize database schema: {error}"))?;
+
+                    transaction
+                        .execute_batch(MIGRATION_1_TO_2)
+                        .map_err(|error| format!("Cannot migrate database schema 1 to 2: {error}"))?;
+                }
+                1 => {
+                    transaction
+                        .execute_batch(MIGRATION_1_TO_2)
+                        .map_err(|error| format!("Cannot migrate database schema 1 to 2: {error}"))?;
+                }
+                version => {
+                    return Err(format!("No migration path from database version {version}"));
+                }
+            }
+
+            transaction
+                .pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|error| format!("Cannot update database version: {error}"))?;
+
+            transaction
+                .commit()
+                .map_err(|error| format!("Cannot commit schema migration: {error}"))?;
+        }
+
+        blobs::recover_interrupted_operations(&connection, &root_dir)?;
+        Ok(Self {
+            connection,
+            root_dir,
+        })
+    }
+
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+}
+
+mod records;
+pub use records::{ChatRecord, MessageRecord, StartTurnRecord};
+
+pub mod commands;
+
+mod blobs;
+pub use blobs::BlobRecord;
+
+pub mod attachments;
+pub use attachments::{AttachmentReferenceRecord, AttachmentVersionRecord};
+
+pub mod import;
+
+mod preview;
+pub use preview::handle_preview_request;
+
+
+==========================================================================================
+FILE: src-tauri/src/storage/schema.rs
+==========================================================================================
+pub const SCHEMA_VERSION: i64 = 2;
+
+pub const INITIAL_SCHEMA: &str = r#"
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS chats (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL DEFAULT '',
+    prompt_content TEXT,
+    model_used TEXT,
+    mode_used TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_chat_created
+ON messages(chat_id, created_at);
+
+-- One physical file per SHA-256 hash.
+CREATE TABLE IF NOT EXISTS blobs (
+    sha256 TEXT PRIMARY KEY,
+    relative_path TEXT NOT NULL UNIQUE,
+    original_size INTEGER NOT NULL CHECK (original_size >= 0),
+    stored_size INTEGER NOT NULL CHECK (stored_size >= 0),
+    storage_state TEXT NOT NULL DEFAULT 'original'
+        CHECK (storage_state IN ('original', 'compressed', 'processing')),
+    compression_format TEXT,
+    created_at INTEGER NOT NULL,
+    last_accessed_at INTEGER NOT NULL,
+    verified_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attachment_versions (
+    id TEXT PRIMARY KEY,
+    attachment_id TEXT NOT NULL,
+    version_number INTEGER NOT NULL CHECK (version_number > 0),
+    blob_sha256 TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    extension TEXT NOT NULL DEFAULT '',
+    mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    created_at INTEGER NOT NULL,
+    UNIQUE (attachment_id, version_number),
+    FOREIGN KEY (attachment_id) REFERENCES attachments(id) ON DELETE CASCADE,
+    FOREIGN KEY (blob_sha256) REFERENCES blobs(sha256) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachment_versions_blob
+ON attachment_versions(blob_sha256);
+
+-- A reference may belong to a composer draft or a sent message.
+-- Chat ownership allows safe cleanup when a chat is permanently deleted.
+CREATE TABLE IF NOT EXISTS attachment_references (
+    id TEXT PRIMARY KEY,
+    chat_id TEXT NOT NULL,
+    attachment_version_id TEXT NOT NULL,
+    message_id TEXT,
+    purpose TEXT NOT NULL CHECK (purpose IN ('composer', 'message')),
+    position INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (chat_id) REFERENCES chats(id) ON DELETE CASCADE,
+    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+    FOREIGN KEY (attachment_version_id)
+        REFERENCES attachment_versions(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_attachment_refs_chat
+ON attachment_references(chat_id, purpose, position);
+
+CREATE INDEX IF NOT EXISTS idx_attachment_refs_version
+ON attachment_references(attachment_version_id);
+
+CREATE INDEX IF NOT EXISTS idx_attachment_refs_message
+ON attachment_references(message_id);
+
+-- Extraction results are reusable for identical physical files.
+CREATE TABLE IF NOT EXISTS extracted_documents (
+    id TEXT PRIMARY KEY,
+    blob_sha256 TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    language TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE (blob_sha256, extractor, extractor_version),
+    FOREIGN KEY (blob_sha256) REFERENCES blobs(sha256) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS document_chunks (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    content TEXT NOT NULL,
+    token_count INTEGER,
+    start_offset INTEGER,
+    end_offset INTEGER,
+    UNIQUE (document_id, ordinal),
+    FOREIGN KEY (document_id) REFERENCES extracted_documents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_chunks_document
+ON document_chunks(document_id, ordinal);
+
+-- Embeddings are versioned by model name; vectors are stored as float32 BLOBs.
+CREATE TABLE IF NOT EXISTS embeddings (
+    chunk_id TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+    vector BLOB NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (chunk_id, model_name),
+    FOREIGN KEY (chunk_id) REFERENCES document_chunks(id) ON DELETE CASCADE
+);
+
+-- Full-text search is kept in sync with document_chunks.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunk_search USING fts5(
+    chunk_id UNINDEXED,
+    content,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+
+CREATE TRIGGER IF NOT EXISTS document_chunks_ai
+AFTER INSERT ON document_chunks
+BEGIN
+    INSERT INTO chunk_search(chunk_id, content)
+    VALUES (new.id, new.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS document_chunks_ad
+AFTER DELETE ON document_chunks
+BEGIN
+    DELETE FROM chunk_search WHERE chunk_id = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS document_chunks_au
+AFTER UPDATE OF content ON document_chunks
+BEGIN
+    DELETE FROM chunk_search WHERE chunk_id = old.id;
+    INSERT INTO chunk_search(chunk_id, content)
+    VALUES (new.id, new.content);
+END;
+
+-- Crash-safe journal for filesystem operations.
+CREATE TABLE IF NOT EXISTS storage_operations (
+    id TEXT PRIMARY KEY,
+    operation_type TEXT NOT NULL,
+    blob_sha256 TEXT,
+    source_path TEXT,
+    target_path TEXT,
+    state TEXT NOT NULL
+        CHECK (state IN (
+            'PENDING',
+            'PROCESSING',
+            'VERIFYING',
+            'COMMITTING',
+            'COMPLETED',
+            'FAILED'
+        )),
+    metadata_json TEXT,
+    error_message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY (blob_sha256) REFERENCES blobs(sha256) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_storage_operations_state
+ON storage_operations(state, updated_at);
+
+CREATE TABLE IF NOT EXISTS storage_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO storage_metadata(key, value)
+VALUES ('schema_version', '1');
+"#;
+
+pub const MIGRATION_1_TO_2: &str = r#"
+ALTER TABLE extracted_documents ADD COLUMN detected_format TEXT;
+ALTER TABLE extracted_documents ADD COLUMN metadata_json TEXT;
+ALTER TABLE extracted_documents ADD COLUMN content_relative_path TEXT;
+ALTER TABLE extracted_documents ADD COLUMN preview_relative_path TEXT;
+ALTER TABLE extracted_documents ADD COLUMN error_code TEXT;
+ALTER TABLE extracted_documents ADD COLUMN error_message TEXT;
+ALTER TABLE extracted_documents ADD COLUMN processed_at INTEGER;
+ALTER TABLE extracted_documents ADD COLUMN source_size INTEGER;
+
+CREATE TABLE document_sections (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    parent_id TEXT,
+    section_type TEXT NOT NULL CHECK (
+        section_type IN (
+            'root', 'page', 'sheet', 'slide', 'chapter', 'table',
+            'paragraph', 'header', 'footer', 'notes', 'archive_entry'
+        )
+    ),
+    title TEXT,
+    ordinal INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES extracted_documents(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES document_sections(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_document_sections_document
+ON document_sections(document_id, ordinal);
+
+CREATE INDEX idx_document_sections_parent
+ON document_sections(parent_id, ordinal);
+
+ALTER TABLE document_chunks ADD COLUMN section_id TEXT REFERENCES document_sections(id) ON DELETE SET NULL;
+ALTER TABLE document_chunks ADD COLUMN chunk_type TEXT NOT NULL DEFAULT 'text';
+ALTER TABLE document_chunks ADD COLUMN metadata_json TEXT;
+
+CREATE INDEX idx_document_chunks_section
+ON document_chunks(section_id, ordinal);
+
+CREATE TABLE document_assets (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    section_id TEXT,
+    blob_sha256 TEXT,
+    asset_type TEXT NOT NULL,
+    mime_type TEXT,
+    file_name TEXT,
+    metadata_json TEXT,
+    ordinal INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES extracted_documents(id) ON DELETE CASCADE,
+    FOREIGN KEY (section_id) REFERENCES document_sections(id) ON DELETE SET NULL,
+    FOREIGN KEY (blob_sha256) REFERENCES blobs(sha256) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_document_assets_document
+ON document_assets(document_id, ordinal);
+
+CREATE TABLE archive_entries (
+    id TEXT PRIMARY KEY,
+    document_id TEXT NOT NULL,
+    parent_id TEXT,
+    entry_path TEXT NOT NULL,
+    entry_name TEXT NOT NULL,
+    entry_type TEXT NOT NULL CHECK (
+        entry_type IN ('file', 'directory', 'archive', 'unsupported')
+    ),
+    nested_depth INTEGER NOT NULL DEFAULT 0 CHECK (nested_depth BETWEEN 0 AND 2),
+    compression_method TEXT,
+    compressed_size INTEGER,
+    uncompressed_size INTEGER,
+    blob_sha256 TEXT,
+    nested_document_id TEXT,
+    extraction_status TEXT NOT NULL DEFAULT 'pending',
+    error_message TEXT,
+    ordinal INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES extracted_documents(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES archive_entries(id) ON DELETE CASCADE,
+    FOREIGN KEY (blob_sha256) REFERENCES blobs(sha256) ON DELETE SET NULL,
+    FOREIGN KEY (nested_document_id) REFERENCES extracted_documents(id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_archive_entries_document
+ON archive_entries(document_id, ordinal);
+
+CREATE INDEX idx_archive_entries_parent
+ON archive_entries(parent_id, ordinal);
+
+UPDATE storage_metadata SET value = '2' WHERE key = 'schema_version';
+"#;
+
+
+==========================================================================================
+FILE: src-tauri/src/storage/import.rs
+==========================================================================================
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use rusqlite::params;
+use serde_json::json;
+use tauri::{AppHandle, Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
+use uuid::Uuid;
+
+use super::{
+    AttachmentReferenceRecord, MAX_FILE_SIZE_BYTES, MAX_IMPORT_BATCH_SIZE_BYTES,
+    MAX_IMPORT_FILES, Storage,
+};
+
+fn now_timestamp() -> Result<i64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System clock error: {error}"))?;
+
+    i64::try_from(duration.as_millis()).map_err(|error| format!("Timestamp overflow: {error}"))
+}
+
+fn file_metadata(path: &Path) -> Result<(String, String, String), String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "Selected file has no filename".to_string())?
+        .to_string_lossy()
+        .into_owned();
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let mime_type = match extension.as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "avif" => "image/avif",
+        "heic" | "heif" => "image/heic",
+        "txt" | "log" | "csv" | "tsv" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "html" | "htm" => "text/html",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "js" | "mjs" | "cjs" => "text/javascript",
+        "ts" | "tsx" => "text/typescript",
+        "css" => "text/css",
+        "rs" => "text/rust",
+        "py" => "text/x-python",
+        "java" => "text/x-java-source",
+        "c" | "h" => "text/x-c",
+        "cpp" | "hpp" | "cc" => "text/x-c++",
+        "sh" | "bash" => "text/x-shellscript",
+        "yaml" | "yml" => "application/yaml",
+        "toml" => "application/toml",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        "odp" => "application/vnd.oasis.opendocument.presentation",
+        "epub" => "application/epub+zip",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "rtf" => "application/rtf",
+        _ => "application/octet-stream",
+    };
+
+    Ok((file_name, extension, mime_type.to_string()))
+}
+
+struct PreparedAttachment {
+    blob_sha256: String,
+    file_name: String,
+    extension: String,
+    mime_type: String,
+}
+
+impl Storage {
+    fn import_selected_paths(
+        &mut self,
+        chat_id: &str,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<AttachmentReferenceRecord>, String> {
+        if paths.is_empty() {
+            return self.list_composer_attachments(chat_id);
+        }
+
+        if paths.len() > MAX_IMPORT_FILES {
+            return Err(format!(
+                "An import batch cannot contain more than {MAX_IMPORT_FILES} files"
+            ));
+        }
+
+        let mut declared_batch_size = 0u64;
+
+        for path in &paths {
+            let metadata = std::fs::metadata(path)
+                .map_err(|error| format!("Cannot inspect file {}: {error}", path.display()))?;
+
+            if !metadata.is_file() {
+                return Err(format!("Not a regular file: {}", path.display()));
+            }
+
+            let file_size = metadata.len();
+
+            if file_size > MAX_FILE_SIZE_BYTES {
+                return Err(format!(
+                    "File {} exceeds the maximum size of {} MiB",
+                    path.display(),
+                    MAX_FILE_SIZE_BYTES / (1024 * 1024)
+                ));
+            }
+
+            declared_batch_size = declared_batch_size
+                .checked_add(file_size)
+                .ok_or_else(|| "Import batch size overflow".to_string())?;
+
+            if declared_batch_size > MAX_IMPORT_BATCH_SIZE_BYTES {
+                return Err(format!(
+                    "The total import batch exceeds the maximum size of {} MiB",
+                    MAX_IMPORT_BATCH_SIZE_BYTES / (1024 * 1024)
+                ));
+            }
+        }
+
+        let timestamp = now_timestamp()?;
+        let operation_id = Uuid::new_v4().to_string();
+
+        let chat_exists: bool = self
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM chats WHERE id = ?1)",
+                params![chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Cannot verify import chat: {error}"))?;
+
+        if !chat_exists {
+            return Err(format!("Chat not found: {chat_id}"));
+        }
+
+        let existing = self.list_composer_attachments(chat_id)?;
+        let mut position = i64::try_from(existing.len())
+            .map_err(|error| format!("Attachment position overflow: {error}"))?;
+
+        self.connection
+            .execute(
+                "INSERT INTO storage_operations (
+                    id, operation_type, state, metadata_json,
+                    created_at, updated_at
+                ) VALUES (?1, 'import_batch', 'PENDING', ?2, ?3, ?3)",
+                params![
+                    operation_id,
+                    json!({
+                        "chatId": chat_id,
+                        "files": []
+                    })
+                    .to_string(),
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("Cannot create import journal: {error}"))?;
+
+        self.connection
+            .execute(
+                "UPDATE storage_operations
+                 SET state = 'PROCESSING', updated_at = ?1
+                 WHERE id = ?2",
+                params![now_timestamp()?, operation_id],
+            )
+            .map_err(|error| format!("Cannot start import journal: {error}"))?;
+
+        let preparation = (|| -> Result<Vec<PreparedAttachment>, String> {
+            let mut prepared = Vec::with_capacity(paths.len());
+            let mut imported_size = 0u64;
+
+            for path in paths {
+                let metadata = std::fs::metadata(&path)
+                    .map_err(|error| format!("Cannot inspect file {}: {error}", path.display()))?;
+
+                if !metadata.is_file() {
+                    return Err(format!("Not a regular file: {}", path.display()));
+                }
+
+                let (file_name, extension, mime_type) = file_metadata(&path)?;
+
+                let file = File::open(&path)
+                    .map_err(|error| format!("Cannot open {file_name}: {error}"))?;
+
+                let remaining_batch_size =
+                    MAX_IMPORT_BATCH_SIZE_BYTES.saturating_sub(imported_size);
+                let effective_limit = MAX_FILE_SIZE_BYTES.min(remaining_batch_size);
+                let blob = self.store_blob_with_limit(file, effective_limit)?;
+
+                imported_size = imported_size
+                    .checked_add(
+                        u64::try_from(blob.original_size)
+                            .map_err(|error| format!("Invalid stored blob size: {error}"))?
+                    )
+                    .ok_or_else(|| "Import batch size overflow".to_string())?;
+
+                prepared.push(PreparedAttachment {
+                    blob_sha256: blob.sha256,
+                    file_name,
+                    extension,
+                    mime_type,
+                });
+
+                let files_json: Vec<_> = prepared
+                    .iter()
+                    .map(|item| {
+                        json!({
+                            "blobSha256": item.blob_sha256,
+                            "fileName": item.file_name,
+                            "extension": item.extension,
+                            "mimeType": item.mime_type
+                        })
+                    })
+                    .collect();
+
+                self.connection
+                    .execute(
+                        "UPDATE storage_operations
+                         SET metadata_json = ?1, updated_at = ?2
+                         WHERE id = ?3",
+                        params![
+                            json!({
+                                "chatId": chat_id,
+                                "files": files_json
+                            })
+                            .to_string(),
+                            now_timestamp()?,
+                            operation_id
+                        ],
+                    )
+                    .map_err(|error| format!("Cannot update import journal: {error}"))?;
+            }
+
+            Ok(prepared)
+        })();
+
+        let prepared = match preparation {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let _ = self.connection.execute(
+                    "UPDATE storage_operations
+                     SET state = 'FAILED', error_message = ?1, updated_at = ?2
+                     WHERE id = ?3",
+                    params![error, now_timestamp().unwrap_or(timestamp), operation_id],
+                );
+                return Err(error);
+            }
+        };
+
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| format!("Cannot start atomic attachment transaction: {error}"))?;
+
+        let commit_result = (|| -> Result<(), String> {
+            for item in &prepared {
+                let version = super::attachments::create_attachment_version_in_transaction(
+                    &transaction,
+                    None,
+                    &item.blob_sha256,
+                    &item.file_name,
+                    &item.extension,
+                    &item.mime_type,
+                    timestamp,
+                )?;
+
+                super::attachments::add_attachment_reference_in_transaction(
+                    &transaction,
+                    chat_id,
+                    &version.id,
+                    None,
+                    "composer",
+                    position,
+                    timestamp,
+                )?;
+
+                position = position
+                    .checked_add(1)
+                    .ok_or_else(|| "Attachment position overflow".to_string())?;
+            }
+
+            transaction
+                .execute(
+                    "UPDATE storage_operations
+                     SET state = 'COMPLETED', updated_at = ?1, error_message = NULL
+                     WHERE id = ?2",
+                    params![now_timestamp()?, operation_id],
+                )
+                .map_err(|error| format!("Cannot complete import journal: {error}"))?;
+
+            Ok(())
+        })();
+
+        if let Err(error) = commit_result {
+            drop(transaction);
+
+            let _ = self.connection.execute(
+                "UPDATE storage_operations
+                 SET state = 'FAILED', error_message = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![error, now_timestamp().unwrap_or(timestamp), operation_id],
+            );
+
+            return Err(error);
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| format!("Cannot commit imported attachments: {error}"))?;
+
+        
+        for item in &prepared {
+            if super::archive::is_supported_archive_extension(
+                &item.extension,
+                &item.file_name,
+            ) {
+                if let Err(error) = super::archive::index_imported_archive(
+                    self,
+                    &item.blob_sha256,
+                    &item.file_name,
+                    &item.extension,
+                ) {
+                    eprintln!("Archive indexing failed for {}: {}", item.file_name, error);
+                }
+            }
+        }
+
+        self.list_composer_attachments(chat_id)
+    }
+}
+
+fn process_selected_paths(app: AppHandle, paths: Vec<PathBuf>, chat_id: String) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| -> Result<Vec<AttachmentReferenceRecord>, String> {
+            let state = app.state::<Mutex<Storage>>();
+            let mut storage = state
+                .lock()
+                .map_err(|error| format!("Storage lock poisoned: {error}"))?;
+
+            storage.import_selected_paths(&chat_id, paths)
+        })();
+
+        match result {
+            Ok(attachments) => {
+                let _ = app.emit("attachments-imported", attachments);
+            }
+            Err(error) => {
+                // Keep the frontend draft synchronized even after a failed batch.
+                let current = (|| {
+                    let state = app.state::<Mutex<Storage>>();
+                    let storage = state.lock().ok()?;
+                    storage.list_composer_attachments(&chat_id).ok()
+                })();
+
+                if let Some(attachments) = current {
+                    let _ = app.emit("attachments-imported", attachments);
+                }
+
+                let _ = app.emit("attachments-import-error", error);
+            }
+        }
+    });
+}
+
+#[tauri::command]
+pub fn import_attachments(app: AppHandle, chat_id: String) -> Result<(), String> {
+    let callback_app = app.clone();
+
+    app.dialog().file().pick_files(move |selected_files| {
+        if let Some(selected_files) = selected_files {
+            let paths = selected_files
+                .into_iter()
+                .map(|file| file.into_path())
+                .collect::<Result<Vec<_>, _>>();
+
+            match paths {
+                Ok(paths) => process_selected_paths(callback_app, paths, chat_id),
+                Err(error) => {
+                    let _ = callback_app.emit(
+                        "attachments-import-error",
+                        format!("Cannot resolve selected files: {error}"),
+                    );
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn import_files(app: AppHandle, chat_id: String, paths: Vec<String>) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    process_selected_paths(app, paths.into_iter().map(PathBuf::from).collect(), chat_id);
+
+    Ok(())
+}
+
+
+==========================================================================================
+FILE: src-tauri/src/storage/archive.rs
+==========================================================================================
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use flate2::read::GzDecoder;
+use rusqlite::{OptionalExtension, params};
+use tar::{Archive as TarArchive, EntryType};
+use uuid::Uuid;
+use zip::ZipArchive;
+
+use super::Storage;
+
+pub(super) const MAX_ARCHIVE_ENTRIES: usize = 10_000;
+pub(super) const MAX_ARCHIVE_TOTAL_SIZE: u64 = 1024 * 1024 * 1024;
+pub(super) const MAX_ARCHIVE_ENTRY_SIZE: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_NESTED_ARCHIVE_DEPTH: u8 = 2;
+
+#[derive(Debug)]
+pub(super) struct ArchiveBudget {
+    entries: usize,
+    extracted_bytes: u64,
+}
+
+impl ArchiveBudget {
+    pub(super) fn new() -> Self {
+        Self { entries: 0, extracted_bytes: 0 }
+    }
+
+    fn register_entry(&mut self) -> Result<(), String> {
+        self.entries = self.entries.checked_add(1)
+            .ok_or_else(|| "Archive entry counter overflow".to_string())?;
+        if self.entries > MAX_ARCHIVE_ENTRIES {
+            return Err(format!("Archive exceeds {MAX_ARCHIVE_ENTRIES} entries"));
+        }
+        Ok(())
+    }
+
+    fn remaining(&self) -> u64 {
+        MAX_ARCHIVE_TOTAL_SIZE.saturating_sub(self.extracted_bytes)
+    }
+
+    fn entry_limit(&self) -> u64 {
+        self.remaining().min(MAX_ARCHIVE_ENTRY_SIZE)
+    }
+
+    fn register_bytes(&mut self, bytes: u64) -> Result<(), String> {
+        let next = self.extracted_bytes.checked_add(bytes)
+            .ok_or_else(|| "Archive extraction size overflow".to_string())?;
+        if next > MAX_ARCHIVE_TOTAL_SIZE {
+            return Err("Archive exceeds the 1 GiB extraction limit".to_string());
+        }
+        self.extracted_bytes = next;
+        Ok(())
+    }
+}
+
+pub(super) fn validate_archive_entry_path(raw: &str) -> Result<String, String> {
+    if raw.is_empty()
+        || raw.starts_with('/')
+        || raw.starts_with("//")
+        || raw.contains('\\')
+        || raw.contains('\0')
+    {
+        return Err("Unsafe archive entry path".into());
+    }
+
+    let path = Path::new(raw);
+    if path.components().any(|component| {
+        matches!(component, Component::ParentDir | Component::RootDir | Component::Prefix(_))
+    }) {
+        return Err("Archive entry attempts path traversal".into());
+    }
+
+    let mut parts = Vec::new();
+    for part in raw.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." || part.contains(':') || part.chars().any(char::is_control) {
+            return Err("Unsafe archive path component".into());
+        }
+        parts.push(part);
+    }
+
+    if parts.is_empty() {
+        return Err("Empty archive entry path".into());
+    }
+    Ok(parts.join("/"))
+}
+
+fn timestamp() -> Result<i64, String> {
+    let duration = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("System clock error: {e}"))?;
+    i64::try_from(duration.as_millis()).map_err(|e| format!("Timestamp overflow: {e}"))
+}
+
+fn is_archive_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.ends_with(".zip")
+        || name.ends_with(".tar")
+        || name.ends_with(".tar.gz")
+        || name.ends_with(".tgz")
+        || name.ends_with(".gz")
+}
+
+pub(super) fn is_supported_archive_extension(extension: &str, file_name: &str) -> bool {
+    matches!(extension, "zip" | "tar" | "gz" | "tgz")
+        || file_name.to_ascii_lowercase().ends_with(".tar.gz")
+}
+
+fn safe_blob_path(storage: &Storage, sha256: &str) -> Result<PathBuf, String> {
+    let relative: String = storage.connection.query_row(
+        "SELECT relative_path FROM blobs WHERE sha256 = ?1",
+        params![sha256],
+        |row| row.get(0),
+    ).map_err(|e| format!("Cannot locate archive blob: {e}"))?;
+
+    let relative_path = Path::new(&relative);
+    if relative_path.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err("Invalid blob storage path".into());
+    }
+
+    let blobs_root = storage.root_dir.join("blobs").canonicalize()
+        .map_err(|e| format!("Cannot resolve blob directory: {e}"))?;
+    let candidate = storage.root_dir.join(relative_path);
+    let metadata = fs::symlink_metadata(&candidate)
+        .map_err(|e| format!("Cannot inspect archive blob: {e}"))?;
+
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("Archive blob is not a regular file".into());
+    }
+
+    let resolved = candidate.canonicalize()
+        .map_err(|e| format!("Cannot resolve archive blob: {e}"))?;
+    if !resolved.starts_with(&blobs_root) {
+        return Err("Archive blob is outside the blob storage directory".into());
+    }
+    Ok(resolved)
+}
+
+fn create_document(
+    storage: &Storage,
+    sha256: &str,
+    format: &str,
+    parent_id: Option<&str>,
+) -> Result<String, String> {
+    let now = timestamp()?;
+    let id = Uuid::new_v4().to_string();
+    let version = format!("1:{}", parent_id.unwrap_or("root"));
+
+    storage.connection.execute(
+        "INSERT OR IGNORE INTO extracted_documents (
+            id, blob_sha256, extractor, extractor_version, status,
+            created_at, updated_at, detected_format, source_size
+        )
+        SELECT ?1, sha256, 'archive', ?2, 'processing',
+               ?3, ?3, ?4, original_size
+        FROM blobs WHERE sha256 = ?5",
+        params![id, version, now, format, sha256],
+    ).map_err(|e| format!("Cannot create archive document: {e}"))?;
+
+    let document_id: String = storage.connection.query_row(
+        "SELECT id FROM extracted_documents
+         WHERE blob_sha256 = ?1 AND extractor = 'archive' AND extractor_version = ?2",
+        params![sha256, version],
+        |row| row.get(0),
+    ).map_err(|e| format!("Cannot retrieve archive document: {e}"))?;
+
+    storage.connection.execute(
+        "UPDATE extracted_documents
+         SET status = 'processing', detected_format = ?1,
+             error_code = NULL, error_message = NULL,
+             updated_at = ?2, processed_at = NULL
+         WHERE id = ?3",
+        params![format, now, document_id],
+    ).map_err(|e| format!("Cannot prepare archive document: {e}"))?;
+
+    storage.connection.execute(
+        "DELETE FROM archive_entries WHERE document_id = ?1",
+        params![document_id],
+    ).map_err(|e| format!("Cannot reset archive entries: {e}"))?;
+
+    Ok(document_id)
+}
+
+fn set_document_status(
+    storage: &Storage,
+    id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    let now = timestamp()?;
+    storage.connection.execute(
+        "UPDATE extracted_documents
+         SET status = ?1,
+             error_code = CASE WHEN ?2 IS NULL THEN NULL ELSE 'ARCHIVE_PROCESSING' END,
+             error_message = ?2, updated_at = ?3, processed_at = ?3
+         WHERE id = ?4",
+        params![status, error, now, id],
+    ).map_err(|e| format!("Cannot update archive status: {e}"))?;
+    Ok(())
+}
+
+fn insert_entry(
+    storage: &Storage,
+    document_id: &str,
+    parent_id: Option<&str>,
+    path: &str,
+    kind: &str,
+    depth: u8,
+    compression: Option<&str>,
+    compressed_size: Option<u64>,
+    size: Option<u64>,
+    blob_sha256: Option<&str>,
+    status: &str,
+    error: Option<&str>,
+) -> Result<String, String> {
+    let id = Uuid::new_v4().to_string();
+    let now = timestamp()?;
+    let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or(path);
+    let compressed = compressed_size.map(i64::try_from).transpose()
+        .map_err(|e| format!("Compressed size overflow: {e}"))?;
+    let uncompressed = size.map(i64::try_from).transpose()
+        .map_err(|e| format!("Entry size overflow: {e}"))?;
+
+    storage.connection.execute(
+        "INSERT INTO archive_entries (
+            id, document_id, parent_id, entry_path, entry_name,
+            entry_type, nested_depth, compression_method,
+            compressed_size, uncompressed_size, blob_sha256,
+            extraction_status, error_message, ordinal, created_at
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+            (SELECT COUNT(*) FROM archive_entries WHERE document_id = ?2), ?14
+        )",
+        params![
+            id, document_id, parent_id, path, name, kind, i64::from(depth),
+            compression, compressed, uncompressed, blob_sha256, status, error, now
+        ],
+    ).map_err(|e| format!("Cannot save archive entry: {e}"))?;
+
+    Ok(id)
+}
+
+fn save_unsupported(
+    storage: &Storage,
+    budget: &mut ArchiveBudget,
+    document_id: &str,
+    parent_id: Option<&str>,
+    raw_path: &str,
+    depth: u8,
+    compression: Option<&str>,
+    compressed_size: Option<u64>,
+    size: Option<u64>,
+    reason: &str,
+) -> Result<(), String> {
+    budget.register_entry()?;
+    let path = validate_archive_entry_path(raw_path)
+        .unwrap_or_else(|_| format!("unsupported-entry-{}", Uuid::new_v4()));
+
+    insert_entry(
+        storage, document_id, parent_id, &path, "unsupported", depth,
+        compression, compressed_size, size, None, "unsupported", Some(reason),
+    )?;
+    Ok(())
+}
+
+fn extract_to_blob<R: Read>(
+    storage: &mut Storage,
+    reader: &mut R,
+    budget: &mut ArchiveBudget,
+) -> Result<(String, u64), String> {
+    let limit = budget.entry_limit();
+    if limit == 0 {
+        return Err("Archive extraction budget exhausted".into());
+    }
+
+    let temp_dir = storage.root_dir.join("temp");
+    let temp_path = temp_dir.join(format!("{}.part", Uuid::new_v4()));
+
+    let result = (|| -> Result<u64, String> {
+        let mut output = OpenOptions::new().write(true).create_new(true)
+            .open(&temp_path)
+            .map_err(|e| format!("Cannot create extraction temp file: {e}"))?;
+
+        let mut bounded = reader.take(limit.saturating_add(1));
+        let copied = io::copy(&mut bounded, &mut output)
+            .map_err(|e| format!("Cannot extract archive entry: {e}"))?;
+
+        if copied > limit {
+            return Err("Archive entry exceeds its extraction limit".into());
+        }
+
+        output.flush().map_err(|e| format!("Cannot flush extracted entry: {e}"))?;
+        output.sync_all().map_err(|e| format!("Cannot sync extracted entry: {e}"))?;
+        Ok(copied)
+    })();
+
+    let size = match result {
+        Ok(size) => size,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = budget.register_bytes(size) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    let stored = File::open(&temp_path)
+        .map_err(|e| format!("Cannot reopen extracted entry: {e}"))
+        .and_then(|file| storage.store_blob_with_limit(file, limit));
+    let _ = fs::remove_file(&temp_path);
+
+    Ok((stored?.sha256, size))
+}
+
+fn update_nested(
+    storage: &Storage,
+    entry_id: &str,
+    nested_id: Option<&str>,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    storage.connection.execute(
+        "UPDATE archive_entries
+         SET nested_document_id = ?1, extraction_status = ?2, error_message = ?3
+         WHERE id = ?4",
+        params![nested_id, status, error, entry_id],
+    ).map_err(|e| format!("Cannot update nested archive: {e}"))?;
+    Ok(())
+}
+
+fn process_nested(
+    storage: &mut Storage,
+    entry_id: &str,
+    blob_sha256: &str,
+    name: &str,
+    depth: u8,
+    budget: &mut ArchiveBudget,
+) -> Result<(), String> {
+    if !is_archive_name(name) {
+        return Ok(());
+    }
+
+    if depth >= MAX_NESTED_ARCHIVE_DEPTH {
+        return update_nested(
+            storage, entry_id, None, "unsupported",
+            Some("Maximum nested archive depth reached"),
+        );
+    }
+
+    let lower = name.to_ascii_lowercase();
+    let extension = if lower.ends_with(".tar.gz") {
+        "tar.gz"
+    } else if lower.ends_with(".tgz") {
+        "tgz"
+    } else {
+        Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("")
+    };
+
+    match process_document(storage, blob_sha256, name, extension, depth + 1, Some(entry_id), budget) {
+        Ok(id) => update_nested(storage, entry_id, Some(&id), "completed", None),
+        Err(error) => update_nested(storage, entry_id, None, "failed", Some(&error)),
+    }
+}
+
+fn save_file<R: Read>(
+    storage: &mut Storage,
+    reader: &mut R,
+    budget: &mut ArchiveBudget,
+    document_id: &str,
+    parent_id: Option<&str>,
+    raw_path: &str,
+    depth: u8,
+    compression: Option<&str>,
+    compressed_size: Option<u64>,
+    declared_size: Option<u64>,
+) -> Result<(), String> {
+    budget.register_entry()?;
+
+    let path = match validate_archive_entry_path(raw_path) {
+        Ok(path) => path,
+        Err(error) => {
+            let fallback = format!("unsupported-entry-{}", Uuid::new_v4());
+            insert_entry(
+                storage, document_id, parent_id, &fallback, "unsupported", depth,
+                compression, compressed_size, declared_size, None, "unsupported", Some(&error),
+            )?;
+            return Ok(());
+        }
+    };
+
+    if declared_size.is_some_and(|size| size > budget.entry_limit()) {
+        insert_entry(
+            storage, document_id, parent_id, &path, "unsupported", depth,
+            compression, compressed_size, declared_size, None, "failed",
+            Some("Entry exceeds extraction size limit"),
+        )?;
+        return Ok(());
+    }
+
+    let (sha256, actual_size) = match extract_to_blob(storage, reader, budget) {
+        Ok(result) => result,
+        Err(error) => {
+            insert_entry(
+                storage, document_id, parent_id, &path, "unsupported", depth,
+                compression, compressed_size, declared_size, None, "failed", Some(&error),
+            )?;
+            return Ok(());
+        }
+    };
+
+    let nested = is_archive_name(&path);
+    let kind = if nested { "archive" } else { "file" };
+
+    let entry_id = insert_entry(
+        storage, document_id, parent_id, &path, kind, depth,
+        compression, compressed_size, Some(actual_size), Some(&sha256), "completed", None,
+    )?;
+
+    if nested {
+        process_nested(storage, &entry_id, &sha256, &path, depth, budget)?;
+    }
+    Ok(())
+}
+
+fn process_zip(
+    storage: &mut Storage,
+    document_id: &str,
+    source: &Path,
+    depth: u8,
+    parent_id: Option<&str>,
+    budget: &mut ArchiveBudget,
+) -> Result<(), String> {
+    let file = File::open(source).map_err(|e| format!("Cannot open ZIP: {e}"))?;
+    let mut archive = ZipArchive::new(file).map_err(|e| format!("Invalid ZIP: {e}"))?;
+
+    if archive.len() > MAX_ARCHIVE_ENTRIES {
+        return Err("ZIP archive contains too many entries".into());
+    }
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)
+            .map_err(|e| format!("Cannot read ZIP entry: {e}"))?;
+
+        let name = entry.name().to_string();
+        let compressed = entry.compressed_size();
+        let size = entry.size();
+        let method = format!("{:?}", entry.compression());
+
+        if entry.encrypted() {
+            save_unsupported(
+                storage, budget, document_id, parent_id, &name, depth,
+                Some(&method), Some(compressed), Some(size),
+                "Encrypted ZIP entry requires a password",
+            )?;
+            continue;
+        }
+
+        if entry.is_symlink() || entry.enclosed_name().is_none() {
+            save_unsupported(
+                storage, budget, document_id, parent_id, &name, depth,
+                Some(&method), Some(compressed), Some(size),
+                "Unsafe ZIP path or symbolic link",
+            )?;
+            continue;
+        }
+
+        if entry.is_dir() {
+            budget.register_entry()?;
+            if let Ok(path) = validate_archive_entry_path(&name) {
+                insert_entry(
+                    storage, document_id, parent_id, &path, "directory", depth,
+                    Some(&method), Some(compressed), Some(size), None, "completed", None,
+                )?;
+            } else {
+                save_unsupported(
+                    storage, budget, document_id, parent_id, &name, depth,
+                    Some(&method), Some(compressed), Some(size), "Unsafe directory path",
+                )?;
+            }
+            continue;
+        }
+
+        save_file(
+            storage, &mut entry, budget, document_id, parent_id, &name, depth,
+            Some(&method), Some(compressed), Some(size),
+        )?;
+    }
+    Ok(())
+}
+
+fn process_tar<R: Read>(
+    storage: &mut Storage,
+    reader: R,
+    document_id: &str,
+    depth: u8,
+    parent_id: Option<&str>,
+    budget: &mut ArchiveBudget,
+) -> Result<(), String> {
+    let mut archive = TarArchive::new(reader);
+    let entries = archive.entries().map_err(|e| format!("Cannot read TAR: {e}"))?;
+
+    for item in entries {
+        let mut entry = item.map_err(|e| format!("Cannot read TAR entry: {e}"))?;
+        let name = entry.path()
+            .map_err(|e| format!("Invalid TAR path: {e}"))?
+            .to_string_lossy().into_owned();
+        let size = entry.size();
+        let kind: EntryType = entry.header().entry_type();
+
+        if kind.is_dir() {
+            budget.register_entry()?;
+            if let Ok(path) = validate_archive_entry_path(&name) {
+                insert_entry(
+                    storage, document_id, parent_id, &path, "directory", depth,
+                    Some("tar"), None, Some(size), None, "completed", None,
+                )?;
+            } else {
+                save_unsupported(
+                    storage, budget, document_id, parent_id, &name, depth,
+                    Some("tar"), None, Some(size), "Unsafe TAR directory path",
+                )?;
+            }
+            continue;
+        }
+
+        if !kind.is_file() {
+            let reason = if kind.is_symlink() {
+                "TAR symbolic links are not extracted"
+            } else if kind.is_hard_link() {
+                "TAR hard links are not extracted"
+            } else if kind.is_fifo() || kind.is_block_special() || kind.is_character_special() {
+                "TAR special filesystem entries are not extracted"
+            } else {
+                "Unsupported TAR entry type"
+            };
+            save_unsupported(
+                storage, budget, document_id, parent_id, &name, depth,
+                Some("tar"), None, Some(size), reason,
+            )?;
+            continue;
+        }
+
+        save_file(
+            storage, &mut entry, budget, document_id, parent_id, &name, depth,
+            Some("tar"), None, Some(size),
+        )?;
+    }
+    Ok(())
+}
+
+fn process_gzip(
+    storage: &mut Storage,
+    document_id: &str,
+    source: &Path,
+    name: &str,
+    depth: u8,
+    parent_id: Option<&str>,
+    budget: &mut ArchiveBudget,
+) -> Result<(), String> {
+    let file = File::open(source).map_err(|e| format!("Cannot open GZIP: {e}"))?;
+    let mut decoder = GzDecoder::new(file);
+    let output_name = name.strip_suffix(".gz")
+        .or_else(|| name.strip_suffix(".GZ"))
+        .unwrap_or("extracted-content");
+
+    save_file(
+        storage, &mut decoder, budget, document_id, parent_id, output_name,
+        depth, Some("gzip"), None, None,
+    )
+}
+
+fn process_document(
+    storage: &mut Storage,
+    sha256: &str,
+    name: &str,
+    extension: &str,
+    depth: u8,
+    parent_id: Option<&str>,
+    budget: &mut ArchiveBudget,
+) -> Result<String, String> {
+    let document_id = create_document(storage, sha256, extension, parent_id)?;
+    let source = safe_blob_path(storage, sha256)?;
+    let lower = name.to_ascii_lowercase();
+
+    let result = if extension == "zip" || lower.ends_with(".zip") {
+        process_zip(storage, &document_id, &source, depth, parent_id, budget)
+    } else if extension == "tar" || lower.ends_with(".tar") {
+        let file = File::open(&source).map_err(|e| format!("Cannot open TAR: {e}"))?;
+        process_tar(storage, file, &document_id, depth, parent_id, budget)
+    } else if extension == "tar.gz" || extension == "tgz"
+        || lower.ends_with(".tar.gz") || lower.ends_with(".tgz")
+    {
+        let file = File::open(&source).map_err(|e| format!("Cannot open compressed TAR: {e}"))?;
+        process_tar(storage, GzDecoder::new(file), &document_id, depth, parent_id, budget)
+    } else if extension == "gz" || lower.ends_with(".gz") {
+        process_gzip(storage, &document_id, &source, name, depth, parent_id, budget)
+    } else {
+        Err("Unsupported archive format".into())
+    };
+
+    match result {
+        Ok(()) => {
+            set_document_status(storage, &document_id, "completed", None)?;
+            Ok(document_id)
+        }
+        Err(error) => {
+            let _ = set_document_status(storage, &document_id, "failed", Some(&error));
+            Err(error)
+        }
+    }
+}
+
+pub(super) fn index_imported_archive(
+    storage: &mut Storage,
+    sha256: &str,
+    file_name: &str,
+    extension: &str,
+) -> Result<(), String> {
+    let mut budget = ArchiveBudget::new();
+    process_document(storage, sha256, file_name, extension, 0, None, &mut budget)?;
+    Ok(())
+}
+
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveEntryRecord {
+    pub id: String,
+    pub document_id: String,
+    pub parent_id: Option<String>,
+    pub entry_path: String,
+    pub entry_name: String,
+    pub entry_type: String,
+    pub nested_depth: i64,
+    pub compression_method: Option<String>,
+    pub compressed_size: Option<i64>,
+    pub uncompressed_size: Option<i64>,
+    pub blob_sha256: Option<String>,
+    pub nested_document_id: Option<String>,
+    pub extraction_status: String,
+    pub error_message: Option<String>,
+    pub ordinal: i64,
+    pub created_at: i64,
+}
+
+fn query_archive_entries(
+    storage: &Storage,
+    document_id: &str,
+) -> Result<Vec<ArchiveEntryRecord>, String> {
+    let mut statement = storage.connection.prepare(
+        "SELECT
+            id, document_id, parent_id, entry_path, entry_name,
+            entry_type, nested_depth, compression_method,
+            compressed_size, uncompressed_size, blob_sha256,
+            nested_document_id, extraction_status, error_message,
+            ordinal, created_at
+         FROM archive_entries
+         WHERE document_id = ?1
+         ORDER BY ordinal ASC, entry_path COLLATE NOCASE ASC"
+    ).map_err(|e| format!("Cannot prepare archive entry query: {e}"))?;
+
+    let rows = statement.query_map(params![document_id], |row| {
+        Ok(ArchiveEntryRecord {
+            id: row.get(0)?,
+            document_id: row.get(1)?,
+            parent_id: row.get(2)?,
+            entry_path: row.get(3)?,
+            entry_name: row.get(4)?,
+            entry_type: row.get(5)?,
+            nested_depth: row.get(6)?,
+            compression_method: row.get(7)?,
+            compressed_size: row.get(8)?,
+            uncompressed_size: row.get(9)?,
+            blob_sha256: row.get(10)?,
+            nested_document_id: row.get(11)?,
+            extraction_status: row.get(12)?,
+            error_message: row.get(13)?,
+            ordinal: row.get(14)?,
+            created_at: row.get(15)?,
+        })
+    }).map_err(|e| format!("Cannot query archive entries: {e}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("Cannot read archive entries: {e}"))
+}
+
+#[tauri::command]
+pub fn list_archive_entries(
+    state: tauri::State<'_, std::sync::Mutex<Storage>>,
+    chat_id: String,
+    reference_id: String,
+    nested_entry_id: Option<String>,
+) -> Result<Vec<ArchiveEntryRecord>, String> {
+    let storage = state.lock()
+        .map_err(|e| format!("Storage lock poisoned: {e}"))?;
+
+    let root_document_id: String = storage.connection.query_row(
+        "SELECT d.id
+         FROM attachment_references r
+         JOIN attachment_versions v ON v.id = r.attachment_version_id
+         JOIN extracted_documents d ON d.blob_sha256 = v.blob_sha256
+         WHERE r.id = ?1
+           AND r.chat_id = ?2
+           AND d.extractor = 'archive'
+           AND d.extractor_version = '1:root'
+         ORDER BY d.updated_at DESC
+         LIMIT 1",
+        params![reference_id, chat_id],
+        |row| row.get(0),
+    ).optional()
+        .map_err(|e| format!("Cannot resolve archive attachment: {e}"))?
+        .ok_or_else(|| "No indexed archive exists for this attachment in this chat".to_string())?;
+
+    let selected_document_id = match nested_entry_id {
+        None => root_document_id,
+        Some(entry_id) => {
+            let nested_document_id: Option<String> = storage.connection.query_row(
+                "WITH RECURSIVE reachable_documents(id) AS (
+                    SELECT ?1
+                    UNION
+                    SELECT ae.nested_document_id
+                    FROM archive_entries ae
+                    JOIN reachable_documents rd ON ae.document_id = rd.id
+                    WHERE ae.nested_document_id IS NOT NULL
+                )
+                SELECT ae.nested_document_id
+                FROM archive_entries ae
+                WHERE ae.id = ?2
+                  AND ae.document_id IN (SELECT id FROM reachable_documents)",
+                params![root_document_id, entry_id],
+                |row| row.get(0),
+            ).optional()
+                .map_err(|e| format!("Cannot resolve nested archive: {e}"))?
+                .flatten();
+
+            nested_document_id
+                .ok_or_else(|| "Nested archive entry does not belong to this attachment or is not indexed".to_string())?
+        }
+    };
+
+    query_archive_entries(&storage, &selected_document_id)
+}
+
+
+#[tauri::command]
+pub fn read_archive_entry_chunk(
+    state: tauri::State<'_, std::sync::Mutex<Storage>>,
+    chat_id: String,
+    reference_id: String,
+    entry_id: String,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, String> {
+    const MAX_CHUNK_SIZE: usize = 256 * 1024;
+
+    if length == 0 || length > MAX_CHUNK_SIZE {
+        return Err(format!(
+            "Chunk length must be between 1 and {} bytes",
+            MAX_CHUNK_SIZE
+        ));
+    }
+
+    let storage = state.lock()
+        .map_err(|e| format!("Storage lock poisoned: {e}"))?;
+
+    let root_document_id: String = storage.connection.query_row(
+        "SELECT d.id
+         FROM attachment_references r
+         JOIN attachment_versions v ON v.id = r.attachment_version_id
+         JOIN extracted_documents d ON d.blob_sha256 = v.blob_sha256
+         WHERE r.id = ?1
+           AND r.chat_id = ?2
+           AND d.extractor = 'archive'
+           AND d.extractor_version = '1:root'
+         ORDER BY d.updated_at DESC
+         LIMIT 1",
+        params![reference_id, chat_id],
+        |row| row.get(0),
+    ).optional()
+        .map_err(|e| format!("Cannot resolve archive attachment: {e}"))?
+        .ok_or_else(|| "Archive is not available in this chat".to_string())?;
+
+    let blob_sha256: Option<String> = storage.connection.query_row(
+        "WITH RECURSIVE reachable_documents(id) AS (
+            SELECT ?1
+            UNION
+            SELECT ae.nested_document_id
+            FROM archive_entries ae
+            JOIN reachable_documents rd ON ae.document_id = rd.id
+            WHERE ae.nested_document_id IS NOT NULL
+         )
+         SELECT ae.blob_sha256
+         FROM archive_entries ae
+         WHERE ae.id = ?2
+           AND ae.document_id IN (SELECT id FROM reachable_documents)
+           AND ae.entry_type IN ('file', 'archive')
+           AND ae.extraction_status = 'completed'",
+        params![root_document_id, entry_id],
+        |row| row.get(0),
+    ).optional()
+        .map_err(|e| format!("Cannot resolve archive entry: {e}"))?
+        .flatten();
+
+    let sha256 = blob_sha256
+        .ok_or_else(|| "Archive entry is unavailable, unsupported, or does not belong to this archive".to_string())?;
+
+    let path = safe_blob_path(&storage, &sha256)?;
+    let mut file = File::open(path)
+        .map_err(|e| format!("Cannot open archive entry: {e}"))?;
+
+    let file_size = file.metadata()
+        .map_err(|e| format!("Cannot inspect archive entry: {e}"))?
+        .len();
+
+    if offset > file_size {
+        return Err("Archive entry offset is out of bounds".into());
+    }
+
+    let bytes_to_read = (file_size - offset).min(length as u64) as usize;
+
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("Cannot seek archive entry: {e}"))?;
+
+    let mut buffer = vec![0u8; bytes_to_read];
+    file.read_exact(&mut buffer)
+        .map_err(|e| format!("Cannot read archive entry: {e}"))?;
+
+    Ok(buffer)
+}
+
+
+==========================================================================================
+FILE: src-tauri/src/storage/attachments.rs
+==========================================================================================
+use rusqlite::{OptionalExtension, Transaction, params};
+use serde::Serialize;
+use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
+
+use super::Storage;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentVersionRecord {
+    pub id: String,
+    pub attachment_id: String,
+    pub version_number: i64,
+    pub blob_sha256: String,
+    pub file_name: String,
+    pub extension: String,
+    pub mime_type: String,
+    pub original_size: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentReferenceRecord {
+    pub id: String,
+    pub chat_id: String,
+    pub message_id: Option<String>,
+    pub attachment_version_id: String,
+    pub attachment_id: String,
+    pub version_number: i64,
+    pub file_name: String,
+    pub extension: String,
+    pub mime_type: String,
+    pub blob_sha256: String,
+    pub original_size: i64,
+    pub position: i64,
+    pub purpose: String,
+    pub created_at: i64,
+}
+
+fn now_timestamp() -> Result<i64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System clock error: {error}"))?;
+
+    i64::try_from(duration.as_millis()).map_err(|error| format!("Timestamp overflow: {error}"))
+}
+
+pub(super) fn create_attachment_version_in_transaction(
+    tx: &Transaction<'_>,
+    attachment_id: Option<&str>,
+    blob_sha256: &str,
+    file_name: &str,
+    extension: &str,
+    mime_type: &str,
+    timestamp: i64,
+) -> Result<AttachmentVersionRecord, String> {
+    if file_name.trim().is_empty() {
+        return Err("Attachment filename cannot be empty".to_string());
+    }
+
+    let original_size: i64 = tx
+        .query_row(
+            "SELECT original_size FROM blobs WHERE sha256 = ?1",
+            params![blob_sha256],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("Cannot verify attachment blob: {e}"))?
+        .ok_or_else(|| "Attachment blob does not exist".to_string())?;
+
+    let resolved_id = match attachment_id {
+        Some(id) => {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM attachments WHERE id = ?1)",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("Cannot verify attachment: {e}"))?;
+            if !exists {
+                return Err(format!("Attachment not found: {id}"));
+            }
+            id.to_owned()
+        }
+        None => {
+            let id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO attachments (id, created_at, updated_at) VALUES (?1, ?2, ?2)",
+                params![id, timestamp],
+            )
+            .map_err(|e| format!("Cannot create attachment: {e}"))?;
+            id
+        }
+    };
+
+    let version_number: i64 = tx
+        .query_row(
+            "SELECT COALESCE(MAX(version_number), 0) + 1
+         FROM attachment_versions WHERE attachment_id = ?1",
+            params![resolved_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Cannot determine attachment version: {e}"))?;
+
+    let version_id = Uuid::new_v4().to_string();
+
+    tx.execute(
+        "INSERT INTO attachment_versions (
+            id, attachment_id, version_number, blob_sha256,
+            file_name, extension, mime_type, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            version_id,
+            resolved_id,
+            version_number,
+            blob_sha256,
+            file_name,
+            extension,
+            mime_type,
+            timestamp
+        ],
+    )
+    .map_err(|e| format!("Cannot save attachment version: {e}"))?;
+
+    tx.execute(
+        "UPDATE attachments SET updated_at = ?1 WHERE id = ?2",
+        params![timestamp, resolved_id],
+    )
+    .map_err(|e| format!("Cannot update attachment timestamp: {e}"))?;
+
+    Ok(AttachmentVersionRecord {
+        id: version_id,
+        attachment_id: resolved_id,
+        version_number,
+        blob_sha256: blob_sha256.to_owned(),
+        file_name: file_name.to_owned(),
+        extension: extension.to_owned(),
+        mime_type: mime_type.to_owned(),
+        original_size,
+        created_at: timestamp,
+    })
+}
+
+pub(super) fn add_attachment_reference_in_transaction(
+    tx: &Transaction<'_>,
+    chat_id: &str,
+    version_id: &str,
+    message_id: Option<&str>,
+    purpose: &str,
+    position: i64,
+    timestamp: i64,
+) -> Result<String, String> {
+    if !matches!(purpose, "composer" | "message") {
+        return Err("Invalid attachment reference purpose".to_string());
+    }
+    if position < 0 {
+        return Err("Attachment position cannot be negative".to_string());
+    }
+    match (purpose, message_id) {
+        ("composer", None) | ("message", Some(_)) => {}
+        _ => {
+            return Err(
+                "Composer references cannot have a message ID, and message references require one"
+                    .to_string(),
+            );
+        }
+    }
+
+    let chat_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM chats WHERE id = ?1)",
+            params![chat_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Cannot verify reference chat: {e}"))?;
+    if !chat_exists {
+        return Err(format!("Chat not found: {chat_id}"));
+    }
+
+    let version_exists: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachment_versions WHERE id = ?1)",
+            params![version_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Cannot verify attachment version: {e}"))?;
+    if !version_exists {
+        return Err(format!("Attachment version not found: {version_id}"));
+    }
+
+    if let Some(message_id) = message_id {
+        let belongs: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM messages WHERE id = ?1 AND chat_id = ?2
+            )",
+                params![message_id, chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("Cannot verify target message: {e}"))?;
+        if !belongs {
+            return Err("Target message does not belong to the specified chat".to_string());
+        }
+    }
+
+    let reference_id = Uuid::new_v4().to_string();
+    tx.execute(
+        "INSERT INTO attachment_references (
+            id, chat_id, attachment_version_id, message_id,
+            purpose, position, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            reference_id,
+            chat_id,
+            version_id,
+            message_id,
+            purpose,
+            position,
+            timestamp
+        ],
+    )
+    .map_err(|e| format!("Cannot create attachment reference: {e}"))?;
+
+    tx.execute(
+        "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
+        params![timestamp, chat_id],
+    )
+    .map_err(|e| format!("Cannot update chat timestamp: {e}"))?;
+
+    Ok(reference_id)
+}
+
+impl Storage {
+    /// Creates a new attachment or adds a version to an existing attachment.
+    /// The referenced physical blob must already exist.
+    pub fn create_attachment_version(
+        &mut self,
+        attachment_id: Option<&str>,
+        blob_sha256: &str,
+        file_name: &str,
+        extension: &str,
+        mime_type: &str,
+    ) -> Result<AttachmentVersionRecord, String> {
+        let timestamp = now_timestamp()?;
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|e| format!("Cannot start attachment transaction: {e}"))?;
+
+        let version = create_attachment_version_in_transaction(
+            &tx,
+            attachment_id,
+            blob_sha256,
+            file_name,
+            extension,
+            mime_type,
+            timestamp,
+        )?;
+
+        tx.commit()
+            .map_err(|e| format!("Cannot commit attachment version: {e}"))?;
+        Ok(version)
+    }
+
+    /// Links an attachment version to a chat draft or a sent message.
+    pub fn add_attachment_reference(
+        &mut self,
+        chat_id: &str,
+        attachment_version_id: &str,
+        message_id: Option<&str>,
+        purpose: &str,
+        position: i64,
+    ) -> Result<String, String> {
+        let timestamp = now_timestamp()?;
+        let tx = self
+            .connection
+            .transaction()
+            .map_err(|e| format!("Cannot start reference transaction: {e}"))?;
+
+        let reference_id = add_attachment_reference_in_transaction(
+            &tx,
+            chat_id,
+            attachment_version_id,
+            message_id,
+            purpose,
+            position,
+            timestamp,
+        )?;
+
+        tx.commit()
+            .map_err(|e| format!("Cannot commit attachment reference: {e}"))?;
+        Ok(reference_id)
+    }
+
+    /// Returns attachments belonging to a specific message.
+    pub fn list_message_attachments(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<AttachmentReferenceRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    r.id,
+                    r.chat_id,
+                    r.message_id,
+                    r.attachment_version_id,
+                    v.attachment_id,
+                    v.version_number,
+                    v.file_name,
+                    v.extension,
+                    v.mime_type,
+                    v.blob_sha256,
+                    b.original_size,
+                    r.position,
+                    r.purpose,
+                    r.created_at
+                 FROM attachment_references r
+                 JOIN attachment_versions v
+                    ON v.id = r.attachment_version_id
+                 JOIN blobs b
+                    ON b.sha256 = v.blob_sha256
+                 WHERE r.message_id = ?1
+                 ORDER BY r.position ASC, r.created_at ASC",
+            )
+            .map_err(|error| format!("Cannot prepare attachment query: {error}"))?;
+
+        let rows = statement
+            .query_map(params![message_id], |row| {
+                Ok(AttachmentReferenceRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    attachment_version_id: row.get(3)?,
+                    attachment_id: row.get(4)?,
+                    version_number: row.get(5)?,
+                    file_name: row.get(6)?,
+                    extension: row.get(7)?,
+                    mime_type: row.get(8)?,
+                    blob_sha256: row.get(9)?,
+                    original_size: row.get(10)?,
+                    position: row.get(11)?,
+                    purpose: row.get(12)?,
+                    created_at: row.get(13)?,
+                })
+            })
+            .map_err(|error| format!("Cannot list message attachments: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Cannot read attachment records: {error}"))
+    }
+
+    /// Returns draft attachments belonging to a chat.
+    pub fn list_composer_attachments(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<AttachmentReferenceRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    r.id,
+                    r.chat_id,
+                    r.message_id,
+                    r.attachment_version_id,
+                    v.attachment_id,
+                    v.version_number,
+                    v.file_name,
+                    v.extension,
+                    v.mime_type,
+                    v.blob_sha256,
+                    b.original_size,
+                    r.position,
+                    r.purpose,
+                    r.created_at
+                 FROM attachment_references r
+                 JOIN attachment_versions v
+                    ON v.id = r.attachment_version_id
+                 JOIN blobs b
+                    ON b.sha256 = v.blob_sha256
+                 WHERE r.chat_id = ?1 AND r.purpose = 'composer'
+                 ORDER BY r.position ASC, r.created_at ASC",
+            )
+            .map_err(|error| format!("Cannot prepare draft attachment query: {error}"))?;
+
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(AttachmentReferenceRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    message_id: row.get(2)?,
+                    attachment_version_id: row.get(3)?,
+                    attachment_id: row.get(4)?,
+                    version_number: row.get(5)?,
+                    file_name: row.get(6)?,
+                    extension: row.get(7)?,
+                    mime_type: row.get(8)?,
+                    blob_sha256: row.get(9)?,
+                    original_size: row.get(10)?,
+                    position: row.get(11)?,
+                    purpose: row.get(12)?,
+                    created_at: row.get(13)?,
+                })
+            })
+            .map_err(|error| format!("Cannot list draft attachments: {error}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Cannot read draft attachment records: {error}"))
+    }
+
+    /// Removes a logical reference. Physical cleanup is handled separately.
+    pub fn remove_attachment_reference(&mut self, reference_id: &str) -> Result<bool, String> {
+        let deleted = self
+            .connection
+            .execute(
+                "DELETE FROM attachment_references WHERE id = ?1",
+                params![reference_id],
+            )
+            .map_err(|error| format!("Cannot remove attachment reference: {error}"))?;
+
+        Ok(deleted > 0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewBlobRecord {
+    pub relative_path: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub original_size: i64,
+}
+
+impl Storage {
+    /// Resolves a currently authorized attachment reference for preview.
+    pub fn get_preview_blob(
+        &self,
+        chat_id: &str,
+        reference_id: &str,
+    ) -> Result<PreviewBlobRecord, String> {
+        self.connection
+            .query_row(
+                "SELECT
+                    b.relative_path,
+                    v.file_name,
+                    v.mime_type,
+                    b.original_size
+                 FROM attachment_references r
+                 JOIN attachment_versions v
+                    ON v.id = r.attachment_version_id
+                 JOIN blobs b
+                    ON b.sha256 = v.blob_sha256
+                 WHERE r.id = ?1
+                   AND r.chat_id = ?2
+                   AND b.storage_state = 'original'",
+                params![reference_id, chat_id],
+                |row| {
+                    Ok(PreviewBlobRecord {
+                        relative_path: row.get(0)?,
+                        file_name: row.get(1)?,
+                        mime_type: row.get(2)?,
+                        original_size: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Cannot resolve preview attachment: {error}"))?
+            .ok_or_else(|| "Attachment is unavailable for preview".to_string())
+    }
+}
+
+impl Storage {
+    pub fn promote_composer_attachments(
+        &mut self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Vec<AttachmentReferenceRecord>, String> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| format!("Cannot start attachment promotion: {error}"))?;
+
+        let message_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM messages
+                    WHERE id = ?1 AND chat_id = ?2
+                )",
+                rusqlite::params![message_id, chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Cannot verify target message: {error}"))?;
+
+        if !message_exists {
+            return Err("Target message does not belong to the specified chat".into());
+        }
+
+        transaction
+            .execute(
+                "UPDATE attachment_references
+                 SET message_id = ?1, purpose = 'message'
+                 WHERE chat_id = ?2 AND purpose = 'composer'",
+                rusqlite::params![message_id, chat_id],
+            )
+            .map_err(|error| format!("Cannot promote composer attachments: {error}"))?;
+
+        transaction
+            .commit()
+            .map_err(|error| format!("Cannot commit attachment promotion: {error}"))?;
+
+        self.list_message_attachments(message_id)
+    }
+}
+
+#[tauri::command]
+pub fn promote_composer_attachments(
+    state: tauri::State<'_, std::sync::Mutex<Storage>>,
+    chat_id: String,
+    message_id: String,
+) -> Result<Vec<AttachmentReferenceRecord>, String> {
+    let mut storage = state
+        .lock()
+        .map_err(|error| format!("Storage lock poisoned: {error}"))?;
+
+    storage.promote_composer_attachments(&chat_id, &message_id)
+}
+
+#[tauri::command]
+pub fn read_attachment_chunk(
+    state: tauri::State<'_, std::sync::Mutex<Storage>>,
+    chat_id: String,
+    reference_id: String,
+    offset: u64,
+    length: usize,
+) -> Result<Vec<u8>, String> {
+    const MAX_CHUNK_SIZE: usize = 256 * 1024;
+
+    if length == 0 || length > MAX_CHUNK_SIZE {
+        return Err(format!(
+            "Chunk length must be between 1 and {} bytes",
+            MAX_CHUNK_SIZE
+        ));
+    }
+
+    let storage = state
+        .lock()
+        .map_err(|error| format!("Storage lock poisoned: {error}"))?;
+
+    // The reference is resolved within the requested chat.
+    let blob = storage.get_preview_blob(&chat_id, &reference_id)?;
+    let path = storage.resolve_blob_path(&blob.relative_path)?;
+
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file =
+        std::fs::File::open(&path).map_err(|error| format!("Cannot open attachment: {error}"))?;
+
+    let file_size = file
+        .metadata()
+        .map_err(|error| format!("Cannot inspect attachment: {error}"))?
+        .len();
+
+    if offset > file_size {
+        return Err("Attachment offset is out of bounds".to_owned());
+    }
+
+    let bytes_to_read = (file_size - offset).min(length as u64) as usize;
+
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("Cannot seek attachment: {error}"))?;
+
+    let mut buffer = vec![0u8; bytes_to_read];
+    file.read_exact(&mut buffer)
+        .map_err(|error| format!("Cannot read attachment chunk: {error}"))?;
+
+    Ok(buffer)
+}
+
+
+==========================================================================================
+FILE: src-tauri/src/storage/preview.rs
+==========================================================================================
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom},
+    sync::Mutex,
+};
+
+use tauri::{
+    AppHandle, Manager, Runtime, State, UriSchemeResponder,
+    http::{Method, Request, Response, StatusCode, header},
+};
+
+use super::Storage;
+
+const MAX_RESPONSE_SIZE: u64 = 2 * 1024 * 1024;
+
+pub fn handle_preview_request<R: Runtime>(
+    app: AppHandle<R>,
+    request: Request<Vec<u8>>,
+    responder: UriSchemeResponder,
+) {
+    let response = match build_preview_response(&app, &request) {
+        Ok(response) => response,
+        Err(status) => empty_response(status),
+    };
+
+    let _ = responder.respond(response);
+}
+
+fn build_preview_response<R: Runtime>(
+    app: &AppHandle<R>,
+    request: &Request<Vec<u8>>,
+) -> Result<Response<Vec<u8>>, StatusCode> {
+    if request.method() != Method::GET && request.method() != Method::HEAD {
+        return Err(StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    let segments: Vec<&str> = request.uri().path().trim_matches('/').split('/').collect();
+
+    if segments.len() != 2
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let chat_id = segments[0];
+    let reference_id = segments[1];
+
+    let state: State<'_, Mutex<Storage>> = app.state();
+    let (path, file_name, mime_type, file_size) = {
+        let storage = state
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        let preview = storage
+            .get_preview_blob(chat_id, reference_id)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+
+        let path = storage
+            .resolve_blob_path(&preview.relative_path)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+
+        (
+            path,
+            preview.file_name,
+            safe_mime_type(&preview.mime_type).to_string(),
+            preview.original_size as u64,
+        )
+    };
+
+    let range_header = request.headers().get(header::RANGE);
+    let (start, end, status) = match range_header {
+        Some(value) => {
+            let value = value
+                .to_str()
+                .map_err(|_| StatusCode::RANGE_NOT_SATISFIABLE)?;
+            let (start, end) = parse_range(value, file_size)?;
+            (start, end, StatusCode::PARTIAL_CONTENT)
+        }
+        None => {
+            if file_size > MAX_RESPONSE_SIZE {
+                return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+            }
+            (0, file_size.saturating_sub(1), StatusCode::OK)
+        }
+    };
+
+    let length = if file_size == 0 { 0 } else { end - start + 1 };
+
+    if length > MAX_RESPONSE_SIZE {
+        return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    let mut body = Vec::new();
+
+    if request.method() == Method::GET && length > 0 {
+        let mut file = File::open(path).map_err(|_| StatusCode::NOT_FOUND)?;
+        file.seek(SeekFrom::Start(start))
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        body.resize(length as usize, 0);
+        file.read_exact(&mut body)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+
+    let disposition = format!("inline; filename=\"{}\"", safe_filename(&file_name));
+
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, mime_type)
+        .header(header::CONTENT_LENGTH, length.to_string())
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::CONTENT_DISPOSITION, disposition)
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Content-Security-Policy", "default-src 'none'; sandbox");
+
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{file_size}"),
+        );
+    }
+
+    builder
+        .body(body)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn parse_range(value: &str, size: u64) -> Result<(u64, u64), StatusCode> {
+    if size == 0 {
+        return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    let value = value
+        .strip_prefix("bytes=")
+        .ok_or(StatusCode::RANGE_NOT_SATISFIABLE)?;
+
+    if value.contains(',') {
+        return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    let (start, end) = value
+        .split_once('-')
+        .ok_or(StatusCode::RANGE_NOT_SATISFIABLE)?;
+
+    let (start, end) = if start.is_empty() {
+        let suffix: u64 = end.parse().map_err(|_| StatusCode::RANGE_NOT_SATISFIABLE)?;
+
+        if suffix == 0 {
+            return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+        }
+
+        (size.saturating_sub(suffix), size - 1)
+    } else {
+        let start: u64 = start
+            .parse()
+            .map_err(|_| StatusCode::RANGE_NOT_SATISFIABLE)?;
+
+        let end = if end.is_empty() {
+            size - 1
+        } else {
+            end.parse::<u64>()
+                .map_err(|_| StatusCode::RANGE_NOT_SATISFIABLE)?
+                .min(size - 1)
+        };
+
+        (start, end)
+    };
+
+    if start >= size || end < start || end - start + 1 > MAX_RESPONSE_SIZE {
+        return Err(StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+
+    Ok((start, end))
+}
+
+fn safe_mime_type(mime: &str) -> &str {
+    match mime {
+        "application/pdf" | "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+        | "image/bmp" | "text/plain" | "text/markdown" => mime,
+        _ => "application/octet-stream",
+    }
+}
+
+fn safe_filename(name: &str) -> String {
+    name.chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | ' ')
+        })
+        .take(120)
+        .collect::<String>()
+        .replace('"', "")
+}
+
+fn empty_response(status: StatusCode) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_LENGTH, "0")
+        .header("X-Content-Type-Options", "nosniff")
+        .body(Vec::new())
+        .unwrap_or_else(|_| Response::new(Vec::new()))
+}
+
+
+==========================================================================================
+FILE: src-tauri/src/storage/blobs.rs
+==========================================================================================
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use rusqlite::{Connection, OptionalExtension, params};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use super::{MAX_FILE_SIZE_BYTES, Storage};
+
+const BUFFER_SIZE: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobRecord {
+    pub sha256: String,
+    pub relative_path: String,
+    pub original_size: i64,
+    pub stored_size: i64,
+}
+
+fn now_timestamp() -> Result<i64, String> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("System clock error: {error}"))?;
+
+    i64::try_from(duration.as_millis()).map_err(|error| format!("Timestamp overflow: {error}"))
+}
+
+fn digest_to_hex(digest: &[u8]) -> String {
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hash_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        File::open(path).map_err(|error| format!("Cannot open existing blob: {error}"))?;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+
+    loop {
+        let bytes_read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("Cannot verify existing blob: {error}"))?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(digest_to_hex(&hasher.finalize()))
+}
+
+fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let path = Path::new(relative);
+
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+        || path.components().next() != Some(Component::Normal("blobs".as_ref()))
+    {
+        return Err("Invalid internal blob path".to_string());
+    }
+
+    Ok(root.join(path))
+}
+
+impl Storage {
+    pub fn resolve_blob_path(&self, relative: &str) -> Result<PathBuf, String> {
+        let candidate = resolve_relative_path(&self.root_dir, relative)?;
+
+        let storage_root = self
+            .root_dir
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve storage directory: {error}"))?;
+
+        let blobs_root = self
+            .root_dir
+            .join("blobs")
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve blob storage directory: {error}"))?;
+
+        if !blobs_root.starts_with(&storage_root) {
+            return Err("Blob storage directory escapes storage root".to_string());
+        }
+
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve blob file: {error}"))?;
+
+        if !canonical.starts_with(&blobs_root) {
+            return Err("Blob path escapes storage directory".to_string());
+        }
+
+        let metadata = fs::symlink_metadata(&candidate)
+            .map_err(|error| format!("Cannot inspect blob file: {error}"))?;
+
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("Blob path is not a regular file".to_string());
+        }
+
+        Ok(canonical)
+    }
+
+    pub fn store_blob<R: Read>(&mut self, reader: R) -> Result<BlobRecord, String> {
+        self.store_blob_with_limit(reader, MAX_FILE_SIZE_BYTES)
+    }
+
+    pub(super) fn store_blob_with_limit<R: Read>(
+        &mut self,
+        mut reader: R,
+        max_size: u64,
+    ) -> Result<BlobRecord, String> {
+        let operation_id = Uuid::new_v4().to_string();
+        let timestamp = now_timestamp()?;
+
+        let temp_relative = format!("temp/{operation_id}.part");
+        let temp_path = self.root_dir.join(&temp_relative);
+
+        self.connection
+            .execute(
+                "INSERT INTO storage_operations (
+                    id, operation_type, state, created_at, updated_at
+                 ) VALUES (?1, 'store_blob', 'PENDING', ?2, ?2)",
+                params![operation_id, timestamp],
+            )
+            .map_err(|error| format!("Cannot create storage journal entry: {error}"))?;
+
+        self.connection
+            .execute(
+                "UPDATE storage_operations
+                 SET state = 'PROCESSING', source_path = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![temp_relative, timestamp, operation_id],
+            )
+            .map_err(|error| format!("Cannot update storage journal: {error}"))?;
+
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|error| format!("Cannot create temporary blob: {error}"))?;
+
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; BUFFER_SIZE];
+        let mut total_size: u64 = 0;
+
+        let write_result = (|| -> Result<(), String> {
+            loop {
+                let bytes_read = reader
+                    .read(&mut buffer)
+                    .map_err(|error| format!("Cannot read incoming file: {error}"))?;
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                total_size = total_size
+                    .checked_add(bytes_read as u64)
+                    .ok_or_else(|| "File size overflow".to_string())?;
+
+                if total_size > max_size {
+                    return Err(format!(
+                        "File exceeds the allowed size limit of {} MiB",
+                        max_size / (1024 * 1024)
+                    ));
+                }
+
+                output
+                    .write_all(&buffer[..bytes_read])
+                    .map_err(|error| format!("Cannot write temporary blob: {error}"))?;
+
+                hasher.update(&buffer[..bytes_read]);
+            }
+
+            output
+                .sync_all()
+                .map_err(|error| format!("Cannot synchronize temporary blob: {error}"))?;
+
+            Ok(())
+        })();
+
+        drop(output);
+
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path);
+            let _ = self.connection.execute(
+                "UPDATE storage_operations
+                 SET state = 'FAILED', error_message = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![error, now_timestamp().unwrap_or(timestamp), operation_id],
+            );
+            return Err(error);
+        }
+
+        let original_size = i64::try_from(total_size)
+            .map_err(|error| format!("File is too large for SQLite metadata: {error}"))?;
+
+        let sha256 = digest_to_hex(&hasher.finalize());
+
+        let existing: Option<(String, i64)> = self
+            .connection
+            .query_row(
+                "SELECT relative_path, original_size
+                 FROM blobs WHERE sha256 = ?1",
+                params![sha256],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("Cannot check blob deduplication: {error}"))?;
+
+        let relative_path = if let Some((existing_relative, _)) = existing {
+            let existing_path = resolve_relative_path(&self.root_dir, &existing_relative)?;
+
+            let existing_is_valid = existing_path.is_file()
+                && hash_file(&existing_path)
+                    .map(|hash| hash == sha256)
+                    .unwrap_or(false);
+
+            if existing_is_valid {
+                fs::remove_file(&temp_path)
+                    .map_err(|error| format!("Cannot remove duplicate temporary file: {error}"))?;
+
+                self.connection
+                    .execute(
+                        "UPDATE blobs SET last_accessed_at = ?1 WHERE sha256 = ?2",
+                        params![now_timestamp()?, sha256],
+                    )
+                    .map_err(|error| format!("Cannot update blob access time: {error}"))?;
+
+                self.connection
+                    .execute(
+                        "UPDATE storage_operations
+                         SET blob_sha256 = ?1, state = 'COMPLETED', updated_at = ?2
+                         WHERE id = ?3",
+                        params![sha256, now_timestamp()?, operation_id],
+                    )
+                    .map_err(|error| format!("Cannot complete deduplication journal: {error}"))?;
+
+                return Ok(BlobRecord {
+                    sha256,
+                    relative_path: existing_relative,
+                    original_size,
+                    stored_size: original_size,
+                });
+            }
+
+            if let Some(parent) = existing_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("Cannot recreate blob directory: {error}"))?;
+            }
+
+            self.connection
+                .execute(
+                    "UPDATE storage_operations
+                     SET state = 'COMMITTING', target_path = ?1, updated_at = ?2
+                     WHERE id = ?3",
+                    params![existing_relative, now_timestamp()?, operation_id],
+                )
+                .map_err(|error| format!("Cannot update repair journal: {error}"))?;
+
+            fs::rename(&temp_path, &existing_path)
+                .map_err(|error| format!("Cannot repair existing blob: {error}"))?;
+
+            self.connection
+                .execute(
+                    "UPDATE blobs
+                     SET original_size = ?1, stored_size = ?1,
+                         storage_state = 'original',
+                         compression_format = NULL,
+                         last_accessed_at = ?2,
+                         verified_at = ?2
+                     WHERE sha256 = ?3",
+                    params![original_size, now_timestamp()?, sha256],
+                )
+                .map_err(|error| format!("Cannot update repaired blob metadata: {error}"))?;
+
+            existing_relative
+        } else {
+            let prefix = &sha256[..2];
+            let relative = format!("blobs/{prefix}/{sha256}.blob");
+            let target_path = resolve_relative_path(&self.root_dir, &relative)?;
+
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|error| format!("Cannot create blob directory: {error}"))?;
+            }
+
+            self.connection
+                .execute(
+                    "UPDATE storage_operations
+                     SET state = 'VERIFYING', target_path = ?1, updated_at = ?2
+                     WHERE id = ?3",
+                    params![relative, now_timestamp()?, operation_id],
+                )
+                .map_err(|error| format!("Cannot update verification journal: {error}"))?;
+
+            let orphan_is_valid = target_path.is_file()
+                && hash_file(&target_path)
+                    .map(|hash| hash == sha256)
+                    .unwrap_or(false);
+
+            if orphan_is_valid {
+                fs::remove_file(&temp_path)
+                    .map_err(|error| format!("Cannot remove duplicate orphan blob: {error}"))?;
+            } else {
+                self.connection
+                    .execute(
+                        "UPDATE storage_operations
+                         SET state = 'COMMITTING', updated_at = ?1
+                         WHERE id = ?2",
+                        params![now_timestamp()?, operation_id],
+                    )
+                    .map_err(|error| format!("Cannot update commit journal: {error}"))?;
+
+                fs::rename(&temp_path, &target_path)
+                    .map_err(|error| format!("Cannot commit blob file: {error}"))?;
+            }
+
+            relative
+        };
+
+        let timestamp = now_timestamp()?;
+
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| format!("Cannot start blob metadata transaction: {error}"))?;
+
+        transaction
+            .execute(
+                "INSERT INTO blobs (
+                    sha256, relative_path, original_size, stored_size,
+                    storage_state, created_at, last_accessed_at, verified_at
+                 ) VALUES (?1, ?2, ?3, ?3, 'original', ?4, ?4, ?4)
+                 ON CONFLICT(sha256) DO UPDATE SET
+                    relative_path = excluded.relative_path,
+                    original_size = excluded.original_size,
+                    stored_size = excluded.stored_size,
+                    storage_state = 'original',
+                    compression_format = NULL,
+                    last_accessed_at = excluded.last_accessed_at,
+                    verified_at = excluded.verified_at",
+                params![sha256, relative_path, original_size, timestamp],
+            )
+            .map_err(|error| format!("Cannot save blob metadata: {error}"))?;
+
+        transaction
+            .execute(
+                "UPDATE storage_operations
+                 SET blob_sha256 = ?1, state = 'COMPLETED', updated_at = ?2
+                 WHERE id = ?3",
+                params![sha256, timestamp, operation_id],
+            )
+            .map_err(|error| format!("Cannot complete blob journal: {error}"))?;
+
+        transaction
+            .commit()
+            .map_err(|error| format!("Cannot commit blob metadata: {error}"))?;
+
+        Ok(BlobRecord {
+            sha256,
+            relative_path,
+            original_size,
+            stored_size: original_size,
+        })
+    }
+}
+
+
+fn resolve_recovery_temp_path(root: &Path, relative: &str) -> Result<Option<PathBuf>, String> {
+    let mut components = Path::new(relative).components();
+
+    if components.next() != Some(Component::Normal("temp".as_ref())) {
+        return Err("Temporary path is outside the temp directory".to_string());
+    }
+
+    let filename = components
+        .next()
+        .and_then(|component| component.as_os_str().to_str())
+        .ok_or_else(|| "Invalid temporary filename".to_string())?;
+
+    if components.next().is_some() {
+        return Err("Temporary path contains unexpected components".to_string());
+    }
+
+    let uuid = filename
+        .strip_suffix(".part")
+        .ok_or_else(|| "Temporary filename has an invalid extension".to_string())?;
+
+    Uuid::parse_str(uuid)
+        .map_err(|_| "Temporary filename does not contain a valid operation UUID".to_string())?;
+
+    let temp_root = root.join("temp");
+    let root_metadata = fs::symlink_metadata(&temp_root)
+        .map_err(|error| format!("Cannot inspect temp directory: {error}"))?;
+
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err("Temp directory is not a regular directory".to_string());
+    }
+
+    let candidate = temp_root.join(filename);
+
+    match fs::symlink_metadata(&candidate) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("Temporary path is not a regular file".to_string());
+            }
+
+            Ok(Some(candidate))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Cannot inspect temporary file: {error}")),
+    }
+}
+
+pub(super) fn recover_interrupted_operations(
+    connection: &Connection,
+    root_dir: &Path,
+) -> Result<(), String> {
+    let operations = {
+        let mut statement = connection
+            .prepare(
+                "SELECT id, operation_type, source_path
+                 FROM storage_operations
+                 WHERE state IN ('PENDING', 'PROCESSING', 'VERIFYING', 'COMMITTING')
+                 ORDER BY created_at ASC",
+            )
+            .map_err(|error| format!("Cannot prepare interrupted operation query: {error}"))?;
+
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|error| format!("Cannot query interrupted operations: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Cannot read interrupted operations: {error}"))?
+    };
+
+    for (operation_id, operation_type, source_path) in operations {
+        let mut recovery_message =
+            "Operation was interrupted before completion and recovered during startup."
+                .to_string();
+
+        match operation_type.as_str() {
+            "store_blob" => {
+                if let Some(relative) = source_path {
+                    match resolve_recovery_temp_path(root_dir, &relative) {
+                        Ok(Some(path)) => {
+                            match fs::remove_file(&path) {
+                                Ok(()) => recovery_message.push_str(
+                                    " Incomplete temporary file was removed.",
+                                ),
+                                Err(error) => recovery_message.push_str(&format!(
+                                    " Temporary file was preserved because cleanup failed: {error}"
+                                )),
+                            }
+                        }
+                        Ok(None) => recovery_message.push_str(
+                            " Temporary file was already absent.",
+                        ),
+                        Err(error) => recovery_message.push_str(&format!(
+                            " Temporary file was preserved because its path was unsafe: {error}"
+                        )),
+                    }
+                } else {
+                    recovery_message.push_str(
+                        " No temporary source path was recorded.",
+                    );
+                }
+
+                recovery_message.push_str(
+                    " Any committed target blob was preserved for later reconciliation.",
+                );
+            }
+            "import_batch" => {
+                recovery_message.push_str(
+                    " The attachment transaction was not completed; stored blobs were preserved.",
+                );
+            }
+            _ => {
+                recovery_message.push_str(
+                    " Unknown operation type; filesystem data was left untouched.",
+                );
+            }
+        }
+
+        connection
+            .execute(
+                "UPDATE storage_operations
+                 SET state = 'FAILED', error_message = ?1, updated_at = ?2
+                 WHERE id = ?3
+                   AND state IN ('PENDING', 'PROCESSING', 'VERIFYING', 'COMMITTING')",
+                params![recovery_message, now_timestamp()?, operation_id],
+            )
+            .map_err(|error| {
+                format!("Cannot mark interrupted operation as recovered: {error}")
+            })?;
+    }
+
+    Ok(())
+}
+
+
+==========================================================================================
+FILE: src-tauri/src/lib.rs
+==========================================================================================
+use std::sync::Mutex;
+use tauri::Manager;
+
+mod storage;
+
+const CORE_SYSTEM_RULES: &str = include_str!("../../Core_System_Rules.md");
+
+const SONNE_VOICE: &str = include_str!("../../Sonne_Voice.md");
+
+const PRO_AI_INTELLIGENCE: &str = include_str!("../../Pro_AI_Intelligence.md");
+
+const GEMMA_INTELLIGENCE: &str = include_str!("../../Gemma_Intelligence.md");
+
+const PRO_AI_FINAL: &str = include_str!("../../Pro_AI_Final_Instructions.md");
+
+const GEMMA_FINAL: &str = include_str!("../../Gemma_Final_Instructions.md");
+
+#[tauri::command]
+fn greet(name: &str) -> String {
+    format!(
+        "Hello, {}! You've been greeted from the Rust backend!",
+        name
+    )
+}
+
+#[tauri::command]
+fn get_runtime_instructions(model: &str) -> Result<String, String> {
+    let (intelligence, final_instructions) = match model {
+        "pro-ai" => (PRO_AI_INTELLIGENCE, PRO_AI_FINAL),
+        "gemma" => (GEMMA_INTELLIGENCE, GEMMA_FINAL),
+        _ => return Err(format!("Unknown model profile: {}", model)),
+    };
+
+    Ok([
+        CORE_SYSTEM_RULES,
+        SONNE_VOICE,
+        intelligence,
+        final_instructions,
+    ]
+    .join("\n\n"))
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("sonne-file", |ctx, request, responder| {
+            let app = ctx.app_handle().clone();
+            storage::handle_preview_request(app, request, responder);
+        })
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let app_data_dir = app.path().app_data_dir()?;
+
+            let storage =
+                storage::Storage::initialize(&app_data_dir).map_err(std::io::Error::other)?;
+
+            app.manage(Mutex::new(storage));
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            get_runtime_instructions,
+            storage::commands::create_chat,
+            storage::commands::list_chats,
+            storage::commands::get_chat,
+            storage::commands::save_message,
+            storage::commands::start_turn,
+            storage::commands::update_message,
+            storage::commands::rewind_chat,
+            storage::commands::list_messages,
+            storage::commands::delete_chat,
+            storage::commands::create_attachment_version,
+            storage::commands::add_attachment_reference,
+            storage::commands::list_message_attachments,
+            storage::commands::list_composer_attachments,
+            storage::commands::remove_attachment_reference,
+            storage::import::import_attachments,
+            storage::import::import_files,
+            storage::attachments::promote_composer_attachments,
+            storage::attachments::read_attachment_chunk,
+            storage::archive::list_archive_entries,
+            storage::archive::read_archive_entry_chunk,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+
+==========================================================================================
+FILE: package.json
+==========================================================================================
+{
+  "name": "sonne",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "mammoth": "^1.13.0",
+    "officeparser": "^8.9.0",
+    "ollama": "^0.6.4",
+    "pdfjs-dist": "^6.5.438",
+    "prismjs": "^1.30.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tesseract.js": "7.0.0",
+    "tesseract.js-core": "7.0.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/prismjs": "^1.26.6",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^6.0.2",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16"
+  }
+}
+
+
+==========================================================================================
+FILE: src-tauri/Cargo.toml
+==========================================================================================
+[package]
+name = "sonne"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2024"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "sonne_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+sha2 = "0.11.1"
+uuid = { version = "1.29.3", features = ["v4"] }
+tauri-plugin-dialog = "2.8.4"
+zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
+tar = "0.4.46"
+flate2 = "1.1.11"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+
+==========================================================================================
+FILE: vite.config.ts
+==========================================================================================
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+// @ts-expect-error type error without @types/node package
+import process from "node:process";
+const host = process.env.TAURI_DEV_HOST;
+
+// https://vite.dev/config/
+export default defineConfig(() => ({
+  plugins: [react()],
+
+  // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
+  //
+  // 1. prevent Vite from obscuring rust errors
+  clearScreen: false,
+  // 2. tauri expects a fixed port, fail if that port is not available
+  server: {
+    port: 1420,
+    strictPort: true,
+    host: host || false,
+    hmr: host
+      ? {
+          protocol: "ws",
+          host,
+          port: 1421,
+        }
+      : undefined,
+    watch: {
+      // 3. tell Vite to ignore watching `src-tauri`
+      ignored: ["**/src-tauri/**"],
+    },
+  },
+}));
+
+
+==========================================================================================
+FILE: src-tauri/tauri.conf.json
+==========================================================================================
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "sonne",
+  "version": "0.1.0",
+  "identifier": "com.sonne.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "sonne",
+        "width": 800,
+        "height": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

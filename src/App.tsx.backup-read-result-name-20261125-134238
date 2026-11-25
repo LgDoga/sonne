@@ -1,0 +1,1388 @@
+import LivePreview from "./components/LivePreview";
+import EmptyState from "./components/EmptyState";
+import ChatHeader from "./components/ChatHeader";
+import ChatInput from "./components/ChatInput";
+import type { AttachmentReference } from "./components/FileAttachments";
+import { readStoredAttachment } from "./fileReader";
+import ChatMessageItem, { type ChatMessage } from "./components/ChatMessage";
+import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import "prismjs";
+
+const Prism = (
+  globalThis as unknown as {
+    Prism?: {
+      languages?: Record<string, unknown>;
+      highlight?: (code: string, grammar: unknown, lang: string) => string;
+    };
+  }
+).Prism;
+
+import "./App.css";
+import {
+  type BackendConfig,
+  type ExecutionBackend,
+  type ModeOption,
+  type ModelProfile,
+  type ResolvedMode,
+  buildChatRequestBody,
+  buildSystemPrompt,
+  detectIntent,
+  isSupportedModelName,
+  routeRequest,
+} from "./modelRouting";
+import {
+  createChatStream,
+  type ActiveOllamaChatStream,
+} from "./ollamaClient";
+import {
+  type ContextStats,
+  estimateMessageTokens,
+  resolveContextBudget,
+  selectHistory,
+} from "./contextManager";
+
+// ============================================================
+// TYPES
+// ============================================================
+
+
+
+type OllamaChatChunk = {
+  message?: {
+    thinking?: string;
+    content?: string;
+  };
+  done?: boolean;
+  // [perf-diag] Fields present on Ollama's final (done: true) chunk.
+  model?: string;
+  done_reason?: string;
+  error?: string;
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
+  eval_count?: number;
+  eval_duration?: number;
+};
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
+const OLLAMA_URL = "http://127.0.0.1:11434";
+
+type ActiveGeneration = {
+  id: number;
+  controller: AbortController;
+  request: ActiveOllamaChatStream | null;
+  cancelled: boolean;
+  flush: () => void;
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function formatNow(): string {
+  return new Date().toLocaleTimeString("uk-UA", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+/**
+ * Removes an embedded <think>...</think> block if a model
+ * accidentally includes one in its normal response content.
+ *
+ * The separate Ollama thinking channel is never displayed.
+ */
+function extractAnswer(raw: string): string {
+  const thinkOpen = raw.indexOf("<think>");
+
+  if (thinkOpen === -1) {
+    return raw.trim();
+  }
+
+  const thinkClose = raw.indexOf("</think>", thinkOpen);
+
+  if (thinkClose === -1) {
+    return raw.slice(0, thinkOpen).trim();
+  }
+
+  return (
+    raw.slice(0, thinkOpen) + raw.slice(thinkClose + "</think>".length)
+  ).trim();
+}
+
+// ============================================================
+// [perf-diag] TEMPORARY PERFORMANCE DIAGNOSTICS
+// Logs timing metrics to the developer console only. Never logs
+// message text, system instructions or any other private data.
+// To remove: delete this block and every line tagged [perf-diag].
+// ============================================================
+
+const PERF_DIAGNOSTICS_ENABLED = true;
+
+type PerfMarkName =
+  | "instructions"
+  | "headers"
+  | "firstChunk"
+  | "firstThinking"
+  | "firstContent"
+  | "firstVisible"
+  | "firstPaint"
+  | "doneChunk"
+  | "streamEnd";
+
+type PerfTrace = {
+  t0: number;
+  model: string;
+  mode: ResolvedMode;
+  modeSetting: ModeOption;
+  modelSelection: "auto" | "manual";
+  profile: ModelProfile;
+  backend: ExecutionBackend;
+  thinkingChannel: boolean;
+  historyMessages: number;
+  historyChars: number;
+  context: ContextStats | null; // estimates from contextManager
+  systemPromptChars: number;
+  userPromptChars: number;
+  marks: Partial<Record<PerfMarkName, number>>;
+  chunks: number;
+  thinkingChunks: number;
+  contentChunks: number;
+  lineFailures: number;
+  streamError: string | null;
+  cancelled: boolean;
+  final: OllamaChatChunk | null;
+};
+
+function perfMark(trace: PerfTrace, name: PerfMarkName): void {
+  // Only the first occurrence of each mark is recorded.
+  if (trace.marks[name] === undefined) {
+    trace.marks[name] = performance.now();
+  }
+}
+
+function perfObserveChunk(trace: PerfTrace, chunk: OllamaChatChunk): void {
+  trace.chunks += 1;
+
+  const hasThinking = Boolean(chunk.message?.thinking);
+  const hasContent = Boolean(chunk.message?.content);
+
+  if (hasThinking) {
+    trace.thinkingChunks += 1;
+    perfMark(trace, "firstThinking");
+  }
+
+  if (hasContent) {
+    trace.contentChunks += 1;
+    perfMark(trace, "firstContent");
+  }
+
+  if (hasThinking || hasContent) {
+    perfMark(trace, "firstChunk");
+  }
+
+  if (typeof chunk.error === "string" && trace.streamError === null) {
+    trace.streamError = chunk.error.slice(0, 200);
+  }
+
+  if (chunk.done === true) {
+    trace.final = chunk;
+    perfMark(trace, "doneChunk");
+  }
+}
+
+function perfIsValidNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0;
+}
+
+/** Ollama reports durations in nanoseconds. Absent value -> "N/A". */
+function perfNsToMs(value: unknown): string {
+  return perfIsValidNumber(value) ? `${(value / 1e6).toFixed(0)} ms` : "N/A";
+}
+
+/** Milliseconds elapsed from t0 to a mark. Missing mark -> "N/A". */
+function perfSince(trace: PerfTrace, name: PerfMarkName): string {
+  const mark = trace.marks[name];
+
+  return mark === undefined ? "N/A" : `${(mark - trace.t0).toFixed(0)} ms`;
+}
+
+/** Tokens per second from an Ollama count and a nanosecond duration. */
+function perfRate(count: unknown, durationNs: unknown): string {
+  if (!perfIsValidNumber(count) || !perfIsValidNumber(durationNs)) {
+    return "N/A";
+  }
+
+  if (count === 0 || durationNs === 0) return "N/A";
+
+  return `${(count / (durationNs / 1e9)).toFixed(1)} tok/s`;
+}
+
+function perfCount(value: unknown): string {
+  return perfIsValidNumber(value) ? String(value) : "N/A";
+}
+
+function perfDiff(later?: number, earlier?: number): string {
+  if (later === undefined || earlier === undefined) return "N/A";
+
+  return `${(later - earlier).toFixed(0)} ms`;
+}
+
+// Context Manager metrics. All "est_" values are local estimates; the actual
+// prompt size is prompt_tokens_prompt_eval_count (Ollama). Metadata only.
+function perfContextReport(ctx: ContextStats | null): Record<string, string> {
+  if (!ctx) return { context_optimization: "N/A" };
+
+  return {
+    context_optimization: ctx.optimized ? "active" : "not needed",
+    context_status: ctx.status,
+    context_window: `${ctx.contextWindow} (${ctx.windowSource})`,
+    context_input_budget_est: String(ctx.inputBudget),
+    context_output_reserve: String(ctx.outputReserve),
+    history_messages_total: String(ctx.totalHistoryMessages),
+    history_messages_omitted: String(ctx.omittedHistoryMessages),
+    est_history_tokens_original: String(ctx.estOriginalHistoryTokens),
+    est_history_tokens_retained: String(ctx.estSelectedHistoryTokens),
+    est_history_tokens_removed: String(ctx.estRemovedHistoryTokens),
+    est_fixed_tokens_system_plus_user: String(ctx.estFixedTokens),
+    est_input_tokens_total: String(ctx.estInputTokens),
+  };
+}
+
+function perfBuildReport(trace: PerfTrace): Record<string, string> {
+  const final = trace.final;
+  const marks = trace.marks;
+
+  const wallMs =
+    marks.streamEnd !== undefined ? marks.streamEnd - trace.t0 : undefined;
+
+  const ollamaTotalMs = perfIsValidNumber(final?.total_duration)
+    ? final.total_duration / 1e6
+    : undefined;
+
+  return {
+    model_requested: trace.model,
+    model_reported_by_ollama: final?.model ?? "N/A",
+    mode_resolved: trace.mode,
+    mode_setting: trace.modeSetting,
+    model_selection: trace.modelSelection,
+    profile: trace.profile,
+    backend: trace.backend,
+    thinking_channel_requested: String(trace.thinkingChannel),
+
+    wall_total: wallMs === undefined ? "N/A" : `${wallMs.toFixed(0)} ms`,
+    ollama_total_duration: perfNsToMs(final?.total_duration),
+    client_overhead_wall_minus_ollama:
+      wallMs === undefined || ollamaTotalMs === undefined
+        ? "N/A"
+        : `${(wallMs - ollamaTotalMs).toFixed(0)} ms`,
+    ollama_load_duration: perfNsToMs(final?.load_duration),
+    ollama_prompt_eval_duration: perfNsToMs(final?.prompt_eval_duration),
+    ollama_eval_duration: perfNsToMs(final?.eval_duration),
+
+    ttft_first_visible_token_queued: perfSince(trace, "firstVisible"),
+    ttft_first_visible_token_painted_approx: perfSince(trace, "firstPaint"),
+    time_to_first_any_chunk: perfSince(trace, "firstChunk"),
+    time_to_first_thinking_chunk: perfSince(trace, "firstThinking"),
+    time_to_first_content_chunk: perfSince(trace, "firstContent"),
+    thinking_phase_first_thinking_to_first_content: perfDiff(
+      marks.firstContent,
+      marks.firstThinking,
+    ),
+    time_to_instructions_ready: perfSince(trace, "instructions"),
+    time_to_response_headers: perfSince(trace, "headers"),
+    time_to_done_chunk: perfSince(trace, "doneChunk"),
+
+    prompt_tokens_prompt_eval_count: perfCount(final?.prompt_eval_count),
+    output_tokens_eval_count: perfCount(final?.eval_count),
+    prompt_eval_rate: perfRate(
+      final?.prompt_eval_count,
+      final?.prompt_eval_duration,
+    ),
+    generation_rate: perfRate(final?.eval_count, final?.eval_duration),
+
+    done_chunk_received: String(trace.final !== null),
+    done_reason: final?.done_reason ?? "N/A",
+    stream_error: trace.streamError ?? "none",
+    stream_cancelled: String(trace.cancelled),
+    stream_completed: String(trace.final !== null && !trace.cancelled),
+    stream_chunks_total: String(trace.chunks),
+    stream_chunks_thinking: String(trace.thinkingChunks),
+    stream_chunks_content: String(trace.contentChunks),
+    stream_line_failures: String(trace.lineFailures),
+
+    history_messages_sent: String(trace.historyMessages),
+    history_chars_sent: String(trace.historyChars),
+    ...perfContextReport(trace.context),
+    system_prompt_chars: String(trace.systemPromptChars),
+    user_prompt_chars: String(trace.userPromptChars),
+  };
+}
+
+function perfLogReport(trace: PerfTrace): void {
+  if (!PERF_DIAGNOSTICS_ENABLED) return;
+
+  console.info("[Sonne perf] response metrics");
+  console.table(perfBuildReport(trace));
+  void perfLogOllamaResidency(trace.model);
+}
+
+function perfLogFailure(trace: PerfTrace, message: string): void {
+  if (!PERF_DIAGNOSTICS_ENABLED) return;
+
+  console.warn("[Sonne perf] request failed", {
+    model: trace.model,
+    backend: trace.backend,
+    mode: trace.mode,
+    elapsed: `${(performance.now() - trace.t0).toFixed(0)} ms`,
+    time_to_response_headers: perfSince(trace, "headers"),
+    error: message.slice(0, 200),
+  });
+}
+
+/**
+ * Read-only check of which models Ollama currently keeps in memory
+ * (GET /api/ps). Does not change the keep-alive timer.
+ */
+async function perfLogOllamaResidency(requestedModel: string): Promise<void> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+
+  try {
+    const response = await fetch(`${OLLAMA_URL}/api/ps`, {
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      console.info(`[Sonne perf] /api/ps unavailable: HTTP ${response.status}`);
+      return;
+    }
+
+    const data = (await response.json()) as {
+      models?: Array<{
+        name?: string;
+        model?: string;
+        size?: number;
+        size_vram?: number;
+        context_length?: number;
+        expires_at?: string;
+      }>;
+    };
+
+    const gib = (bytes: unknown) =>
+      perfIsValidNumber(bytes) ? (bytes / 1024 ** 3).toFixed(2) : "N/A";
+
+    const rows = (data.models ?? []).map((entry) => {
+      const name = entry.name ?? entry.model ?? "N/A";
+      const expires = entry.expires_at ? Date.parse(entry.expires_at) : NaN;
+
+      return {
+        model: name,
+        is_requested_model: String(name === requestedModel),
+        size_gib: gib(entry.size),
+        vram_gib: gib(entry.size_vram),
+        gpu_share:
+          perfIsValidNumber(entry.size) &&
+          entry.size > 0 &&
+          perfIsValidNumber(entry.size_vram)
+            ? `${((entry.size_vram / entry.size) * 100).toFixed(0)}%`
+            : "N/A",
+        context_length: perfCount(entry.context_length),
+        unloads_in: Number.isFinite(expires)
+          ? `${Math.max(0, Math.round((expires - Date.now()) / 1000))} s`
+          : "N/A",
+      };
+    });
+
+    console.info(
+      `[Sonne perf] models resident in Ollama after response: ${rows.length}`,
+    );
+
+    if (rows.length > 0) console.table(rows);
+  } catch {
+    console.info("[Sonne perf] /api/ps request failed or timed out");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ============================================================
+// CONTENT PARSING
+// ============================================================
+
+function highlightCode(code: string, lang: string): string {
+  const normalized =
+    lang === "html" || lang === "xml" || lang === "svg"
+      ? "markup"
+      : lang === "js"
+        ? "javascript"
+        : lang === "ts"
+          ? "typescript"
+          : lang === "py"
+            ? "python"
+            : lang;
+
+  const grammar = Prism?.languages?.[normalized];
+
+  if (grammar && typeof Prism?.highlight === "function") {
+    return Prism.highlight(code, grammar, normalized);
+  }
+
+  return code
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ============================================================
+// CODE BLOCK COMPONENT
+// ============================================================
+
+// MAIN APP
+// ============================================================
+
+export function App() {
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsLoaded, setModelsLoaded] = useState<boolean>(false);
+  const [selectedModel, setSelectedModel] = useState<string>("auto");
+  const [modeSetting, setModeSetting] = useState<ModeOption>("auto");
+  const [allowThinking, setAllowThinking] = useState<boolean>(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState<string>("");
+  const [attachments, setAttachments] = useState<AttachmentReference[]>([]);
+  const [chatId, setChatId] = useState<string>("");
+
+  useEffect(() => {
+    let active = true;
+    const startupSession = chatSessionRef.current;
+
+    async function restoreChat() {
+      try {
+        const chats = await invoke<Array<{
+          id: string;
+          title: string;
+          createdAt: number;
+          updatedAt: number;
+        }>>("list_chats");
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+
+        if (chats.length === 0) {
+          const chat = await invoke<{ id: string }>("create_chat", {
+            title: "Новий чат",
+          });
+          if (!active || startupSession !== chatSessionRef.current) return;
+          setChatId(chat.id);
+          return;
+        }
+
+        const latestChat = chats[0];
+        if (!active || startupSession !== chatSessionRef.current) return;
+        setChatId(latestChat.id);
+
+        const [storedMessages, composerAttachments] = await Promise.all([
+          invoke<Array<{
+            id: string;
+            chatId: string;
+            role: "user" | "assistant" | "system";
+            content: string;
+            promptContent: string | null;
+            modelUsed: string | null;
+            modeUsed: string | null;
+            createdAt: number;
+          }>>("list_messages", { chatId: latestChat.id }),
+          invoke<AttachmentReference[]>("list_composer_attachments", {
+            chatId: latestChat.id,
+          }),
+        ]);
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+
+        const restoredMessages = await Promise.all(
+          storedMessages
+            .filter((message) => message.role !== "system")
+            .map(async (message): Promise<ChatMessage> => {
+              const messageAttachments = await invoke<AttachmentReference[]>(
+                "list_message_attachments",
+                { messageId: message.id },
+              );
+
+              return {
+                dbId: message.id,
+                role: message.role as "user" | "assistant",
+                content: message.content,
+                promptContent: message.promptContent ?? undefined,
+                modelUsed: message.modelUsed ?? undefined,
+                modeUsed: (message.modeUsed ?? undefined) as ResolvedMode | undefined,
+                attachments: messageAttachments,
+                timestamp: new Date(message.createdAt).toLocaleTimeString("uk-UA", {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  second: "2-digit",
+                }),
+                includeInHistory: true,
+              };
+            }),
+        );
+
+        if (!active || startupSession !== chatSessionRef.current) return;
+        setMessages(restoredMessages);
+        setAttachments(composerAttachments);
+      } catch (error) {
+        console.error("Не вдалося відновити історію чату:", error);
+      }
+    }
+
+    void restoreChat();
+
+    return () => {
+      active = false;
+    };
+  }, []);
+  const [editingMessageIndex, setEditingMessageIndex] = useState<number | null>(null);
+  const [isGenerating, setIsGenerating] = useState<boolean>(false);
+  const [modelActivity, setModelActivity] = useState<{
+    model: string; profile: string; backend: string; thinking: boolean;
+  } | null>(null);
+  const [elapsedSec, setElapsedSec] = useState<number>(0);
+  const [previewHtml, setPreviewHtml] = useState<string | null>(null);
+
+  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const sendLockRef = useRef(false);
+  const chatSessionRef = useRef(0);
+  const activeGenerationRef = useRef<ActiveGeneration | null>(null);
+  const generationIdRef = useRef(0);
+
+  // ----------------------------------------------------------
+  // LOAD PRISM LANGUAGES
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    void Promise.all([
+      import("prismjs/components/prism-markup"),
+      import("prismjs/components/prism-css"),
+      import("prismjs/components/prism-javascript"),
+      import("prismjs/components/prism-json"),
+      import("prismjs/components/prism-typescript"),
+      import("prismjs/components/prism-java"),
+      import("prismjs/components/prism-c"),
+      import("prismjs/components/prism-python"),
+    ]).catch(() => {
+      // Some Prism languages may fail to load.
+    });
+  }, []);
+
+  // ----------------------------------------------------------
+  // LOAD OLLAMA MODELS
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    async function loadModels() {
+      try {
+        const response = await fetch(`${OLLAMA_URL}/api/tags`);
+
+        if (!response.ok) return;
+
+        const data = await response.json();
+
+        const names: string[] = (data.models || [])
+          .map((model: { name: string }) => model.name)
+          .filter((name: string) => isSupportedModelName(name));
+
+        setModels(names);
+      } catch {
+        // Ollama is offline or unavailable.
+      } finally {
+        setModelsLoaded(true);
+      }
+    }
+
+    void loadModels();
+  }, []);
+
+  // ----------------------------------------------------------
+  // GENERATION TIMER
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    if (!isGenerating) return;
+
+    const start = Date.now();
+
+    setElapsedSec(0);
+
+    const timer = setInterval(() => {
+      setElapsedSec(Number(((Date.now() - start) / 1000).toFixed(1)));
+    }, 100);
+
+    return () => clearInterval(timer);
+  }, [isGenerating]);
+
+  // ----------------------------------------------------------
+  // AUTO SCROLL
+  // ----------------------------------------------------------
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, isGenerating]);
+
+  // ----------------------------------------------------------
+  // PREVIEW
+  // ----------------------------------------------------------
+
+  function handleOpenPreview(code: string, lang: string) {
+    if (lang === "css") {
+      setPreviewHtml(
+        `<!DOCTYPE html>
+<html>
+<head>
+<style>${code}</style>
+</head>
+<body>
+<div style="padding:24px;font-family:sans-serif">
+CSS підключено
+</div>
+</body>
+</html>`,
+      );
+
+      return;
+    }
+
+    setPreviewHtml(code);
+  }
+
+  function handleStopGeneration() {
+    const active = activeGenerationRef.current;
+    if (!active) return;
+
+    try {
+      active.flush();
+    } catch (error) {
+      console.error("[Sonne] Помилка фінального flush під час скасування:", error);
+    }
+
+    active.cancelled = true;
+    active.controller.abort();
+
+    try {
+      active.request?.abort();
+    } catch (error) {
+      console.error("[Sonne] Помилка abort Ollama request:", error);
+    }
+
+    setIsGenerating(false);
+  }
+
+  async function handleCopy(content: string) {
+    try {
+      await navigator.clipboard.writeText(content);
+    } catch (error) {
+      console.error("[Sonne] Не вдалося скопіювати повідомлення:", error);
+    }
+  }
+
+  function handleEdit(index: number) {
+    if (isGenerating) handleStopGeneration();
+
+    const message = messages[index];
+    if (!message || message.role !== "user") return;
+
+    const attachmentLabel = message.attachments?.length
+      ? `\n\n📎 ${message.attachments.map((file) => file.fileName).join(", ")}`
+      : "";
+
+    const editableContent =
+      attachmentLabel && message.content.endsWith(attachmentLabel)
+        ? message.content.slice(0, -attachmentLabel.length)
+        : message.content;
+
+    setInput(editableContent);
+    setAttachments([...(message.attachments ?? [])]);
+    setEditingMessageIndex(index);
+  }
+
+  // ----------------------------------------------------------
+  // SEND MESSAGE
+  // ----------------------------------------------------------
+
+  async function handleSend() {
+    if (sendLockRef.current) return;
+
+    sendLockRef.current = true;
+
+    try {
+      await handleSendInternal();
+    } finally {
+      sendLockRef.current = false;
+    }
+  }
+
+  async function handleSendInternal() {
+    const sendSession = chatSessionRef.current;
+    const isEditing = editingMessageIndex !== null;
+    const baseMessages = isEditing
+      ? messages.slice(0, editingMessageIndex)
+      : messages;
+    const attachmentFiles = [...attachments];
+    const prompt = input.trim() || (attachmentFiles.length
+      ? "Проаналізуй прикріплені файли та надай змістовну відповідь."
+      : "");
+
+    if (!prompt || isGenerating) return;
+
+    const userTime = formatNow();
+    const startTime = Date.now();
+    const perfT0 = performance.now(); // [perf-diag]
+
+    const resolvedMode = detectIntent(prompt, modeSetting);
+    const requiresModel = resolvedMode !== "image";
+
+    if (requiresModel && !modelsLoaded) return;
+
+    // Profile and execution backend are resolved together. Pro AI has two
+    // backends (Thinking / Instruct); a missing backend is an explicit error,
+    // never a silent substitution.
+    const route = requiresModel
+      ? routeRequest(
+          resolvedMode,
+          models,
+          selectedModel,
+          prompt,
+          modeSetting === "auto",
+          allowThinking,
+        )
+      : null;
+
+    if (route && !route.ok) {
+      const unavailableText = route.message;
+
+      if (!chatId) {
+        console.error("Чат ще не ініціалізовано.");
+        return;
+      }
+
+      let rewindMessageId: string | null = null;
+      if (isEditing) {
+        const editedMessage = messages[editingMessageIndex!];
+        if (!editedMessage?.dbId) {
+          console.error("Не вдалося визначити повідомлення для редагування.");
+          return;
+        }
+        rewindMessageId = editedMessage.dbId;
+      }
+
+      const userContent = prompt + (attachmentFiles.length
+        ? `\\n\\n📎 ${attachmentFiles.map((file) => file.fileName).join(", ")}`
+        : "");
+
+      const startedTurn = await invoke<{
+        userMessage: { id: string };
+        assistantMessage: { id: string };
+        attachments: AttachmentReference[];
+      }>("start_turn", {
+        chatId,
+        rewindMessageId,
+        userContent,
+        promptContent: prompt,
+        assistantContent: unavailableText,
+        assistantModel: null,
+        assistantMode: resolvedMode,
+      });
+
+      if (sendSession !== chatSessionRef.current) return;
+      const savedUser = startedTurn.userMessage;
+      const savedAssistant = startedTurn.assistantMessage;
+      const promotedAttachments = startedTurn.attachments;
+
+      setMessages([
+        ...baseMessages,
+        {
+          role: "user",
+          dbId: savedUser.id,
+          content: userContent,
+          promptContent: prompt,
+          attachments: promotedAttachments,
+          timestamp: userTime,
+        },
+        {
+          role: "assistant",
+          dbId: savedAssistant.id,
+          content: unavailableText,
+          modeUsed: resolvedMode,
+          timestamp: userTime,
+        },
+      ]);
+
+      setInput("");
+      setAttachments([]);
+      setEditingMessageIndex(null);
+      return;
+    }
+
+    const backendConfig: BackendConfig | null = route && route.ok ? route.backend : null;
+    const modelToUse = backendConfig ? backendConfig.ollamaModel : "Image Generator";
+    const activeModel = modelToUse;
+    const modelProfile = backendConfig ? backendConfig.profile : null;
+    if (backendConfig && route && route.ok) {
+      setModelActivity({
+        model: backendConfig.ollamaModel,
+        profile: backendConfig.profile,
+        backend: backendConfig.backend,
+        thinking: Boolean(route.think),
+      });
+    }
+
+    if (requiresModel && !backendConfig) return;
+
+    const generationId = requiresModel ? ++generationIdRef.current : undefined;
+    const generationController = requiresModel ? new AbortController() : null;
+
+    if (!chatId) {
+      console.error("Чат ще не ініціалізовано.");
+      return;
+    }
+
+    let rewindMessageId: string | null = null;
+    if (isEditing) {
+      const editedMessage = messages[editingMessageIndex!];
+      if (!editedMessage?.dbId) {
+        console.error("Не вдалося визначити повідомлення для редагування.");
+        return;
+      }
+      rewindMessageId = editedMessage.dbId;
+    }
+
+      // Validate text-generation dependencies before creating the SQLite turn.
+      if (
+        resolvedMode !== "image" &&
+        (!modelProfile || !backendConfig || !generationController || generationId === undefined)
+      ) {
+        console.error("Не вдалося підготувати текстову генерацію: відсутні параметри моделі.");
+        return;
+      }
+
+    const userContent = prompt + (attachmentFiles.length
+      ? `
+
+📎 ${attachmentFiles.map((file) => file.fileName).join(", ")}`
+      : "");
+
+    const imageUnavailableText =
+      "Режим генерації зображень поки не підключений. Запит збережено; " +
+      "реальну генерацію додамо після інтеграції рушія.";
+
+    const startedTurn = await invoke<{
+      userMessage: { id: string };
+      assistantMessage: { id: string };
+      attachments: AttachmentReference[];
+    }>("start_turn", {
+      chatId,
+      rewindMessageId,
+      userContent,
+      promptContent: prompt,
+      assistantContent: resolvedMode === "image" ? imageUnavailableText : "",
+      assistantModel: resolvedMode === "image" ? null : modelToUse,
+      assistantMode: resolvedMode,
+    });
+
+    if (sendSession !== chatSessionRef.current) return;
+    const savedUser = startedTurn.userMessage;
+    const savedAssistant = startedTurn.assistantMessage;
+    const promotedAttachments = startedTurn.attachments;
+
+    // Add user message and an empty assistant message.
+    setMessages([
+      ...baseMessages,
+      {
+        role: "user",
+        dbId: savedUser.id,
+        content: userContent,
+        promptContent: prompt,
+        attachments: promotedAttachments,
+        timestamp: userTime,
+        turnId: generationId,
+      },
+      {
+        id: generationId,
+        dbId: savedAssistant.id,
+        turnId: generationId,
+        role: "assistant",
+        content: resolvedMode === "image" ? imageUnavailableText : "",
+        modeUsed: resolvedMode,
+        modelUsed: resolvedMode === "image" ? undefined : modelToUse,
+        timestamp: userTime,
+      },
+    ]);
+
+    setInput("");
+    setAttachments([]);
+    setEditingMessageIndex(null);
+
+    // --------------------------------------------------------
+    // IMAGE MODE — GENERATOR NOT CONNECTED
+    // --------------------------------------------------------
+
+    if (resolvedMode === "image") {
+      setMessages((previous) => {
+        const updated = [...previous];
+        updated[updated.length - 1] = {
+          role: "assistant",
+          modeUsed: "image",
+          timestamp: formatNow(),
+          content: imageUnavailableText,
+        };
+        return updated;
+      });
+      return;
+    }
+
+    if (!modelProfile) return;
+
+    if (!backendConfig) return;
+
+    if (!generationController || generationId === undefined) return;
+
+    setIsGenerating(true);
+
+    // The router already applied the Thinking override and resolved `think`
+    // for the chosen backend (Pro Thinking: true, Pro Instruct: false,
+    // Gemma: user-controlled). App.tsx only consumes the result.
+    const userRequestedThinking = route && route.ok ? route.userRequestedThinking : false;
+    const shouldUseThinkingChannel = route && route.ok ? route.think : false;
+
+    // Full stored conversation (UI state is never modified). Only the model
+    // input is reduced, later, by selectHistory().
+    const fullHistory = baseMessages
+      .filter((message) => message.includeInHistory === true)
+      .map((message) => ({
+        role: message.role,
+        content: message.content,
+      }));
+
+    // [perf-diag] Metadata only: counts and lengths, never message text.
+    const perfTrace: PerfTrace = {
+      t0: perfT0,
+      model: modelToUse,
+      mode: resolvedMode,
+      modeSetting,
+      modelSelection: selectedModel === "auto" ? "auto" : "manual",
+      profile: modelProfile,
+      backend: backendConfig.backend,
+      thinkingChannel: shouldUseThinkingChannel,
+      historyMessages: fullHistory.length,
+      context: null,
+      historyChars: fullHistory.reduce(
+        (total, message) => total + message.content.length,
+        0,
+      ),
+      systemPromptChars: 0,
+      userPromptChars: prompt.length,
+      marks: {},
+      chunks: 0,
+      thinkingChunks: 0,
+      contentChunks: 0,
+      lineFailures: 0,
+      streamError: null,
+      cancelled: false,
+      final: null,
+    };
+
+    let rawFull = "";
+    let pendingContent = "";
+    let animationFrame: number | null = null;
+
+    function updateAssistant(update: Partial<ChatMessage>) {
+      if (sendSession !== chatSessionRef.current) return;
+      setMessages((previous) =>
+        previous.map((message) => {
+          if (message.id === generationId) {
+            return { ...message, ...update };
+          }
+
+          if (
+            update.includeInHistory === true &&
+            message.role === "user" &&
+            message.turnId === generationId
+          ) {
+            return { ...message, includeInHistory: true };
+          }
+
+          return message;
+        }),
+      );
+    }
+
+    function flushPendingContent() {
+      if (animationFrame !== null) {
+        cancelAnimationFrame(animationFrame);
+        animationFrame = null;
+      }
+
+      if (activeGeneration.cancelled) {
+        pendingContent = "";
+        return;
+      }
+
+      if (!pendingContent) return;
+
+      rawFull += pendingContent;
+      pendingContent = "";
+
+      const answer = extractAnswer(rawFull);
+
+      // [perf-diag] First non-empty answer text that reaches the UI.
+      if (answer && perfTrace.marks.firstVisible === undefined) {
+        perfMark(perfTrace, "firstVisible");
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => perfMark(perfTrace, "firstPaint")),
+        );
+      }
+
+      updateAssistant({
+        content: answer,
+        modeUsed: resolvedMode,
+        modelUsed: activeModel,
+        timestamp: formatNow(),
+      });
+    }
+
+    const activeGeneration: ActiveGeneration = {
+      id: generationId,
+      controller: generationController,
+      request: null,
+      cancelled: false,
+      flush: flushPendingContent,
+    };
+
+    activeGenerationRef.current = activeGeneration;
+    async function persistAssistantMessage(content: string) {
+      try {
+        await invoke("update_message", {
+          messageId: savedAssistant.id,
+          content,
+          promptContent: null,
+          modelUsed: modelToUse,
+          modeUsed: resolvedMode,
+        });
+      } catch (error) {
+        console.error("[Sonne] Не вдалося зберегти відповідь у SQLite:", error);
+      }
+    }
+
+
+    // --------------------------------------------------------
+    // RUNTIME INSTRUCTIONS + OLLAMA REQUEST
+    // --------------------------------------------------------
+
+    try {
+      const runtimeInstructions = await invoke<string>(
+        "get_runtime_instructions",
+        { model: modelProfile },
+      );
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        throw new DOMException("Generation cancelled", "AbortError");
+      }
+
+      perfMark(perfTrace, "instructions"); // [perf-diag]
+
+      // Both Pro AI backends receive the same profile instructions and the
+      // same task/response assembly (see buildSystemPrompt).
+      const systemPrompt = buildSystemPrompt(runtimeInstructions, resolvedMode);
+
+      perfTrace.systemPromptChars = systemPrompt.length; // [perf-diag]
+
+      // SQLite transaction is the source of truth: process exactly the
+      // attachments promoted into this message by start_turn.
+      const attachmentResults = await Promise.all(
+        promotedAttachments.map((file) => readStoredAttachment(file)),
+      );
+
+      const attachmentContext = attachmentResults.map((file) =>
+        `\n\n--- Вкладений файл: ${file.fileName} (${file.type}) ---\n${file.content}`,
+      ).join("");
+
+      const modelPrompt = attachmentContext
+        ? `${prompt}\n\nВміст вкладених файлів:${attachmentContext}`
+        : prompt;
+
+      const contextBudget = resolveContextBudget(
+        backendConfig,
+        shouldUseThinkingChannel,
+      );
+
+      const fixedTokens =
+        estimateMessageTokens({ content: systemPrompt }) +
+        estimateMessageTokens({ content: modelPrompt });
+
+      if (fixedTokens > contextBudget.inputBudget) {
+        throw new Error(
+          `Системний промпт і вкладення потребують приблизно ${fixedTokens} токенів, ` +
+          `але доступний бюджет — ${contextBudget.inputBudget}. ` +
+          `Розділи документи на менші частини або надішли менше вмісту за раз.`,
+        );
+      }
+
+      // Smart History: older conversation turns are omitted first.
+      const contextSelection = selectHistory(fullHistory, {
+        systemPrompt,
+        userPrompt: modelPrompt,
+        budget: contextBudget,
+      });
+      const historyMessages = contextSelection.history;
+
+      perfTrace.context = contextSelection.stats; // [perf-diag]
+      perfTrace.historyMessages = historyMessages.length; // [perf-diag]
+      perfTrace.historyChars = historyMessages.reduce(
+        (total, message) => total + message.content.length,
+        0,
+      ); // [perf-diag]
+
+      if (contextSelection.stats.status === "fixed-content-exceeds-budget") {
+        console.warn(
+          "[Sonne context] system prompt + current message exceed the estimated input budget; sent without history, not truncated.",
+          contextSelection.stats,
+        );
+      }
+
+
+
+      const apiMessages = [
+        {
+          role: "system" as const,
+          content: systemPrompt,
+        },
+        ...historyMessages,
+        {
+          role: "user" as const,
+          content: modelPrompt,
+        },
+      ];
+
+      const activeRequest = await createChatStream(
+        OLLAMA_URL,
+        buildChatRequestBody(
+          backendConfig,
+          apiMessages,
+          userRequestedThinking,
+        ),
+        generationController.signal,
+      );
+
+      perfMark(perfTrace, "headers"); // [perf-diag]
+
+      activeGeneration.request = activeRequest;
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        activeRequest.abort();
+        throw new DOMException("Generation cancelled", "AbortError");
+      }
+
+      // ------------------------------------------------------
+      // STREAM PROCESSING
+      // ------------------------------------------------------
+
+      function queueContent(contentChunk: string) {
+        if (
+          !contentChunk ||
+          activeGeneration.cancelled ||
+          activeGenerationRef.current?.id !== generationId
+        ) {
+          return;
+        }
+
+        pendingContent += contentChunk;
+
+        if (animationFrame === null) {
+          animationFrame = requestAnimationFrame(() => {
+            animationFrame = null;
+            if (activeGeneration.cancelled) return;
+            flushPendingContent();
+          });
+        }
+      }
+
+      for await (const chunk of activeRequest.stream) {
+        if (
+          activeGeneration.cancelled ||
+          generationController.signal.aborted
+        ) {
+          break;
+        }
+
+        perfObserveChunk(perfTrace, chunk); // [perf-diag]
+
+        // The private thinking channel is intentionally ignored.
+        // Only normal response content is displayed.
+        queueContent(chunk.message?.content || "");
+      }
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        throw new DOMException("Generation cancelled", "AbortError");
+      }
+
+      flushPendingContent();
+      perfMark(perfTrace, "streamEnd"); // [perf-diag]
+      perfLogReport(perfTrace); // [perf-diag]
+
+      // ------------------------------------------------------
+      // FINISH RESPONSE
+      // ------------------------------------------------------
+
+      const totalSec = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      updateAssistant({
+        timestamp: formatNow(),
+        durationSec: totalSec,
+        includeInHistory: true,
+      });
+
+      await persistAssistantMessage(extractAnswer(rawFull));
+    } catch (err) {
+      // ------------------------------------------------------
+      // ERROR HANDLING
+      // ------------------------------------------------------
+
+      const errMsg =
+        err instanceof Error ? err.message : "Помилка з'єднання з Ollama";
+
+      flushPendingContent();
+
+      if (activeGeneration.cancelled || generationController.signal.aborted) {
+        perfTrace.cancelled = true; // [perf-diag]
+        perfMark(perfTrace, "streamEnd"); // [perf-diag]
+        perfLogReport(perfTrace); // [perf-diag]
+        updateAssistant({
+          timestamp: formatNow(),
+          durationSec: ((Date.now() - startTime) / 1000).toFixed(1),
+        });
+        await persistAssistantMessage(extractAnswer(rawFull));
+        return;
+      }
+
+      perfLogFailure(perfTrace, errMsg); // [perf-diag]
+
+      updateAssistant({
+        role: "assistant",
+        modeUsed: resolvedMode,
+        modelUsed: modelToUse,
+        content: `Не вдалося обробити запит: ${errMsg}`,
+        timestamp: formatNow(),
+      });
+
+      await persistAssistantMessage(`Не вдалося обробити запит: ${errMsg}`);
+    } finally {
+      try {
+        flushPendingContent();
+      } catch (error) {
+        console.error("[Sonne] Помилка фінального оновлення UI:", error);
+      }
+
+      try {
+        activeGeneration.request?.dispose();
+      } catch (error) {
+        console.error("[Sonne] Помилка очищення Ollama request:", error);
+      }
+
+      if (activeGenerationRef.current?.id === generationId) {
+        activeGenerationRef.current = null;
+        setIsGenerating(false);
+      }
+    }
+  }
+
+  // ==========================================================
+  // RENDER
+  // ==========================================================
+
+  return (
+    <div className={`sonne-shell ${isGenerating ? "is-generating" : ""}`}>
+      <div className="ambient-layer" />
+
+      <ChatHeader
+        models={models}
+        selectedModel={selectedModel}
+        onSelectedModelChange={setSelectedModel}
+        modeSetting={modeSetting}
+        onModeSettingChange={setModeSetting}
+        allowThinking={allowThinking}
+        onToggleThinking={() => setAllowThinking((value) => !value)}
+        messagesLength={messages.length}
+        onNewChat={() => {
+          chatSessionRef.current += 1;
+          handleStopGeneration();
+          void (async () => {
+            try {
+              const chat = await invoke<{ id: string }>("create_chat", {
+                title: "Новий чат",
+              });
+
+              setChatId(chat.id);
+              setMessages([]);
+              setInput("");
+              setAttachments([]);
+              setEditingMessageIndex(null);
+              setPreviewHtml(null);
+            } catch (error) {
+              console.error("Не вдалося створити новий чат:", error);
+            }
+          })();
+        }}
+        isGenerating={isGenerating}
+        modelActivity={modelActivity}
+        elapsedSec={elapsedSec}
+      />
+
+      <div className="sonne-workspace">
+        <div className="chat-pane">
+          <main className="sonne-messages">
+            {messages.length === 0 ? (
+              <EmptyState />
+            ) : (
+              messages.map((message, index) => (
+                <ChatMessageItem
+                  key={index}
+                  message={message}
+                  index={index}
+                  totalMessages={messages.length}
+                  isGenerating={isGenerating}
+                  onPreview={handleOpenPreview}
+                  highlightCode={highlightCode}
+                  onCopy={handleCopy}
+                  onEdit={handleEdit}
+                />
+              ))
+            )}
+
+            <div ref={bottomRef} />
+          </main>
+
+          <ChatInput
+            input={input}
+            onInputChange={setInput}
+            attachments={attachments}
+            onAttachmentsChange={setAttachments}
+            isGenerating={isGenerating}
+            elapsedSec={elapsedSec}
+            onSend={handleSend}
+            onStop={handleStopGeneration}
+          chatId={chatId}
+            />
+        </div>
+
+        {previewHtml !== null && (
+          <LivePreview html={previewHtml} onClose={() => setPreviewHtml(null)} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default App;
