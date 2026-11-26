@@ -10,7 +10,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OpenFlags};
-use schema::{INITIAL_SCHEMA, MIGRATION_1_TO_2, MIGRATION_2_TO_3, MIGRATION_3_TO_4, SCHEMA_VERSION};
+use schema::{INITIAL_SCHEMA, MIGRATION_1_TO_2, MIGRATION_2_TO_3, MIGRATION_3_TO_4, MIGRATION_4_TO_5, SCHEMA_VERSION};
 
 pub(super) const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 pub(super) const MAX_IMPORT_BATCH_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -122,6 +122,11 @@ impl Storage {
                         .map_err(|error| {
                             format!("Cannot migrate database schema 3 to 4: {error}")
                         })?;
+                    transaction
+                        .execute_batch(MIGRATION_4_TO_5)
+                        .map_err(|error| {
+                            format!("Cannot migrate database schema 4 to 5: {error}")
+                        })?;
                 }
                 1 => {
                     transaction
@@ -139,6 +144,11 @@ impl Storage {
                         .map_err(|error| {
                             format!("Cannot migrate database schema 3 to 4: {error}")
                         })?;
+                    transaction
+                        .execute_batch(MIGRATION_4_TO_5)
+                        .map_err(|error| {
+                            format!("Cannot migrate database schema 4 to 5: {error}")
+                        })?;
                 }
                 2 => {
                     transaction
@@ -151,12 +161,29 @@ impl Storage {
                         .map_err(|error| {
                             format!("Cannot migrate database schema 3 to 4: {error}")
                         })?;
+                    transaction
+                        .execute_batch(MIGRATION_4_TO_5)
+                        .map_err(|error| {
+                            format!("Cannot migrate database schema 4 to 5: {error}")
+                        })?;
                 }
                 3 => {
                     transaction
                         .execute_batch(MIGRATION_3_TO_4)
                         .map_err(|error| {
                             format!("Cannot migrate database schema 3 to 4: {error}")
+                        })?;
+                    transaction
+                        .execute_batch(MIGRATION_4_TO_5)
+                        .map_err(|error| {
+                            format!("Cannot migrate database schema 4 to 5: {error}")
+                        })?;
+                }
+                4 => {
+                    transaction
+                        .execute_batch(MIGRATION_4_TO_5)
+                        .map_err(|error| {
+                            format!("Cannot migrate database schema 4 to 5: {error}")
                         })?;
                 }
                 version => {

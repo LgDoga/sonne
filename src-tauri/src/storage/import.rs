@@ -183,8 +183,8 @@ impl Storage {
             )
             .map_err(|error| format!("Cannot start import journal: {error}"))?;
 
-        let preparation = (|| -> Result<Vec<PreparedAttachment>, String> {
-            let mut prepared = Vec::with_capacity(paths.len());
+        let mut prepared = Vec::with_capacity(paths.len());
+        let preparation = (|| -> Result<(), String> {
             let mut imported_size = 0u64;
 
             for path in paths {
@@ -196,7 +196,6 @@ impl Storage {
                 }
 
                 let (file_name, extension, mime_type) = file_metadata(&path)?;
-
                 let file = File::open(&path)
                     .map_err(|error| format!("Cannot open {file_name}: {error}"))?;
 
@@ -249,21 +248,28 @@ impl Storage {
                     .map_err(|error| format!("Cannot update import journal: {error}"))?;
             }
 
-            Ok(prepared)
+            Ok(())
         })();
 
-        let prepared = match preparation {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let _ = self.connection.execute(
-                    "UPDATE storage_operations
-                     SET state = 'FAILED', error_message = ?1, updated_at = ?2
-                     WHERE id = ?3",
-                    params![error, now_timestamp().unwrap_or(timestamp), operation_id],
-                );
-                return Err(error);
+        if let Err(error) = preparation {
+            let _ = self.connection.execute(
+                "UPDATE storage_operations
+                 SET state = 'FAILED', error_message = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![error, now_timestamp().unwrap_or(timestamp), operation_id],
+            );
+
+            for item in &prepared {
+                if let Err(cleanup_error) = self.delete_unreferenced_blob(&item.blob_sha256) {
+                    eprintln!(
+                        "Failed to clean up partial import blob {}: {}",
+                        item.blob_sha256, cleanup_error
+                    );
+                }
             }
-        };
+
+            return Err(error);
+        }
 
         let transaction = self
             .connection

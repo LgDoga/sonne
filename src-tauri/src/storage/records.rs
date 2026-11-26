@@ -517,11 +517,85 @@ impl Storage {
     }
 
     pub fn delete_chat(&mut self, chat_id: &str) -> Result<bool, String> {
-        let deleted = self
+        let transaction = self
             .connection
+            .transaction()
+            .map_err(|error| format!("Cannot start chat deletion: {error}"))?;
+
+        let affected = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT DISTINCT v.id, v.attachment_id, v.blob_sha256
+                     FROM attachment_references r
+                     JOIN attachment_versions v ON v.id = r.attachment_version_id
+                     WHERE r.chat_id = ?1",
+                )
+                .map_err(|error| format!("Cannot prepare chat attachment cleanup: {error}"))?;
+
+            let rows = statement
+                .query_map(params![chat_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("Cannot query chat attachments: {error}"))?;
+
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("Cannot collect chat attachments: {error}"))?
+        };
+
+        let deleted = transaction
             .execute("DELETE FROM chats WHERE id = ?1", params![chat_id])
             .map_err(|error| format!("Cannot delete chat: {error}"))?;
 
-        Ok(deleted > 0)
+        if deleted == 0 {
+            transaction
+                .commit()
+                .map_err(|error| format!("Cannot finish chat deletion: {error}"))?;
+            return Ok(false);
+        }
+
+        let mut candidate_blobs = Vec::new();
+        for (version_id, attachment_id, blob_sha256) in affected {
+            transaction
+                .execute(
+                    "DELETE FROM attachment_versions
+                     WHERE id = ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM attachment_references
+                           WHERE attachment_version_id = ?1
+                       )",
+                    params![version_id],
+                )
+                .map_err(|error| format!("Cannot remove orphaned attachment version: {error}"))?;
+
+            transaction
+                .execute(
+                    "DELETE FROM attachments
+                     WHERE id = ?1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM attachment_versions
+                           WHERE attachment_id = ?1
+                       )",
+                    params![attachment_id],
+                )
+                .map_err(|error| format!("Cannot remove empty attachment: {error}"))?;
+
+            candidate_blobs.push(blob_sha256);
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| format!("Cannot commit chat deletion: {error}"))?;
+
+        candidate_blobs.sort();
+        candidate_blobs.dedup();
+        for sha256 in candidate_blobs {
+            self.delete_unreferenced_blob(&sha256)?;
+        }
+
+        Ok(true)
     }
 }

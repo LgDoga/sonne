@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub const INITIAL_SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -327,4 +327,46 @@ CREATE TABLE IF NOT EXISTS document_summary_parts (
 CREATE INDEX IF NOT EXISTS idx_document_summary_parts_stage
 ON document_summary_parts(document_id, stage, ordinal);
 
+"#;
+
+pub const MIGRATION_4_TO_5: &str = r#"
+-- The operation journal must retain immutable blob hashes after blob metadata
+-- is deleted. A foreign key with ON DELETE SET NULL destroys the recovery key.
+CREATE TABLE storage_operations_v5 (
+    id TEXT PRIMARY KEY,
+    operation_type TEXT NOT NULL,
+    blob_sha256 TEXT,
+    source_path TEXT,
+    target_path TEXT,
+    state TEXT NOT NULL
+        CHECK (state IN (
+            'PENDING',
+            'PROCESSING',
+            'VERIFYING',
+            'COMMITTING',
+            'COMPLETED',
+            'FAILED'
+        )),
+    metadata_json TEXT,
+    error_message TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+INSERT INTO storage_operations_v5 (
+    id, operation_type, blob_sha256, source_path, target_path,
+    state, metadata_json, error_message, created_at, updated_at
+)
+SELECT
+    id, operation_type, blob_sha256, source_path, target_path,
+    state, metadata_json, error_message, created_at, updated_at
+FROM storage_operations;
+
+DROP TABLE storage_operations;
+ALTER TABLE storage_operations_v5 RENAME TO storage_operations;
+
+CREATE INDEX idx_storage_operations_state
+ON storage_operations(state, updated_at);
+
+UPDATE storage_metadata SET value = '5' WHERE key = 'schema_version';
 "#;

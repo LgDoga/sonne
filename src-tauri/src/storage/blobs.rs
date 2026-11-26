@@ -392,6 +392,9 @@ impl Storage {
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM archive_entries WHERE blob_sha256 = ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1
                    )",
                 params![sha256],
                 |row| row.get::<_, String>(0),
@@ -654,8 +657,41 @@ pub(super) fn recover_interrupted_operations(
                     recovery_message.push_str(" No temporary source path was recorded.");
                 }
 
-                recovery_message
-                    .push_str(" Any committed target blob was preserved for later reconciliation.");
+                if let Some(relative) = target_path.as_deref() {
+                    let registered: bool = connection
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM blobs WHERE relative_path = ?1)",
+                            params![relative],
+                            |row| row.get(0),
+                        )
+                        .map_err(|error| format!("Cannot check recovered blob target: {error}"))?;
+
+                    if !registered {
+                        let candidate = resolve_relative_path(root_dir, relative)?;
+                        let filename = candidate
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .ok_or_else(|| "Recovered blob filename is invalid".to_string())?;
+                        let expected_hash = filename
+                            .strip_suffix(".blob")
+                            .filter(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                            .ok_or_else(|| "Recovered blob filename does not contain a SHA-256 hash".to_string())?;
+
+                        if candidate.exists() {
+                            if hash_file(&candidate)? != expected_hash {
+                                return Err("Uncommitted blob target failed SHA-256 verification; file was preserved".to_string());
+                            }
+                            remove_recovered_blob_file(root_dir, relative)?;
+                            recovery_message.push_str(" Uncommitted target blob was verified and removed.");
+                        } else {
+                            recovery_message.push_str(" Uncommitted target blob was already absent.");
+                        }
+                    } else {
+                        recovery_message.push_str(" Registered target blob was preserved.");
+                    }
+                } else {
+                    recovery_message.push_str(" No target path was recorded.");
+                }
             }
             "import_batch" => {
                 recovery_message.push_str(
