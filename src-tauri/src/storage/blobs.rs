@@ -434,6 +434,9 @@ impl Storage {
                    )
                    AND NOT EXISTS (
                        SELECT 1 FROM archive_entries WHERE blob_sha256 = ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1
                    )",
                 params![sha256],
             )

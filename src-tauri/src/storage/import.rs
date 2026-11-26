@@ -333,6 +333,12 @@ impl Storage {
                 params![error, now_timestamp().unwrap_or(timestamp), operation_id],
             );
 
+            for item in &prepared {
+                if let Err(cleanup_error) = self.delete_unreferenced_blob(&item.blob_sha256) {
+                    eprintln!("Failed to clean up import blob {}: {}", item.blob_sha256, cleanup_error);
+                }
+            }
+
             return Err(error);
         }
 
