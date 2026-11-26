@@ -271,18 +271,10 @@ impl Storage {
             return Err(error);
         }
 
-        let transaction = match self.connection.transaction() {
-            Ok(transaction) => transaction,
-            Err(error) => {
-                let message = format!("Cannot start atomic attachment transaction: {error}");
-                for item in &prepared {
-                    if let Err(cleanup_error) = self.delete_unreferenced_blob(&item.blob_sha256) {
-                        eprintln!("Failed to clean up import blob {}: {}", item.blob_sha256, cleanup_error);
-                    }
-                }
-                return Err(message);
-            }
-        };
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| format!("Cannot start atomic attachment transaction: {error}"))?;
 
         let commit_result = (|| -> Result<(), String> {
             for item in &prepared {
