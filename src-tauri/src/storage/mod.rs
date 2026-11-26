@@ -408,4 +408,30 @@ mod storage_lifecycle_tests {
         ).unwrap();
         assert_eq!(retained, blob.sha256);
     }
+    #[test]
+    fn startup_recovers_unreferenced_blobs_from_failed_import_journal() {
+        let (directory, mut storage) = storage();
+        let blob = storage.store_blob(Cursor::new(b"interrupted import".to_vec())).unwrap();
+        let metadata = serde_json::json!({
+            "chatId": "deleted-chat",
+            "files": [{"blobSha256": blob.sha256}]
+        }).to_string();
+
+        storage.connection().execute(
+            "INSERT INTO storage_operations (
+                id, operation_type, state, metadata_json, created_at, updated_at
+             ) VALUES ('failed-import-test', 'import_batch', 'FAILED', ?1, 1, 1)",
+            [metadata],
+        ).unwrap();
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0).expect("startup recovery should succeed");
+        let exists: bool = recovered.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+            [&blob.sha256], |row| row.get(0)
+        ).unwrap();
+        assert!(!exists, "orphan blob metadata should be removed");
+        assert!(!recovered.root_dir().join(&blob.relative_path).exists());
+    }
+
 }
