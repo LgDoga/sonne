@@ -55,6 +55,7 @@ export default function FileAttachments({
   const processingReferences = useRef(new Set<string>());
 
   const [processingStatus, setProcessingStatus] = useState<Record<string, "processing" | "failed" | "completed">>({});
+  const [processingDetails, setProcessingDetails] = useState<Record<string, string>>({});
 
   useEffect(() => {
     let disposed = false;
@@ -79,9 +80,18 @@ export default function FileAttachments({
         fileName: attachment.fileName,
         mimeType: attachment.mimeType,
         originalSize: attachment.originalSize,
+        onProgress: (message) => {
+          if (disposed) return;
+          setProcessingDetails((current) => ({ ...current, [attachment.id]: message }));
+        },
       })
         .then(() => {
           if (disposed) return;
+          setProcessingDetails((current) => {
+            const next = { ...current };
+            delete next[attachment.id];
+            return next;
+          });
           setProcessingStatus((current) => ({
             ...current,
             [attachment.id]: "completed",
@@ -91,6 +101,11 @@ export default function FileAttachments({
           processingReferences.current.delete(attachment.id);
           if (disposed) return;
 
+          setProcessingDetails((current) => {
+            const next = { ...current };
+            delete next[attachment.id];
+            return next;
+          });
           setProcessingStatus((current) => ({
             ...current,
             [attachment.id]: "failed",
@@ -212,14 +227,27 @@ export default function FileAttachments({
         fileName: attachment.fileName,
         mimeType: attachment.mimeType,
         originalSize: attachment.originalSize,
+        onProgress: (message) => {
+          setProcessingDetails((current) => ({ ...current, [attachment.id]: message }));
+        },
       });
 
+      setProcessingDetails((current) => {
+        const next = { ...current };
+        delete next[attachment.id];
+        return next;
+      });
       setProcessingStatus((current) => ({
         ...current,
         [attachment.id]: "completed",
       }));
     } catch (cause) {
       processingReferences.current.delete(attachment.id);
+      setProcessingDetails((current) => {
+        const next = { ...current };
+        delete next[attachment.id];
+        return next;
+      });
       setProcessingStatus((current) => ({
         ...current,
         [attachment.id]: "failed",
@@ -314,7 +342,9 @@ export default function FileAttachments({
                   {formatFileSize(attachment.originalSize)}
                 </span>
                 {processingStatus[attachment.id] === "processing" && (
-                  <span className="file-attachments-status">Обробка...</span>
+                  <span className="file-attachments-status">
+                    {processingDetails[attachment.id] || "Обробка..."}
+                  </span>
                 )}
                 {processingStatus[attachment.id] === "failed" && (
                   <>

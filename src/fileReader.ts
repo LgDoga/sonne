@@ -2,7 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { OfficeParser } from "officeparser";
 import { createWorker } from "tesseract.js";
 
-import { createEmbeddings, createVisionDescription, OLLAMA_HOST } from "./ollamaClient";
+import {
+  createEmbeddings,
+  createVisionDescription,
+  OLLAMA_HOST,
+  VISION_CONFIG,
+  VISION_PROMPT_VERSION,
+} from "./ollamaClient";
 export type SupportedFileType =
   | "text"
   | "pdf"
@@ -109,7 +115,7 @@ async function readOfficeFile(file: File): Promise<string> {
     },
   });
 
-  const result = await ast.to("md");
+  const result = await ast.to("md", { includeImages: "ocr-text-only" });
 
   if (typeof result.value !== "string") {
     throw new Error(
@@ -178,10 +184,11 @@ export interface StoredAttachmentInput {
   fileName: string;
   mimeType: string;
   originalSize: number;
+  onProgress?: (message: string) => void;
 }
 
 export const EXTRACTOR_ID = "sonne-unified";
-export const EXTRACTOR_VERSION = "officeparser-8.9.0_tesseract-7.0.0_assets-v2-vision";
+export const EXTRACTOR_VERSION = "officeparser-8.9.0_tesseract-7.0.0_assets-v3-on-demand-vision";
 const STORED_READ_CHUNK_SIZE = 256 * 1024;
 const INDEX_CHUNK_TARGET_TOKENS = 800;
 const INDEX_CHUNK_OVERLAP_TOKENS = 120;
@@ -740,7 +747,7 @@ async function extractStoredFile(
       },
     });
 
-    const result = await ast.to("md");
+    const result = await ast.to("md", { includeImages: "ocr-text-only" });
     if (typeof result.value !== "string" || !result.value.trim()) {
       throw new Error(
         `Не вдалося отримати текст із файлу "${file.name}".`,
@@ -756,6 +763,36 @@ async function extractStoredFile(
       sections,
       assets,
       metadata: getAstMetadata(ast),
+    };
+  }
+
+  if (type === "image") {
+    // Keep the original image as a first-class asset even when OCR finds no text.
+    const ocrText = await readImageFile(file);
+    if (file.size > MAX_ASSET_BYTES) {
+      throw new Error(`Зображення перевищує ліміт ${MAX_ASSET_BYTES / 1024 / 1024} MiB.`);
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    return {
+      type,
+      content: ocrText.trim() || `Зображення: ${file.name}`,
+      sections: [{
+        key: "root",
+        parentKey: null,
+        sectionType: "root",
+        title: file.name,
+        ordinal: 0,
+      }],
+      assets: [{
+        sectionKey: "root",
+        assetType: "image",
+        mimeType: file.type || null,
+        fileName: file.name,
+        ordinal: 0,
+        data: Array.from(bytes),
+        metadata: ocrText.trim() ? { ocrText: ocrText.trim() } : null,
+      }],
+      metadata: { fileName: file.name, mimeType: file.type, extraction: "tesseract-ocr" },
     };
   }
 
@@ -778,7 +815,7 @@ async function extractStoredFile(
     metadata: {
       fileName: file.name,
       mimeType: file.type,
-      extraction: result.type === "image" ? "tesseract-ocr" : "plain-text",
+      extraction: "plain-text",
     },
   };
 }
@@ -836,59 +873,91 @@ function flattenChartData(value: unknown): string {
   return lines.join("\n").slice(0, 180000);
 }
 
-const MAX_BACKGROUND_VISION_IMAGES = 4;
-const MAX_BACKGROUND_VISION_BYTES = 20 * 1024 * 1024;
+const MAX_BACKGROUND_VISION_IMAGES = VISION_CONFIG.backgroundMaxImages;
+const MAX_BACKGROUND_VISION_BYTES = VISION_CONFIG.backgroundMaxBytes;
 const MAX_ASSET_METADATA_BYTES = 256 * 1024;
 
 async function addBackgroundVisionDescriptions(
   assets: ExtractedAsset[],
+  onProgress?: (message: string) => void,
 ): Promise<ExtractedAsset[]> {
   const result = [...assets];
   let processedImages = 0;
   let processedBytes = 0;
-
-  for (let index = 0; index < result.length; index += 1) {
-    const asset = result[index];
-    if (asset.assetType !== "image") continue;
-    if (processedImages >= MAX_BACKGROUND_VISION_IMAGES) break;
-
+  const candidates = result.filter((asset) => {
+    if (asset.assetType !== "image") return false;
     const mimeType = asset.mimeType?.toLowerCase() ?? "";
     const fileName = asset.fileName?.toLowerCase() ?? "";
-    const supportedImage =
-      ["image/png", "image/jpeg", "image/webp"].includes(mimeType) ||
+    return ["image/png", "image/jpeg", "image/webp"].includes(mimeType) ||
       /\.(png|jpe?g|webp)$/.test(fileName);
+  });
+  const selectedCandidates = candidates.slice(0, MAX_BACKGROUND_VISION_IMAGES);
+  const totalCandidates = selectedCandidates.length;
 
-    if (!supportedImage) continue;
-
+  for (const asset of selectedCandidates) {
+    const index = result.indexOf(asset);
     const imageBytes = Uint8Array.from(asset.data);
-    if (imageBytes.byteLength === 0) continue;
-    if (processedBytes + imageBytes.byteLength > MAX_BACKGROUND_VISION_BYTES) continue;
+    if (imageBytes.byteLength === 0) {
+      onProgress?.(`Фоновий Vision (Gemma 3): пропущено порожнє зображення ${asset.ordinal + 1}`);
+      continue;
+    }
+    if (processedBytes + imageBytes.byteLength > MAX_BACKGROUND_VISION_BYTES) {
+      onProgress?.("Фоновий Vision (Gemma 3): досягнуто ліміт 20 MiB; решту залишено для аналізу за запитом");
+      continue;
+    }
 
     processedImages += 1;
     processedBytes += imageBytes.byteLength;
+    const visionStartedAt = performance.now();
+    onProgress?.(`Фоновий Vision (Gemma 3): аналіз ${processedImages}/${totalCandidates} · зображення ${asset.ordinal + 1}`);
 
     try {
       const description = await createVisionDescription(OLLAMA_HOST, imageBytes);
-      if (!description) continue;
+      if (!description) {
+        onProgress?.(`Фоновий Vision (Gemma 3): порожній опис ${processedImages}/${totalCandidates}`);
+        continue;
+      }
 
       const metadata = {
         ...(asset.metadata ?? {}),
         visionDescription: description,
+        visionModel: "sonne-gemma:latest",
+        visionPromptVersion: VISION_PROMPT_VERSION,
+        visionAnalyzedAt: new Date().toISOString(),
       };
       const metadataSize = new TextEncoder().encode(JSON.stringify(metadata)).byteLength;
 
       if (metadataSize > MAX_ASSET_METADATA_BYTES) {
         console.warn(`[Sonne Vision] Метадані зображення №${asset.ordinal + 1} перевищують ліміт.`);
+        onProgress?.(`Фоновий Vision (Gemma 3): опис ${processedImages}/${totalCandidates} не збережено — завеликі метадані`);
         continue;
       }
 
       result[index] = { ...asset, metadata };
+      console.info("[Sonne Vision] Background image", {
+        image: asset.fileName || asset.ordinal + 1,
+        bytes: imageBytes.byteLength,
+        durationMs: Math.round(performance.now() - visionStartedAt),
+        result: "cached-for-index",
+      });
+      onProgress?.(`Фоновий Vision (Gemma 3): завершено ${processedImages}/${totalCandidates}`);
     } catch (error) {
       console.warn(
         `[Sonne Vision] Не вдалося описати зображення №${asset.ordinal + 1}:`,
         error,
       );
+      console.info("[Sonne Vision] Background image", {
+        image: asset.fileName || asset.ordinal + 1,
+        bytes: imageBytes.byteLength,
+        durationMs: Math.round(performance.now() - visionStartedAt),
+        result: "failed",
+      });
+      onProgress?.(`Фоновий Vision (Gemma 3): помилка зображення ${asset.ordinal + 1} (${processedImages}/${totalCandidates})`);
     }
+  }
+
+  if (candidates.length > selectedCandidates.length) {
+    onProgress?.(`Фоновий Vision (Gemma 3): ${processedImages}/${totalCandidates} оброблено; ${candidates.length - selectedCandidates.length} залишено для аналізу за запитом`);
   }
 
   return result;
@@ -957,6 +1026,8 @@ function createAssetIndexChunks(assets: ExtractedAsset[]): IndexChunk[] {
 export async function processStoredAttachment(
   attachment: StoredAttachmentInput,
 ): Promise<{ status: "completed" | "skipped"; documentId?: string }> {
+  const onProgress = attachment.onProgress;
+  onProgress?.("Витягування тексту, структури та зображень…");
   if (isArchiveName(attachment.fileName)) {
     return { status: "skipped" };
   }
@@ -993,7 +1064,8 @@ export async function processStoredAttachment(
     if (!documentId) {
       const file = await loadStoredAttachment(attachment);
       const extracted = await extractStoredFile(file);
-      const visionAssets = await addBackgroundVisionDescriptions(extracted.assets);
+      const visionAssets = await addBackgroundVisionDescriptions(extracted.assets, onProgress);
+      onProgress?.("Підготовка пошукових фрагментів…");
       const chunks = [
         ...splitIntoChunks(extracted.content),
         ...createAssetIndexChunks(visionAssets),
@@ -1035,6 +1107,7 @@ export async function processStoredAttachment(
     }
 
     stage = "embedding";
+    onProgress?.("Створення локального пошукового індексу…");
 
     while (true) {
       const batch = await invoke<
@@ -1072,6 +1145,7 @@ export async function processStoredAttachment(
     }
 
     await invoke("finalize_document_embedding_index", { documentId });
+    onProgress?.("Обробку завершено.");
 
     return { status: "completed", documentId };
   } catch (error) {

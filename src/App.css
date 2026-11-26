@@ -508,6 +508,14 @@ body,
   font-weight: 600;
 }
 
+.vision-progress {
+  margin: 0 0 10px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
+}
+
 .msg-time {
   font-variant-numeric: tabular-nums;
   opacity: 0.8;

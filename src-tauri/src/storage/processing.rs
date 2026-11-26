@@ -880,6 +880,315 @@ pub fn get_attachment_document_context(
     })
 }
 
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDocumentAsset {
+    pub asset_id: String,
+    pub asset_type: String,
+    pub mime_type: Option<String>,
+    pub file_name: Option<String>,
+    pub ordinal: i64,
+    pub metadata_json: Option<String>,
+    pub document_id: String,
+    pub section_title: Option<String>,
+}
+
+#[tauri::command]
+pub fn list_attachment_document_assets(
+    state: State<'_, Mutex<Storage>>,
+    chat_id: String,
+    reference_id: String,
+) -> Result<Vec<AttachmentDocumentAsset>, String> {
+    let storage = state
+        .lock()
+        .map_err(|error| format!("Storage lock poisoned: {error}"))?;
+    let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let mut statement = storage.connection.prepare(
+        "SELECT a.id, a.asset_type, a.mime_type, a.file_name, a.ordinal,
+                a.metadata_json, d.id, s.title
+         FROM document_assets a
+         JOIN extracted_documents d ON d.id = a.document_id
+         LEFT JOIN document_sections s ON s.id = a.section_id
+         WHERE d.blob_sha256 = ?1 AND d.status = 'completed'
+         ORDER BY a.ordinal ASC"
+    ).map_err(|error| format!("Cannot prepare document asset query: {error}"))?;
+    let rows = statement.query_map([sha256], |row| {
+        Ok(AttachmentDocumentAsset {
+            asset_id: row.get(0)?,
+            asset_type: row.get(1)?,
+            mime_type: row.get(2)?,
+            file_name: row.get(3)?,
+            ordinal: row.get(4)?,
+            metadata_json: row.get(5)?,
+            document_id: row.get(6)?,
+            section_title: row.get(7)?,
+        })
+    }).map_err(|error| format!("Cannot query document assets: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Cannot read document asset metadata: {error}"))
+}
+
+#[tauri::command]
+pub fn read_attachment_document_asset(
+    state: State<'_, Mutex<Storage>>,
+    chat_id: String,
+    reference_id: String,
+    asset_id: String,
+) -> Result<Vec<u8>, String> {
+    let storage = state
+        .lock()
+        .map_err(|error| format!("Storage lock poisoned: {error}"))?;
+    let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let relative_path: String = storage.connection.query_row(
+        "SELECT b.relative_path
+         FROM document_assets a
+         JOIN extracted_documents d ON d.id = a.document_id
+         JOIN blobs b ON b.sha256 = a.blob_sha256
+         WHERE a.id = ?1 AND d.blob_sha256 = ?2 AND d.status = 'completed'",
+        params![asset_id, sha256],
+        |row| row.get(0),
+    ).optional().map_err(|error| format!("Cannot resolve document asset: {error}"))?
+      .ok_or_else(|| "Document asset does not belong to the specified attachment".to_string())?;
+    let path = storage.resolve_blob_path(&relative_path)?;
+    let metadata = std::fs::metadata(&path)
+        .map_err(|error| format!("Cannot inspect document asset: {error}"))?;
+    if metadata.len() == 0 || metadata.len() > MAX_ASSET_BYTES as u64 {
+        return Err("Document asset is empty or exceeds the 16 MiB limit".into());
+    }
+    std::fs::read(path).map_err(|error| format!("Cannot read document asset: {error}"))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedVisionDescription {
+    pub document_id: String,
+    pub chunk_id: String,
+}
+
+#[tauri::command]
+pub fn save_attachment_document_asset_vision_description(
+    state: State<'_, Mutex<Storage>>,
+    chat_id: String,
+    reference_id: String,
+    asset_id: String,
+    description: String,
+    model_name: Option<String>,
+    prompt_version: Option<i64>,
+) -> Result<SavedVisionDescription, String> {
+    let description = description.trim();
+    if description.is_empty() || description.len() > 32 * 1024 {
+        return Err("Vision description is empty or exceeds the 32 KiB limit".into());
+    }
+    if asset_id.is_empty() || asset_id.len() > 128 {
+        return Err("Invalid document asset ID".into());
+    }
+
+    let model_name = model_name.unwrap_or_else(|| "sonne-gemma:latest".into());
+    if model_name.is_empty() || model_name.len() > 128 {
+        return Err("Invalid Vision model name".into());
+    }
+    let prompt_version = prompt_version.unwrap_or(2);
+    if prompt_version < 1 || prompt_version > 1000 {
+        return Err("Invalid Vision prompt version".into());
+    }
+
+    let mut storage = state
+        .lock()
+        .map_err(|error| format!("Storage lock poisoned: {error}"))?;
+    let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let timestamp = now_timestamp()?;
+    let transaction = storage
+        .connection
+        .transaction()
+        .map_err(|error| format!("Cannot begin Vision metadata transaction: {error}"))?;
+
+    let (document_id, section_id, file_name, ordinal, metadata_json):
+        (String, Option<String>, Option<String>, i64, Option<String>) = transaction
+        .query_row(
+            "SELECT d.id, a.section_id, a.file_name, a.ordinal, a.metadata_json
+             FROM document_assets a
+             JOIN extracted_documents d ON d.id = a.document_id
+             WHERE a.id = ?1 AND d.blob_sha256 = ?2
+               AND d.status = 'completed' AND a.asset_type = 'image'",
+            params![asset_id, sha256],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()
+        .map_err(|error| format!("Cannot resolve Vision asset: {error}"))?
+        .ok_or_else(|| "Image asset does not belong to the specified attachment".to_string())?;
+
+    let mut metadata: Value = metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let metadata_object = metadata
+        .as_object_mut()
+        .ok_or_else(|| "Image asset metadata is not a JSON object".to_string())?;
+
+    // Find the original image-index chunks by their stable ordinal/name metadata.
+    // Replace them instead of leaving stale Vision descriptions searchable.
+    let mut statement = transaction
+        .prepare(
+            "SELECT id, metadata_json FROM document_chunks
+             WHERE document_id = ?1 AND chunk_type IN ('image_ocr', 'asset_vision')",
+        )
+        .map_err(|error| format!("Cannot prepare existing image chunk query: {error}"))?;
+    let rows = statement
+        .query_map([&document_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|error| format!("Cannot query existing image chunks: {error}"))?;
+    let candidate_chunks = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Cannot collect existing image chunks: {error}"))?;
+    drop(statement);
+
+    let mut matching_chunk_ids = Vec::new();
+    for (candidate_id, candidate_metadata) in candidate_chunks {
+        let Some(candidate_metadata) = candidate_metadata
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        else {
+            continue;
+        };
+        let Some(candidate_object) = candidate_metadata.as_object() else {
+            continue;
+        };
+        let same_ordinal = candidate_object
+            .get("assetOrdinal")
+            .and_then(Value::as_i64) == Some(ordinal);
+        let same_name = candidate_object
+            .get("fileName")
+            .and_then(Value::as_str) == file_name.as_deref();
+        let source_matches = matches!(
+            candidate_object.get("source").and_then(Value::as_str),
+            Some("embedded_asset") | Some("embedded_asset_vision")
+        );
+        if same_ordinal && same_name && source_matches {
+            matching_chunk_ids.push(candidate_id);
+        }
+    }
+
+    let stored_chunk_id = metadata_object
+        .get("visionChunkId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_owned);
+    let chunk_id = stored_chunk_id
+        .filter(|stored| matching_chunk_ids.iter().any(|candidate| candidate == stored))
+        .or_else(|| matching_chunk_ids.first().cloned())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    // Remove stale FTS/vector entries before replacing the source chunk.
+    for old_chunk_id in &matching_chunk_ids {
+        transaction
+            .execute(
+                "DELETE FROM document_vectors_nomic WHERE chunk_id = ?1",
+                [old_chunk_id],
+            )
+            .map_err(|error| format!("Cannot remove stale image vector: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM document_chunks WHERE id = ?1 AND document_id = ?2",
+                params![old_chunk_id, document_id],
+            )
+            .map_err(|error| format!("Cannot remove stale image search chunk: {error}"))?;
+    }
+
+    let alt_text = metadata_object
+        .get("altText")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let ocr_text = metadata_object
+        .get("ocrText")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+
+    metadata_object.insert("visionDescription".into(), Value::String(description.to_string()));
+    metadata_object.insert("visionModel".into(), Value::String(model_name.clone()));
+    metadata_object.insert("visionPromptVersion".into(), Value::from(prompt_version));
+    metadata_object.insert("visionAnalyzedAt".into(), Value::from(timestamp));
+    metadata_object.insert("visionChunkId".into(), Value::String(chunk_id.clone()));
+
+    let serialized_metadata = serde_json::to_string(&metadata)
+        .map_err(|error| format!("Cannot serialize Vision metadata: {error}"))?;
+    if serialized_metadata.len() > MAX_METADATA_BYTES {
+        return Err("Updated image metadata exceeds the metadata size limit".into());
+    }
+
+    let display_name = file_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("зображення {}", ordinal + 1));
+    let mut chunk_lines = vec![
+        "Embedded image".to_string(),
+        format!("File name: {display_name}"),
+        format!("Vision description: {description}"),
+    ];
+    if let Some(alt_text) = alt_text {
+        chunk_lines.push(format!("Description: {alt_text}"));
+    }
+    if let Some(ocr_text) = ocr_text {
+        chunk_lines.push(format!("OCR text:\n{ocr_text}"));
+    }
+    let mut chunk_content = chunk_lines.join("\n");
+    if chunk_content.len() > MAX_CHUNK_BYTES {
+        let mut boundary = MAX_CHUNK_BYTES;
+        while !chunk_content.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        chunk_content.truncate(boundary);
+    }
+    let chunk_metadata = serde_json::json!({
+        "source": "embedded_asset_vision",
+        "assetId": asset_id.clone(),
+        "assetOrdinal": ordinal,
+        "fileName": file_name,
+        "visionModel": model_name,
+        "visionPromptVersion": prompt_version
+    }).to_string();
+
+    let next_ordinal: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM document_chunks WHERE document_id = ?1",
+        [&document_id],
+        |row| row.get(0),
+    ).map_err(|error| format!("Cannot allocate Vision search chunk order: {error}"))?;
+    transaction.execute(
+        "INSERT INTO document_chunks (
+            id, document_id, ordinal, content, token_count,
+            start_offset, end_offset, section_id, chunk_type, metadata_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, 'asset_vision', ?7)",
+        params![chunk_id, document_id, next_ordinal, chunk_content,
+            (chunk_content.len() / 4) as i64, section_id, chunk_metadata],
+    ).map_err(|error| format!("Cannot insert Vision search chunk: {error}"))?;
+
+    transaction.execute(
+        "UPDATE document_assets SET metadata_json = ?1 WHERE id = ?2",
+        params![serialized_metadata, asset_id],
+    ).map_err(|error| format!("Cannot persist Vision asset metadata: {error}"))?;
+
+    // Document summaries are derived from document_chunks. Invalidate every
+    // cached Map-Reduce stage so later requests cannot reuse stale image facts.
+    transaction.execute(
+        "DELETE FROM document_summary_parts WHERE document_id = ?1",
+        [&document_id],
+    ).map_err(|error| format!("Cannot invalidate Vision summary parts: {error}"))?;
+    transaction.execute(
+        "DELETE FROM document_summaries WHERE document_id = ?1",
+        [&document_id],
+    ).map_err(|error| format!("Cannot invalidate Vision document summary: {error}"))?;
+
+    transaction.commit()
+        .map_err(|error| format!("Cannot commit Vision metadata transaction: {error}"))?;
+
+    Ok(SavedVisionDescription { document_id, chunk_id })
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSearchResult {

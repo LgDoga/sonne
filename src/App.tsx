@@ -40,6 +40,11 @@ import {
 import {
   createChatStream,
   createEmbeddings,
+  createVisionDescription,
+  unloadOllamaModel,
+  VISION_PROMPT_VERSION,
+  VISION_CONFIG,
+  OLLAMA_HOST,
   type ActiveOllamaChatStream,
 } from "./ollamaClient";
 import {
@@ -1121,6 +1126,13 @@ CSS підключено
 
       perfTrace.systemPromptChars = systemPrompt.length; // [perf-diag]
 
+      // Detect explicit image-analysis requests before document context assembly.
+      // These requests use the per-image Vision pipeline and must not trigger an
+      // expensive, potentially stale Map-Reduce summary first.
+      const explicitImageAnalysis =
+        /(проаналізуй|аналізуй|опиши|розглянь|що\s+на\s+зображенн|що\s+на\s+картин|analy[sz]e|describe|explain|what\s+is\s+in)/i.test(prompt) &&
+        /(зображенн|картинк|image|images|picture|photo|фото)/i.test(prompt);
+
       // SQLite transaction is the source of truth: process exactly the
       // attachments promoted into this message by start_turn.
       const attachmentResults: Array<{
@@ -1130,77 +1142,80 @@ CSS підключено
       }> = [];
 
       if (promotedAttachments.length > 0) {
-        try {
-          const queryVectors = await createEmbeddings(OLLAMA_URL, [prompt]);
-          const queryEmbedding = queryVectors[0];
+        if (!explicitImageAnalysis) {
+          try {
+            const queryVectors = await createEmbeddings(OLLAMA_URL, [prompt]);
+            const queryEmbedding = queryVectors[0];
 
-          if (!queryEmbedding || queryEmbedding.length !== 768) {
-            throw new Error("Не вдалося створити embedding запиту.");
+            if (!queryEmbedding || queryEmbedding.length !== 768) {
+              throw new Error("Не вдалося створити embedding запиту.");
+            }
+
+            const searchResults = await invoke<Array<{
+              chunkId: string;
+              fileName: string;
+              detectedFormat: string | null;
+              content: string;
+            }>>("search_attachment_documents", {
+              chatId,
+              query: prompt,
+              queryEmbedding,
+              limit: 12,
+            });
+
+            attachmentResults.push(
+              ...searchResults.map((result) => ({
+                name: result.fileName || "Документ",
+                format: result.detectedFormat || "невідомий формат",
+                content: result.content || "",
+              })),
+            );
+          } catch (error) {
+            console.warn(
+              "[Sonne] Гібридний пошук недоступний, використовую резервне читання:",
+              error,
+            );
           }
 
-          const searchResults = await invoke<Array<{
-            chunkId: string;
-            fileName: string;
-            detectedFormat: string | null;
-            content: string;
-          }>>("search_attachment_documents", {
-            chatId,
-            query: prompt,
-            queryEmbedding,
-            limit: 12,
-          });
+          if (attachmentResults.length === 0) {
+            const totalAttachmentBudget = 2 * 1024 * 1024;
+            const attachmentBudget = Math.max(
+              1,
+              Math.floor(totalAttachmentBudget / promotedAttachments.length),
+            );
 
-          attachmentResults.push(
-            ...searchResults.map((result) => ({
-              name: result.fileName || "Документ",
-              format: result.detectedFormat || "невідомий формат",
-              content: result.content || "",
-            })),
-          );
-        } catch (error) {
-          console.warn(
-            "[Sonne] Гібридний пошук недоступний, використовую резервне читання:",
-            error,
-          );
-        }
+            const fallbackResults = await Promise.all(
+              promotedAttachments.map(async (file) => {
+                const document = await invoke<{
+                  documentId: string;
+                  fileName: string;
+                  detectedFormat: string | null;
+                  language: string | null;
+                  metadata: unknown;
+                  content: string;
+                  truncated: boolean;
+                }>("get_attachment_document_context", {
+                  referenceId: file.id,
+                  chatId: file.chatId || chatId,
+                  extractor: EXTRACTOR_ID,
+                  extractorVersion: EXTRACTOR_VERSION,
+                  maxBytes: attachmentBudget,
+                });
 
-        if (attachmentResults.length === 0) {
-          const totalAttachmentBudget = 2 * 1024 * 1024;
-          const attachmentBudget = Math.max(
-            1,
-            Math.floor(totalAttachmentBudget / promotedAttachments.length),
-          );
+                return {
+                  name: document.fileName || file.fileName,
+                  format:
+                    document.detectedFormat ||
+                    file.mimeType ||
+                    "невідомий формат",
+                  content: document.content || "",
+                };
+              }),
+            );
 
-          const fallbackResults = await Promise.all(
-            promotedAttachments.map(async (file) => {
-              const document = await invoke<{
-                documentId: string;
-                fileName: string;
-                detectedFormat: string | null;
-                language: string | null;
-                metadata: unknown;
-                content: string;
-                truncated: boolean;
-              }>("get_attachment_document_context", {
-                referenceId: file.id,
-                chatId: file.chatId || chatId,
-                extractor: EXTRACTOR_ID,
-                extractorVersion: EXTRACTOR_VERSION,
-                maxBytes: attachmentBudget,
-              });
+            attachmentResults.push(...fallbackResults);
+          }
 
-              return {
-                name: document.fileName || file.fileName,
-                format:
-                  document.detectedFormat ||
-                  file.mimeType ||
-                  "невідомий формат",
-                content: document.content || "",
-              };
-            }),
-          );
-
-          attachmentResults.push(...fallbackResults);
         }
 
         if (backendConfig) {
@@ -1246,19 +1261,21 @@ CSS підключено
                 throw new Error("Не дочекалися завершення індексації вкладення.");
               }
 
-              const summary = await generateDocumentSummary(
-                processing.documentId,
-                backendConfig.ollamaModel,
-                backendConfig.options,
-                generationController?.signal,
-              );
+              if (!explicitImageAnalysis) {
+                const summary = await generateDocumentSummary(
+                  processing.documentId,
+                  backendConfig.ollamaModel,
+                  backendConfig.options,
+                  generationController?.signal,
+                );
 
-              if (summary.trim()) {
-                attachmentResults.push({
-                  name: `${file.fileName} — повний підсумок`,
-                  format: "Map-Reduce summary",
-                  content: summary,
-                });
+                if (summary.trim()) {
+                  attachmentResults.push({
+                    name: `${file.fileName} — повний підсумок`,
+                    format: "Map-Reduce summary",
+                    content: summary,
+                  });
+                }
               }
             } catch (error) {
               console.warn(
@@ -1278,9 +1295,342 @@ CSS підключено
         `\n\n--- Вміст архіву: ${file.name} ---\n${file.content}`,
       ).join("");
 
-      const modelPrompt = attachmentContext || archiveContext
+      let modelPrompt = attachmentContext || archiveContext
         ? `${prompt}\n\nВміст вкладень та архівів:${attachmentContext}${archiveContext}`
         : prompt;
+
+      // Explicit image analysis: enumerate every image, reuse only current-version
+      // cache entries, persist each new result, and expose deterministic progress.
+      if (explicitImageAnalysis && attachmentFiles.length > 0) {
+        type VisionAsset = {
+          assetId: string;
+          assetType: string;
+          mimeType: string | null;
+          fileName: string | null;
+          ordinal: number;
+          metadataJson: string | null;
+          documentId: string;
+          sectionTitle: string | null;
+          attachmentName: string;
+          chatId: string;
+          referenceId: string;
+        };
+
+        const formatVisionEvidence = (
+          asset: VisionAsset,
+          description: string,
+          metadata: Record<string, unknown>,
+        ) => {
+          const lines = [
+            `[Файл: ${asset.attachmentName}; зображення: ${asset.fileName || `зображення ${asset.ordinal + 1}`}; ` +
+            `розділ: ${asset.sectionTitle || "не визначений"}]`,
+            `Vision-опис: ${description}`,
+          ];
+          const altText = typeof metadata.altText === "string" ? metadata.altText.trim() : "";
+          const ocrText = typeof metadata.ocrText === "string" ? metadata.ocrText.trim() : "";
+          if (altText) lines.push(`Alt text з документа: ${altText}`);
+          if (ocrText) {
+            const boundedOcr = ocrText.slice(0, 8000);
+            lines.push(`OCR-текст, витягнутий під час індексації:\n${boundedOcr}`);
+            if (ocrText.length > boundedOcr.length) {
+              lines.push("OCR-текст скорочено для обмеження контексту.");
+            }
+          }
+          return lines.join("\n");
+        };
+
+        const visionStartedAt = performance.now();
+        updateAssistant({ visionProgress: "Vision (Gemma 3): шукаю вбудовані зображення…" });
+        const visionAssets: VisionAsset[] = [];
+        const enumerationErrors: string[] = [];
+        const seenAssetIds = new Set<string>();
+
+        for (const attachment of attachmentFiles) {
+          if (generationController.signal.aborted) {
+            throw new DOMException("Generation cancelled", "AbortError");
+          }
+          try {
+            const assets = await invoke<Array<{
+              assetId: string;
+              assetType: string;
+              mimeType: string | null;
+              fileName: string | null;
+              ordinal: number;
+              metadataJson: string | null;
+              documentId: string;
+              sectionTitle: string | null;
+            }>>("list_attachment_document_assets", {
+              chatId: attachment.chatId || chatId,
+              referenceId: attachment.id,
+            });
+
+            for (const asset of assets) {
+              if (asset.assetType !== "image" || seenAssetIds.has(asset.assetId)) continue;
+              seenAssetIds.add(asset.assetId);
+              visionAssets.push({
+                ...asset,
+                attachmentName: attachment.fileName,
+                chatId: attachment.chatId || chatId,
+                referenceId: attachment.id,
+              });
+            }
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            enumerationErrors.push(`${attachment.fileName}: ${message}`);
+            console.warn("[Sonne Vision] Не вдалося отримати список assets:", error);
+          }
+        }
+
+        const total = visionAssets.length;
+        const descriptions: string[] = [];
+        const failures: string[] = [...enumerationErrors];
+        const perAssetTimings: Array<{
+          file: string;
+          source: "cache" | "vision" | "failed";
+          durationMs: number;
+          readMs?: number;
+          visionMs?: number;
+          persistMs?: number;
+          bytes?: number;
+        }> = [];
+        const pendingVisionEmbeddings = new Map<string, Set<string>>();
+        const indexingErrors: string[] = [];
+        let completed = 0;
+        let cached = 0;
+        let analyzed = 0;
+
+        updateAssistant({
+          visionProgress: total > 0
+            ? `Vision (Gemma 3): підготовка ${total} зображень…`
+            : "Vision (Gemma 3): у прикріплених документах не знайдено вбудованих зображень.",
+        });
+
+        for (const asset of visionAssets) {
+            if (generationController.signal.aborted) {
+              throw new DOMException("Generation cancelled", "AbortError");
+            }
+
+            const assetStartedAt = performance.now();
+            const displayName = asset.fileName || `зображення ${asset.ordinal + 1}`;
+            let metadata: Record<string, unknown> = {};
+            try {
+              metadata = asset.metadataJson
+                ? JSON.parse(asset.metadataJson) as Record<string, unknown>
+                : {};
+            } catch {
+              metadata = {};
+            }
+
+            const cachedDescription =
+              metadata.visionPromptVersion === VISION_PROMPT_VERSION &&
+              typeof metadata.visionDescription === "string"
+                ? metadata.visionDescription.trim()
+                : "";
+
+            if (cachedDescription) {
+              descriptions.push(formatVisionEvidence(asset, cachedDescription, metadata));
+              cached += 1;
+              completed += 1;
+              perAssetTimings.push({
+                file: displayName,
+                source: "cache",
+                durationMs: Math.round(performance.now() - assetStartedAt),
+              });
+              updateAssistant({
+                visionProgress: `Vision (Gemma 3): ${completed}/${total} · кеш: ${cached} · новий аналіз: ${analyzed} · помилки: ${failures.length}`,
+              });
+
+              // Queue missing vectors for one batch after all Vision calls finish.
+              const cachedChunkId = typeof metadata.visionChunkId === "string"
+                ? metadata.visionChunkId
+                : "";
+              if (cachedChunkId) {
+                const chunkIds = pendingVisionEmbeddings.get(asset.documentId) ?? new Set<string>();
+                chunkIds.add(cachedChunkId);
+                pendingVisionEmbeddings.set(asset.documentId, chunkIds);
+              }
+              continue;
+            }
+
+            updateAssistant({
+              visionProgress: `Vision (Gemma 3): ${completed}/${total} · аналізую ${displayName} · кеш: ${cached} · помилки: ${failures.length}`,
+            });
+
+            try {
+              const readStartedAt = performance.now();
+              const bytes = await invoke<number[]>("read_attachment_document_asset", {
+                chatId: asset.chatId,
+                referenceId: asset.referenceId,
+                assetId: asset.assetId,
+              });
+              const readMs = Math.round(performance.now() - readStartedAt);
+
+              if (!bytes.length) throw new Error("Порожній файл зображення.");
+              if (bytes.length > VISION_CONFIG.maxAssetBytes) {
+                throw new Error("Зображення перевищує ліміт 16 MiB.");
+              }
+
+              const visionCallStartedAt = performance.now();
+              const description = await createVisionDescription(
+                OLLAMA_HOST,
+                Uint8Array.from(bytes),
+                generationController.signal,
+              );
+              const visionMs = Math.round(performance.now() - visionCallStartedAt);
+              if (generationController.signal.aborted) {
+                throw new DOMException("Generation cancelled", "AbortError");
+              }
+              if (!description) throw new Error("Vision-модель повернула порожній опис.");
+
+              // Persist immediately, before moving to the next image. This makes the
+              // batch resumable and creates an FTS/vector-search chunk for the asset.
+              const persistStartedAt = performance.now();
+              const saved = await invoke<{ documentId: string; chunkId: string }>(
+                "save_attachment_document_asset_vision_description",
+                {
+                  chatId: asset.chatId,
+                  referenceId: asset.referenceId,
+                  assetId: asset.assetId,
+                  description,
+                  modelName: "sonne-gemma:latest",
+                  promptVersion: VISION_PROMPT_VERSION,
+                },
+              );
+              const persistMs = Math.round(performance.now() - persistStartedAt);
+              const chunkIds = pendingVisionEmbeddings.get(saved.documentId) ?? new Set<string>();
+              chunkIds.add(saved.chunkId);
+              pendingVisionEmbeddings.set(saved.documentId, chunkIds);
+
+              descriptions.push(formatVisionEvidence(asset, description, metadata));
+              analyzed += 1;
+              completed += 1;
+              perAssetTimings.push({
+                file: displayName,
+                source: "vision",
+                durationMs: Math.round(performance.now() - assetStartedAt),
+                readMs,
+                visionMs,
+                persistMs,
+                bytes: bytes.length,
+              });
+            } catch (error) {
+              if (generationController.signal.aborted ||
+                  (error instanceof DOMException && error.name === "AbortError")) {
+                throw new DOMException("Generation cancelled", "AbortError");
+              }
+              const message = error instanceof Error ? error.message : String(error);
+              failures.push(`${asset.attachmentName} / ${displayName}: ${message}`);
+              completed += 1;
+              perAssetTimings.push({
+                file: displayName,
+                source: "failed",
+                durationMs: Math.round(performance.now() - assetStartedAt),
+              });
+              console.warn(`[Sonne Vision] Помилка зображення ${displayName}:`, error);
+            }
+
+            updateAssistant({
+              visionProgress: `Vision (Gemma 3): ${completed}/${total} · кеш: ${cached} · новий аналіз: ${analyzed} · помилки: ${failures.length}`,
+            });
+        }
+
+        const visionDurationMs = Math.round(performance.now() - visionStartedAt);
+        let embeddingBatchMs = 0;
+        if (pendingVisionEmbeddings.size > 0) {
+          const embeddingStartedAt = performance.now();
+          const pendingCount = [...pendingVisionEmbeddings.values()]
+            .reduce((totalCount, chunkIds) => totalCount + chunkIds.size, 0);
+          updateAssistant({
+            visionProgress: `Vision (Gemma 3): зображення проаналізовано; додаю ${pendingCount} описів до пошукового індексу…`,
+          });
+          try {
+            for (const [documentId, pendingChunkIds] of pendingVisionEmbeddings) {
+              const remainingChunkIds = new Set(pendingChunkIds);
+              while (remainingChunkIds.size > 0) {
+                if (generationController.signal.aborted) {
+                  throw new DOMException("Generation cancelled", "AbortError");
+                }
+                const missing = await invoke<Array<{ chunkId: string; content: string }>>(
+                  "get_document_embedding_batch",
+                  { documentId, limit: 64 },
+                );
+                const batch = missing.filter((chunk) => remainingChunkIds.has(chunk.chunkId));
+                if (batch.length === 0) break;
+
+                const vectors = await createEmbeddings(
+                  OLLAMA_HOST,
+                  batch.map((chunk) => chunk.content),
+                  generationController.signal,
+                );
+                if (vectors.length !== batch.length || vectors.some(
+                  (vector) => vector.length !== 768 ||
+                    vector.some((value) => !Number.isFinite(value)),
+                )) {
+                  throw new Error("Embedding-модель повернула некоректні вектори.");
+                }
+                await invoke("save_document_embedding_batch", {
+                  documentId,
+                  embeddings: batch.map((chunk, index) => ({
+                    chunkId: chunk.chunkId,
+                    vector: vectors[index],
+                  })),
+                });
+                for (const chunk of batch) remainingChunkIds.delete(chunk.chunkId);
+              }
+            }
+          } catch (error) {
+            if (generationController.signal.aborted) {
+              throw new DOMException("Generation cancelled", "AbortError");
+            }
+            const message = error instanceof Error ? error.message : String(error);
+            indexingErrors.push(message);
+            console.warn("[Sonne Vision] Описи збережено, але embedding-індекс неповний:", error);
+          }
+          embeddingBatchMs = Math.round(performance.now() - embeddingStartedAt);
+        }
+
+        console.info("[Sonne Vision] Batch performance", {
+          totalImages: total,
+          cachedImages: cached,
+          newlyAnalyzedImages: analyzed,
+          failedImages: failures.length,
+          durationMs: visionDurationMs,
+          embeddingBatchMs,
+          assets: perAssetTimings,
+          errors: failures,
+          indexingErrors,
+        });
+
+        if (total === 0) {
+          modelPrompt +=
+            "\n\nУВАГА: локальна система не повернула жодного вбудованого image asset. " +
+            "Не стверджуй, що зображення були переглянуті або проаналізовані. Повідом, що доступних зображень для Vision-аналізу не знайдено.";
+        }
+
+        if (descriptions.length > 0) {
+          modelPrompt +=
+            `\n\nРЕЗУЛЬТАТИ ЛОКАЛЬНОГО VISION-АНАЛІЗУ (${descriptions.length}/${total} зображень):\n` +
+            `${descriptions.join("\n\n")}\n\n` +
+            "Правила використання візуальних доказів: Vision-опис, Alt text і OCR наведені окремо; " +
+            "OCR може містити помилки розпізнавання, тому не вважай його безпомилковим. " +
+            "Описи Vision — джерело фактичних даних про видимий вміст. " +
+            "Не вигадуй числові значення, підписи, одиниці, легенди або деталі, яких немає в описі. " +
+            "Не називай приблизні значення точними. Не приписуй зображенню причин, наслідків чи бізнес-висновків без доказів. " +
+            "Зв'язок із розділом документа вказуй лише за переданою назвою розділу; якщо її немає — напиши, що зв'язок не визначений. " +
+            "Не вигадуй хід обробки або прогрес. Якщо кількість успішних описів менша за кількість знайдених зображень, прямо вкажи, що аналіз частковий.";
+        }
+
+        if (failures.length > 0) {
+          modelPrompt += `\n\nНе вдалося проаналізувати (${failures.length}):\n${failures.join("\n")}`;
+        }
+        if (indexingErrors.length > 0) {
+          modelPrompt += `\n\nVision-описи збережено, але не всі потрапили до пошукового індексу: ${indexingErrors.join("; ")}`;
+        }
+
+        updateAssistant({
+          visionProgress: `Vision (Gemma 3): завершено ${completed}/${total} · кеш: ${cached} · новий аналіз: ${analyzed} · помилки: ${failures.length}. Формую відповідь…`,
+        });
+      }
 
       // Gemma 3 supports native image input. Qwen 3 remains OCR-only.
       const visionImages: Uint8Array[] = [];
@@ -1289,7 +1639,7 @@ CSS підключено
 
       if (backendConfig.backend === "gemma") {
         for (const attachment of attachmentFiles) {
-          if (visionImages.length >= 4 || visionBytes >= maxVisionBytes) break;
+          if (visionBytes >= maxVisionBytes) break;
 
           const supportedImage =
             /^image\/(png|jpeg|webp)$/i.test(attachment.mimeType) ||
@@ -1409,6 +1759,7 @@ CSS підключено
           userRequestedThinking,
         ),
         generationController.signal,
+        backendConfig.backend === "gemma" ? [] : ["sonne-gemma:latest"],
       );
 
       perfMark(perfTrace, "headers"); // [perf-diag]
@@ -1477,6 +1828,7 @@ CSS підключено
         timestamp: formatNow(),
         durationSec: totalSec,
         includeInHistory: true,
+        visionProgress: "",
       });
 
       await persistAssistantMessage(extractAnswer(rawFull));
@@ -1496,11 +1848,17 @@ CSS підключено
       flushPendingContent();
 
       if (activeGeneration.cancelled || generationController.signal.aborted) {
+        if (backendConfig.backend !== "gemma") {
+          void unloadOllamaModel(OLLAMA_HOST, "sonne-gemma:latest").catch((unloadError) => {
+            console.warn("[Sonne Vision] Не вдалося звільнити Gemma після скасування:", unloadError);
+          });
+        }
         perfTrace.cancelled = true; // [perf-diag]
         perfMark(perfTrace, "streamEnd"); // [perf-diag]
         perfLogReport(perfTrace); // [perf-diag]
         updateAssistant({
           timestamp: formatNow(),
+          visionProgress: "",
           durationSec: ((Date.now() - startTime) / 1000).toFixed(1),
         });
         await persistAssistantMessage(extractAnswer(rawFull));
@@ -1511,6 +1869,7 @@ CSS підключено
 
       updateAssistant({
         role: "assistant",
+        visionProgress: "",
         modeUsed: resolvedMode,
         modelUsed: modelToUse,
         content: `Не вдалося обробити запит: ${errMsg}`,

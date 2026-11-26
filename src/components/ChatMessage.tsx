@@ -15,6 +15,7 @@ export type ChatMessage = {
   modelUsed?: string;
   timestamp: string;
   durationSec?: string;
+  visionProgress?: string;
   includeInHistory?: boolean;
   turnId?: number;
 };
@@ -92,6 +93,11 @@ export default function ChatMessageItem({
         </>
       ) : (
         <>
+          {message.visionProgress && (
+            <div className="vision-progress" role="status" aria-live="polite">
+              {message.visionProgress}
+            </div>
+          )}
           {message.content &&
             parseContent(message.content).map((part, partIndex) =>
               part.type === "code" ? (

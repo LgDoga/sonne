@@ -3,30 +3,11 @@ import { OfficeParser } from "officeparser";
 const output = document.querySelector("#result")!;
 const fileInput = document.querySelector<HTMLInputElement>("#file")!;
 
-const log = (value: unknown) => {
-  output.textContent += "\n" + (
-    typeof value === "string" ? value : JSON.stringify(value, null, 2)
-  );
-};
-
 fileInput.addEventListener("change", async () => {
   const file = fileInput.files?.[0];
   if (!file) return;
 
-  output.textContent = `Parsing ${file.name} (${file.size} bytes)...`;
-
-  const originalWarn = console.warn;
-  const originalError = console.error;
-
-  console.warn = (...args) => {
-    log(["WARNING", ...args.map(String)]);
-    originalWarn(...args);
-  };
-
-  console.error = (...args) => {
-    log(["ERROR", ...args.map(String)]);
-    originalError(...args);
-  };
+  output.textContent = `Parsing ${file.name}...`;
 
   try {
     const ast = await OfficeParser.parseOffice(await file.arrayBuffer(), {
@@ -47,35 +28,50 @@ fileInput.addEventListener("change", async () => {
       },
     });
 
-    log("WARNINGS:");
-    log(ast.warnings);
+    const content = ast.content as any;
 
-    log("ATTACHMENTS:");
-    log((ast.attachments ?? []).map((item: any) => ({
-      name: item.name,
-      mimeType: item.mimeType,
-      keys: Object.keys(item),
-      ocrText: item.ocrText,
-      ocrLength: item.ocrText?.length ?? 0,
-    })));
-
-    log("CONTENT TYPE:");
-    log(typeof ast.content);
-
-    const markdown = await ast.to("md", { includeImages: "image+ocr-text" });
-
-    log("MARKDOWN RESULT:");
-    log({
-      type: typeof markdown,
-      keys: Object.keys(markdown ?? {}),
-      value: (markdown as any)?.value?.slice?.(0, 12000),
-      messages: (markdown as any)?.messages,
+    const inspect = (node: any): any => ({
+      type: node?.type,
+      text: typeof node?.text === "string" ? node.text.slice(0, 500) : undefined,
+      textLength: node?.text?.length ?? 0,
+      metadata: node?.metadata,
+      children: Array.isArray(node?.children) ? node.children.map(inspect) : undefined,
     });
+
+    const markdownResult = await ast.to("md", {
+      includeImages: "ocr-text-only",
+    });
+    const markdownValue = String((markdownResult as any).value ?? "");
+    const markdownWithoutImages = markdownValue.replace(
+      new RegExp("data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "g"),
+      "[IMAGE_DATA]",
+    );
+
+    const report = {
+      contentType: typeof content,
+      contentKeys: content && typeof content === "object" ? Object.keys(content) : [],
+      contentSample: Array.isArray(content)
+        ? content.slice(0, 30).map(inspect)
+        : inspect(content),
+      markdown: {
+        resultType: typeof markdownResult,
+        resultKeys: Object.keys(markdownResult as any),
+        valueLength: markdownValue.length,
+        containsOcrText: markdownValue.includes("Склад Ne3"),
+        valueSample: markdownWithoutImages.slice(0, 10000),
+        messages: (markdownResult as any).messages,
+      },
+      attachments: (ast.attachments ?? []).map((item: any) => ({
+        name: item.name,
+        ocrLength: item.ocrText?.length ?? 0,
+        ocrSample: item.ocrText?.slice(0, 150),
+      })),
+    };
+
+    output.textContent = JSON.stringify(report, null, 2);
   } catch (error) {
-    log("PARSER FAILURE:");
-    log(error instanceof Error ? error.stack : String(error));
-  } finally {
-    console.warn = originalWarn;
-    console.error = originalError;
+    output.textContent = error instanceof Error
+      ? error.stack ?? error.message
+      : String(error);
   }
 });

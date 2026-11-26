@@ -4,6 +4,7 @@ import {
   loadStoredAttachment,
   readStoredAttachment,
 } from "../fileReader";
+import { createEmbeddings, OLLAMA_HOST } from "../ollamaClient";
 import type { AttachmentReference } from "./FileAttachments";
 
 interface DocumentSearchResult {
@@ -46,11 +47,17 @@ export default function FilePreviewPane({
     setSearchResults([]);
 
     try {
+      const vectors = await createEmbeddings(OLLAMA_HOST, [query]);
+      const queryEmbedding = vectors[0];
+      if (!queryEmbedding || queryEmbedding.length !== 768) {
+        throw new Error("Не вдалося створити embedding пошукового запиту.");
+      }
       const results = await invoke<DocumentSearchResult[]>(
         "search_attachment_documents",
         {
           chatId: attachment.chatId,
           query,
+          queryEmbedding,
           limit: 30,
         },
       );
