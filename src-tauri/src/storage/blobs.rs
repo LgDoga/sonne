@@ -58,53 +58,186 @@ fn hash_file(path: &Path) -> Result<String, String> {
     Ok(digest_to_hex(&hasher.finalize()))
 }
 
-fn resolve_relative_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
-    let path = Path::new(relative);
+fn canonical_real_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("Cannot inspect {label}: {error}"))?;
 
-    if path.is_absolute()
-        || !path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-        || path.components().next() != Some(Component::Normal("blobs".as_ref()))
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("{label} is not a regular directory"));
+    }
+
+    path.canonicalize()
+        .map_err(|error| format!("Cannot resolve {label}: {error}"))
+}
+
+fn ensure_child_directory(
+    parent: &Path,
+    name: &str,
+    create_if_missing: bool,
+) -> Result<PathBuf, String> {
+    let mut components = Path::new(name).components();
+
+    if !matches!(components.next(), Some(Component::Normal(_)))
+        || components.next().is_some()
     {
+        return Err("Invalid storage directory component".to_string());
+    }
+
+    let parent = canonical_real_directory(parent, "storage parent")?;
+    let child = parent.join(name);
+
+    match fs::symlink_metadata(&child) {
+        Ok(_) => {}
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound && create_if_missing =>
+        {
+            match fs::create_dir(&child) {
+                Ok(()) => {}
+                Err(create_error)
+                    if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(create_error) => {
+                    return Err(format!(
+                        "Cannot create storage directory {}: {create_error}",
+                        child.display()
+                    ));
+                }
+            }
+        }
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect storage directory {}: {error}",
+                child.display()
+            ));
+        }
+    }
+
+    let metadata = fs::symlink_metadata(&child)
+        .map_err(|error| format!("Cannot inspect storage directory: {error}"))?;
+
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "Storage directory is not a regular directory: {}",
+            child.display()
+        ));
+    }
+
+    let canonical = child
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve storage directory: {error}"))?;
+
+    if canonical.parent() != Some(parent.as_path()) {
+        return Err(format!(
+            "Storage directory escapes its expected parent: {}",
+            child.display()
+        ));
+    }
+
+    Ok(canonical)
+}
+
+pub(super) fn ensure_storage_directories(root: &Path) -> Result<(), String> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| "Storage root has no parent directory".to_string())?;
+
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Cannot create application data directory: {error}"))?;
+
+    let root_name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "Invalid storage root directory name".to_string())?;
+
+    let canonical_root = ensure_child_directory(parent, root_name, true)?;
+
+    for name in ["blobs", "temp", "extracted", "indexes"] {
+        ensure_child_directory(&canonical_root, name, true)?;
+    }
+
+    Ok(())
+}
+
+fn parse_blob_relative_path(relative: &str) -> Result<(String, String), String> {
+    if relative.contains('\\') {
+        return Err("Blob path contains an invalid separator".to_string());
+    }
+
+    let parts: Vec<&str> = relative.split('/').collect();
+
+    if parts.len() != 3 || parts[0] != "blobs" {
         return Err("Invalid internal blob path".to_string());
     }
 
-    Ok(root.join(path))
+    let hash = parts[2]
+        .strip_suffix(".blob")
+        .ok_or_else(|| "Invalid blob filename".to_string())?;
+
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("Blob filename does not contain a lowercase SHA-256".to_string());
+    }
+
+    if parts[1].len() != 2 || parts[1] != &hash[..2] {
+        return Err("Blob directory does not match its SHA-256".to_string());
+    }
+
+    Ok((parts[1].to_string(), hash.to_string()))
+}
+
+fn ensure_blob_target_path(
+    root: &Path,
+    relative: &str,
+    create_prefix: bool,
+) -> Result<PathBuf, String> {
+    let (prefix, hash) = parse_blob_relative_path(relative)?;
+    let storage_root = canonical_real_directory(root, "storage root")?;
+    let blobs_root = ensure_child_directory(&storage_root, "blobs", false)?;
+    let prefix_root = ensure_child_directory(&blobs_root, &prefix, create_prefix)?;
+    let candidate = prefix_root.join(format!("{hash}.blob"));
+
+    match fs::symlink_metadata(&candidate) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!(
+                "Blob target is a symbolic link: {}",
+                candidate.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(format!(
+                "Blob target is not a regular file: {}",
+                candidate.display()
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect blob target {}: {error}",
+                candidate.display()
+            ));
+        }
+    }
+
+    Ok(candidate)
 }
 
 impl Storage {
     pub fn resolve_blob_path(&self, relative: &str) -> Result<PathBuf, String> {
-        let candidate = resolve_relative_path(&self.root_dir, relative)?;
-
-        let storage_root = self
-            .root_dir
-            .canonicalize()
-            .map_err(|error| format!("Cannot resolve storage directory: {error}"))?;
-
-        let blobs_root = self
-            .root_dir
-            .join("blobs")
-            .canonicalize()
-            .map_err(|error| format!("Cannot resolve blob storage directory: {error}"))?;
-
-        if !blobs_root.starts_with(&storage_root) {
-            return Err("Blob storage directory escapes storage root".to_string());
-        }
-
+        let candidate = ensure_blob_target_path(&self.root_dir, relative, false)?;
         let canonical = candidate
             .canonicalize()
             .map_err(|error| format!("Cannot resolve blob file: {error}"))?;
+        let canonical_parent = candidate
+            .parent()
+            .ok_or_else(|| "Blob path has no parent directory".to_string())?
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve blob directory: {error}"))?;
 
-        if !canonical.starts_with(&blobs_root) {
-            return Err("Blob path escapes storage directory".to_string());
-        }
-
-        let metadata = fs::symlink_metadata(&candidate)
-            .map_err(|error| format!("Cannot inspect blob file: {error}"))?;
-
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err("Blob path is not a regular file".to_string());
+        if canonical.parent() != Some(canonical_parent.as_path()) {
+            return Err("Blob path escapes its validated directory".to_string());
         }
 
         Ok(canonical)
@@ -131,8 +264,12 @@ impl Storage {
         let operation_id = Uuid::new_v4().to_string();
         let timestamp = now_timestamp()?;
 
+        let storage_root = canonical_real_directory(&self.root_dir, "storage root")?;
+        ensure_child_directory(&storage_root, "blobs", false)?;
+        let temp_root = ensure_child_directory(&storage_root, "temp", false)?;
+
         let temp_relative = format!("temp/{operation_id}.part");
-        let temp_path = self.root_dir.join(&temp_relative);
+        let temp_path = temp_root.join(format!("{operation_id}.part"));
 
         self.connection
             .execute(
@@ -236,12 +373,24 @@ impl Storage {
             .map_err(|error| format!("Cannot check blob deduplication: {error}"))?;
 
         let relative_path = if let Some((existing_relative, _)) = existing {
-            let existing_path = resolve_relative_path(&self.root_dir, &existing_relative)?;
+            let existing_path =
+                ensure_blob_target_path(&storage_root, &existing_relative, true)?;
 
-            let existing_is_valid = existing_path.is_file()
-                && hash_file(&existing_path)
+            let existing_is_valid = match fs::symlink_metadata(&existing_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err("Existing blob target is a symbolic link".to_string());
+                }
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err("Existing blob target is not a regular file".to_string());
+                }
+                Ok(_) => hash_file(&existing_path)
                     .map(|hash| hash == sha256)
-                    .unwrap_or(false);
+                    .unwrap_or(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(format!("Cannot inspect existing blob: {error}"));
+                }
+            };
 
             if existing_is_valid {
                 fs::remove_file(&temp_path)
@@ -269,11 +418,6 @@ impl Storage {
                     original_size,
                     stored_size: original_size,
                 });
-            }
-
-            if let Some(parent) = existing_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("Cannot recreate blob directory: {error}"))?;
             }
 
             self.connection
@@ -305,12 +449,7 @@ impl Storage {
         } else {
             let prefix = &sha256[..2];
             let relative = format!("blobs/{prefix}/{sha256}.blob");
-            let target_path = resolve_relative_path(&self.root_dir, &relative)?;
-
-            if let Some(parent) = target_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|error| format!("Cannot create blob directory: {error}"))?;
-            }
+            let target_path = ensure_blob_target_path(&storage_root, &relative, true)?;
 
             self.connection
                 .execute(
@@ -494,7 +633,8 @@ impl Storage {
 }
 
 pub(super) fn remove_recovered_blob_file(root: &Path, relative: &str) -> Result<(), String> {
-    let candidate = resolve_relative_path(root, relative)?;
+    // Creating a missing hash-prefix directory keeps cleanup idempotent.
+    let candidate = ensure_blob_target_path(root, relative, true)?;
 
     let metadata = match fs::symlink_metadata(&candidate) {
         Ok(metadata) => metadata,
@@ -506,41 +646,34 @@ pub(super) fn remove_recovered_blob_file(root: &Path, relative: &str) -> Result<
         return Err("Blob cleanup target is not a regular file".to_string());
     }
 
-    let storage_root = root
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve storage root during cleanup: {error}"))?;
-    let blobs_root = root
-        .join("blobs")
-        .canonicalize()
-        .map_err(|error| format!("Cannot resolve blobs directory during cleanup: {error}"))?;
     let canonical = candidate
         .canonicalize()
         .map_err(|error| format!("Cannot resolve blob cleanup target: {error}"))?;
+    let canonical_parent = candidate
+        .parent()
+        .ok_or_else(|| "Blob cleanup target has no parent directory".to_string())?
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve blob cleanup directory: {error}"))?;
 
-    if !blobs_root.starts_with(&storage_root) || !canonical.starts_with(&blobs_root) {
-        return Err("Blob cleanup target escapes storage directory".to_string());
+    if canonical.parent() != Some(canonical_parent.as_path()) {
+        return Err("Blob cleanup target escapes its validated directory".to_string());
     }
 
-    fs::remove_file(canonical)
+    fs::remove_file(&candidate)
         .map_err(|error| format!("Cannot remove unused physical blob: {error}"))
 }
 
 fn resolve_recovery_temp_path(root: &Path, relative: &str) -> Result<Option<PathBuf>, String> {
-    let mut components = Path::new(relative).components();
+    if relative.contains('\\') {
+        return Err("Temporary path contains an invalid separator".to_string());
+    }
 
-    if components.next() != Some(Component::Normal("temp".as_ref())) {
+    let parts: Vec<&str> = relative.split('/').collect();
+    if parts.len() != 2 || parts[0] != "temp" {
         return Err("Temporary path is outside the temp directory".to_string());
     }
 
-    let filename = components
-        .next()
-        .and_then(|component| component.as_os_str().to_str())
-        .ok_or_else(|| "Invalid temporary filename".to_string())?;
-
-    if components.next().is_some() {
-        return Err("Temporary path contains unexpected components".to_string());
-    }
-
+    let filename = parts[1];
     let uuid = filename
         .strip_suffix(".part")
         .ok_or_else(|| "Temporary filename has an invalid extension".to_string())?;
@@ -548,14 +681,8 @@ fn resolve_recovery_temp_path(root: &Path, relative: &str) -> Result<Option<Path
     Uuid::parse_str(uuid)
         .map_err(|_| "Temporary filename does not contain a valid operation UUID".to_string())?;
 
-    let temp_root = root.join("temp");
-    let root_metadata = fs::symlink_metadata(&temp_root)
-        .map_err(|error| format!("Cannot inspect temp directory: {error}"))?;
-
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
-        return Err("Temp directory is not a regular directory".to_string());
-    }
-
+    let storage_root = canonical_real_directory(root, "storage root")?;
+    let temp_root = ensure_child_directory(&storage_root, "temp", false)?;
     let candidate = temp_root.join(filename);
 
     match fs::symlink_metadata(&candidate) {
@@ -821,7 +948,7 @@ pub(super) fn recover_interrupted_operations(
                         .map_err(|error| format!("Cannot check recovered blob target: {error}"))?;
 
                     if !registered {
-                        let candidate = resolve_relative_path(root_dir, relative)?;
+                        let candidate = ensure_blob_target_path(root_dir, relative, true)?;
                         let filename = candidate
                             .file_name()
                             .and_then(|name| name.to_str())
@@ -966,4 +1093,162 @@ pub(super) fn recover_interrupted_operations(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod path_safety_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            for _ in 0..8 {
+                let path = std::env::temp_dir().join(format!(
+                    "sonne-blob-path-safety-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!(
+                        "Cannot create test directory {}: {error}",
+                        path.display()
+                    ),
+                }
+            }
+
+            panic!("Could not allocate a unique blob path-safety test directory");
+        }
+
+        fn storage_root(&self) -> PathBuf {
+            self.0.join("storage")
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn prepare_storage(directory: &TestDirectory) -> PathBuf {
+        let root = directory.storage_root();
+        ensure_storage_directories(&root).unwrap();
+        root
+    }
+
+    fn test_relative(hash: &str) -> String {
+        format!("blobs/{}/{}.blob", &hash[..2], hash)
+    }
+
+    #[test]
+    fn creates_expected_storage_directories() {
+        let directory = TestDirectory::new();
+        let root = prepare_storage(&directory);
+
+        for name in ["blobs", "temp", "extracted", "indexes"] {
+            let metadata = fs::symlink_metadata(root.join(name)).unwrap();
+            assert!(metadata.is_dir());
+            assert!(!metadata.file_type().is_symlink());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_storage_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let root = directory.storage_root();
+        let outside = directory.0.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, &root).unwrap();
+
+        assert!(ensure_storage_directories(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_blobs_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let root = directory.storage_root();
+        fs::create_dir_all(&root).unwrap();
+        let outside = directory.0.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("blobs")).unwrap();
+
+        assert!(ensure_storage_directories(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_temp_root() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let root = prepare_storage(&directory);
+        let temp_root = root.join("temp");
+        fs::remove_dir(&temp_root).unwrap();
+        let outside = directory.0.join("outside-temp");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, &temp_root).unwrap();
+
+        assert!(ensure_storage_directories(&root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_hash_prefix_directory() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let root = prepare_storage(&directory);
+        let hash = format!("ab{}", "0".repeat(62));
+        let relative = test_relative(&hash);
+        let outside = directory.0.join("outside-prefix");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("blobs").join("ab")).unwrap();
+
+        assert!(ensure_blob_target_path(&root, &relative, false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_blob_file() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let root = prepare_storage(&directory);
+        let hash = format!("cd{}", "1".repeat(62));
+        let prefix = root.join("blobs").join("cd");
+        fs::create_dir(&prefix).unwrap();
+
+        let outside = directory.0.join("outside.blob");
+        fs::write(&outside, b"must not be followed").unwrap();
+        symlink(&outside, prefix.join(format!("{hash}.blob"))).unwrap();
+
+        assert!(ensure_blob_target_path(&root, &test_relative(&hash), false).is_err());
+    }
+
+    #[test]
+    fn creates_a_valid_blob_target_inside_the_hash_prefix() {
+        let directory = TestDirectory::new();
+        let root = prepare_storage(&directory);
+        let hash = format!("ef{}", "2".repeat(62));
+        let relative = test_relative(&hash);
+
+        let target = ensure_blob_target_path(&root, &relative, true).unwrap();
+
+        assert_eq!(
+            target.parent().unwrap(),
+            root.join("blobs").join("ef").canonicalize().unwrap()
+        );
+        assert!(!target.exists());
+    }
 }

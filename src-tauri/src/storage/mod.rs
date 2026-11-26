@@ -5,7 +5,6 @@ pub mod processing;
 mod schema;
 
 use std::{
-    fs,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::Duration,
@@ -51,15 +50,7 @@ impl Storage {
         register_sqlite_vec()?;
         let root_dir = app_data_dir.join("storage");
 
-        for directory in [
-            root_dir.join("blobs"),
-            root_dir.join("temp"),
-            root_dir.join("extracted"),
-            root_dir.join("indexes"),
-        ] {
-            fs::create_dir_all(&directory)
-                .map_err(|error| format!("Cannot create storage directory: {error}"))?;
-        }
+        blobs::ensure_storage_directories(&root_dir)?;
 
         let database_path = root_dir.join("sonne.db");
 
