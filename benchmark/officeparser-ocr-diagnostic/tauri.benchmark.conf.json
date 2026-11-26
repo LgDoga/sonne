@@ -1,0 +1,6 @@
+{
+  "build": {
+    "beforeDevCommand": "/Users/mironmashtalir/Projects/sonne/node_modules/.bin/vite /Users/mironmashtalir/Projects/sonne-benchmark-corpus-review/sonne-benchmark-corpus --config /Users/mironmashtalir/Projects/sonne-benchmark-corpus-review/sonne-benchmark-corpus/vite.config.ts",
+    "devUrl": "http://127.0.0.1:1425/officeparser-test.html"
+  }
+}
