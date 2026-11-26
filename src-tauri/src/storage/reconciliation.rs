@@ -204,7 +204,32 @@ pub fn reconcile(
         ..Default::default()
     };
 
+    let mut scan_blobs_root = false;
+    let mut skip_registered_blob_checks = false;
+
+    match fs::symlink_metadata(&blobs_root) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            report.symlinks.push(blobs_root.display().to_string());
+            skip_registered_blob_checks = true;
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            scan_blobs_root = true;
+        }
+        Ok(_) => {
+            report.invalid_paths.push(blobs_root.display().to_string());
+            skip_registered_blob_checks = true;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            report.scan_errors.push(format!("{}: {}", blobs_root.display(), error));
+            skip_registered_blob_checks = true;
+        }
+    }
+
     for blob in &registered {
+        if skip_registered_blob_checks {
+            continue;
+        }
         if !validate_blob_identity(&blob.relative_path, &blob.sha256) {
             report.invalid_paths.push(blob.relative_path.clone());
             continue;
@@ -255,7 +280,9 @@ pub fn reconcile(
         }
     }
 
-    if blobs_root.exists() {
+
+
+    if scan_blobs_root {
         scan_directory(
             &blobs_root,
             &blobs_root,
@@ -411,6 +438,40 @@ mod tests {
             &format!("blobs/bb/{hash}.blob"),
             &hash
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_to_scan_symlinked_blobs_root() {
+        use std::os::unix::fs::symlink;
+
+        let (directory, connection) = setup();
+        let blobs_root = directory.0.join("blobs");
+        let outside = directory.0.join("outside");
+
+        fs::remove_dir(&blobs_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        let data = b"outside blob";
+        let hash = test_hash(data);
+        let relative = format!("blobs/{}/{}.blob", &hash[..2], hash);
+        let outside_file = outside.join(format!("{}/{}.blob", &hash[..2], hash));
+
+        fs::create_dir_all(outside_file.parent().unwrap()).unwrap();
+        fs::write(&outside_file, data).unwrap();
+        register(&connection, data, &relative);
+
+        symlink(&outside, &blobs_root).unwrap();
+
+        let report = reconcile(&connection, &directory.0).unwrap();
+
+        assert!(report.symlinks.contains(&blobs_root.display().to_string()));
+        assert_eq!(report.verified_blobs, 0);
+        assert_eq!(report.scanned_files, 0);
+        assert!(report.missing_files.is_empty());
+        assert!(report.orphan_files.is_empty());
+        assert!(outside_file.exists());
+        assert_eq!(fs::read(&outside_file).unwrap(), data);
     }
 
     #[test]
