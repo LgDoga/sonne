@@ -245,7 +245,26 @@ mod sqlite_vec_integration_tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .expect("cannot read schema version");
 
-        assert_eq!(schema_version, 3, "database must use schema v3");
+        assert_eq!(
+            schema_version,
+            super::schema::SCHEMA_VERSION,
+            "database schema version must match the current version"
+        );
+
+        for table in ["document_summaries", "document_summary_parts"] {
+            let exists: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM sqlite_master
+                        WHERE type = 'table' AND name = ?1
+                    )",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("failed to check schema v4 tables");
+
+            assert!(exists, "missing schema v4 table: {table}");
+        }
 
         let extension_version: String = connection
             .query_row("SELECT vec_version()", [], |row| row.get(0))
