@@ -351,3 +351,61 @@ mod sqlite_vec_integration_tests {
         println!("768-dimensional insert and similarity search: passed");
     }
 }
+
+#[cfg(test)]
+mod storage_lifecycle_tests {
+    use super::Storage;
+    use std::{fs, io::Cursor, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    struct TestDirectory(PathBuf);
+    impl Drop for TestDirectory { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    fn storage() -> (TestDirectory, Storage) {
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "sonne-storage-lifecycle-{}-{nonce}", std::process::id()
+        )));
+        fs::create_dir_all(&directory.0).unwrap();
+        let storage = Storage::initialize(&directory.0).expect("storage should initialize");
+        (directory, storage)
+    }
+
+    #[test]
+    fn deleting_chat_prunes_only_unshared_attachment_versions_and_blobs() {
+        let (_directory, mut storage) = storage();
+        let first = storage.create_chat("first").unwrap();
+        let second = storage.create_chat("second").unwrap();
+        let blob = storage.store_blob(Cursor::new(b"shared attachment".to_vec())).unwrap();
+        let version = storage.create_attachment_version(None, &blob.sha256, "shared.txt", "txt", "text/plain").unwrap();
+        storage.add_attachment_reference(&first.id, &version.id, None, "composer", 0).unwrap();
+        storage.add_attachment_reference(&second.id, &version.id, None, "composer", 0).unwrap();
+
+        assert!(storage.delete_chat(&first.id).unwrap());
+        let shared: bool = storage.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)", [&blob.sha256], |row| row.get(0)
+        ).unwrap();
+        assert!(shared, "blob referenced by another chat must remain");
+
+        assert!(storage.delete_chat(&second.id).unwrap());
+        let remains: bool = storage.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)", [&blob.sha256], |row| row.get(0)
+        ).unwrap();
+        assert!(!remains, "last unreferenced blob should be pruned");
+        assert!(!storage.root_dir().join(&blob.relative_path).exists());
+    }
+
+    #[test]
+    fn operation_journal_keeps_blob_hash_after_blob_row_is_deleted() {
+        let (_directory, mut storage) = storage();
+        let blob = storage.store_blob(Cursor::new(b"journal snapshot".to_vec())).unwrap();
+        storage.connection().execute(
+            "INSERT INTO storage_operations (
+                id, operation_type, blob_sha256, target_path, state, created_at, updated_at
+             ) VALUES ('journal-test', 'delete_blob', ?1, ?2, 'PENDING', 1, 1)",
+            rusqlite::params![blob.sha256, blob.relative_path],
+        ).unwrap();
+        storage.connection().execute("DELETE FROM blobs WHERE sha256 = ?1", [&blob.sha256]).unwrap();
+        let retained: String = storage.connection().query_row(
+            "SELECT blob_sha256 FROM storage_operations WHERE id = 'journal-test'", [], |row| row.get(0)
+        ).unwrap();
+        assert_eq!(retained, blob.sha256);
+    }
+}

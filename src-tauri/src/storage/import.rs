@@ -271,10 +271,18 @@ impl Storage {
             return Err(error);
         }
 
-        let transaction = self
-            .connection
-            .transaction()
-            .map_err(|error| format!("Cannot start atomic attachment transaction: {error}"))?;
+        let transaction = match self.connection.transaction() {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                let message = format!("Cannot start atomic attachment transaction: {error}");
+                for item in &prepared {
+                    if let Err(cleanup_error) = self.delete_unreferenced_blob(&item.blob_sha256) {
+                        eprintln!("Failed to clean up import blob {}: {}", item.blob_sha256, cleanup_error);
+                    }
+                }
+                return Err(message);
+            }
+        };
 
         let commit_result = (|| -> Result<(), String> {
             for item in &prepared {
@@ -328,9 +336,20 @@ impl Storage {
             return Err(error);
         }
 
-        transaction
-            .commit()
-            .map_err(|error| format!("Cannot commit imported attachments: {error}"))?;
+        if let Err(error) = transaction.commit() {
+            let message = format!("Cannot commit imported attachments: {error}");
+            let _ = self.connection.execute(
+                "UPDATE storage_operations SET state = 'FAILED', error_message = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![message, now_timestamp().unwrap_or(timestamp), operation_id],
+            );
+            for item in &prepared {
+                if let Err(cleanup_error) = self.delete_unreferenced_blob(&item.blob_sha256) {
+                    eprintln!("Failed to clean up import blob {}: {}", item.blob_sha256, cleanup_error);
+                }
+            }
+            return Err(message);
+        }
 
         for item in &prepared {
             if super::archive::is_supported_archive_extension(&item.extension, &item.file_name) {

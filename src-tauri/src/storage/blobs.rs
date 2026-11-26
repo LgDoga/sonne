@@ -6,6 +6,7 @@ use std::{
 };
 
 use rusqlite::{Connection, OptionalExtension, params};
+use serde_json::Value;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -549,6 +550,56 @@ fn resolve_recovery_temp_path(root: &Path, relative: &str) -> Result<Option<Path
     }
 }
 
+
+fn recover_unreferenced_blob(
+    connection: &Connection,
+    root_dir: &Path,
+    sha256: &str,
+) -> Result<bool, String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Invalid SHA-256 in interrupted import journal".to_string());
+    }
+    let timestamp = now_timestamp()?;
+    let transaction = connection.unchecked_transaction()
+        .map_err(|error| format!("Cannot start import recovery cleanup: {error}"))?;
+    let relative_path: Option<String> = transaction.query_row(
+        "SELECT relative_path FROM blobs WHERE sha256 = ?1
+           AND NOT EXISTS (SELECT 1 FROM attachment_versions WHERE blob_sha256 = ?1)
+           AND NOT EXISTS (SELECT 1 FROM document_assets WHERE blob_sha256 = ?1)
+           AND NOT EXISTS (SELECT 1 FROM archive_entries WHERE blob_sha256 = ?1)
+           AND NOT EXISTS (SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1)",
+        params![sha256], |row| row.get(0)
+    ).optional().map_err(|error| format!("Cannot inspect interrupted import blob: {error}"))?;
+    let Some(relative_path) = relative_path else {
+        transaction.commit().map_err(|error| format!("Cannot finish import recovery check: {error}"))?;
+        return Ok(false);
+    };
+    let operation_id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO storage_operations (
+            id, operation_type, blob_sha256, target_path, state, created_at, updated_at
+         ) VALUES (?1, 'delete_blob', ?2, ?3, 'PENDING', ?4, ?4)",
+        params![operation_id, sha256, relative_path, timestamp]
+    ).map_err(|error| format!("Cannot journal recovered blob cleanup: {error}"))?;
+    let deleted = transaction.execute(
+        "DELETE FROM blobs WHERE sha256 = ?1
+           AND NOT EXISTS (SELECT 1 FROM attachment_versions WHERE blob_sha256 = ?1)
+           AND NOT EXISTS (SELECT 1 FROM document_assets WHERE blob_sha256 = ?1)
+           AND NOT EXISTS (SELECT 1 FROM archive_entries WHERE blob_sha256 = ?1)
+           AND NOT EXISTS (SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1)",
+        params![sha256]
+    ).map_err(|error| format!("Cannot remove recovered orphan metadata: {error}"))?;
+    transaction.commit().map_err(|error| format!("Cannot commit recovered blob cleanup: {error}"))?;
+    if deleted == 0 { return Ok(false); }
+    remove_recovered_blob_file(root_dir, &relative_path)?;
+    connection.execute(
+        "UPDATE storage_operations SET state = 'COMPLETED', error_message = NULL, updated_at = ?1
+         WHERE id = ?2",
+        params![now_timestamp()?, operation_id]
+    ).map_err(|error| format!("Cannot complete recovered blob cleanup: {error}"))?;
+    Ok(true)
+}
+
 pub(super) fn recover_interrupted_operations(
     connection: &Connection,
     root_dir: &Path,
@@ -556,9 +607,10 @@ pub(super) fn recover_interrupted_operations(
     let operations = {
         let mut statement = connection
             .prepare(
-                "SELECT id, operation_type, source_path, target_path, blob_sha256
+                "SELECT id, operation_type, source_path, target_path, blob_sha256, metadata_json
                  FROM storage_operations
                  WHERE state IN ('PENDING', 'PROCESSING', 'VERIFYING', 'COMMITTING')
+                    OR (operation_type = 'import_batch' AND state = 'FAILED')
                  ORDER BY created_at ASC",
             )
             .map_err(|error| format!("Cannot prepare interrupted operation query: {error}"))?;
@@ -571,6 +623,7 @@ pub(super) fn recover_interrupted_operations(
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             })
             .map_err(|error| format!("Cannot query interrupted operations: {error}"))?
@@ -578,7 +631,7 @@ pub(super) fn recover_interrupted_operations(
             .map_err(|error| format!("Cannot read interrupted operations: {error}"))?
     };
 
-    for (operation_id, operation_type, source_path, target_path, blob_sha256) in operations {
+    for (operation_id, operation_type, source_path, target_path, blob_sha256, metadata_json) in operations {
         let mut recovery_message =
             "Operation was interrupted before completion and recovered during startup.".to_string();
         let mut recovered_state = "FAILED";
@@ -598,6 +651,9 @@ pub(super) fn recover_interrupted_operations(
                                )
                                AND NOT EXISTS (
                                    SELECT 1 FROM archive_entries WHERE blob_sha256 = ?1
+                               )
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1
                                )",
                             params![sha256],
                         )
@@ -694,9 +750,29 @@ pub(super) fn recover_interrupted_operations(
                 }
             }
             "import_batch" => {
-                recovery_message.push_str(
-                    " The attachment transaction was not completed; stored blobs were preserved.",
-                );
+                let hashes = metadata_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .and_then(|value| value.get("files").and_then(Value::as_array).cloned())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|file| file.get("blobSha256").and_then(Value::as_str).map(str::to_owned))
+                    .collect::<Vec<_>>();
+                let mut cleaned = 0usize;
+                let mut preserved = 0usize;
+                for sha256 in hashes {
+                    match recover_unreferenced_blob(connection, root_dir, &sha256) {
+                        Ok(true) => cleaned += 1,
+                        Ok(false) => preserved += 1,
+                        Err(error) => {
+                            preserved += 1;
+                            recovery_message.push_str(&format!(" Cleanup deferred: {error}"));
+                        }
+                    }
+                }
+                recovery_message.push_str(&format!(
+                    " Interrupted import recovery removed {cleaned} unreferenced blobs and preserved {preserved} referenced or unavailable blobs."
+                ));
             }
             _ => {
                 recovery_message
