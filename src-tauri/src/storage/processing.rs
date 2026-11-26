@@ -5,13 +5,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 use uuid::Uuid;
 
-use super::{MAX_FILE_SIZE_BYTES, Storage};
+use super::{Storage, MAX_FILE_SIZE_BYTES};
 
 const MAX_SECTIONS: usize = 10_000;
 const MAX_CHUNKS: usize = 50_000;
@@ -314,14 +314,20 @@ fn validate_document(input: &SaveExtractedDocumentInput) -> Result<(), String> {
         ));
     }
 
-    let section_keys: HashSet<&str> =
-        input.sections.iter().map(|section| section.key.as_str()).collect();
+    let section_keys: HashSet<&str> = input
+        .sections
+        .iter()
+        .map(|section| section.key.as_str())
+        .collect();
 
     let mut total_asset_bytes = 0usize;
 
     for asset in &input.assets {
         if asset.asset_type != "image" && asset.asset_type != "chart" {
-            return Err(format!("Unsupported document asset type: {}", asset.asset_type));
+            return Err(format!(
+                "Unsupported document asset type: {}",
+                asset.asset_type
+            ));
         }
 
         if asset.ordinal < 0 {
@@ -340,11 +346,19 @@ fn validate_document(input: &SaveExtractedDocumentInput) -> Result<(), String> {
             return Err("Document embedded assets exceed the 64 MiB limit".into());
         }
 
-        if asset.mime_type.as_ref().is_some_and(|value| value.is_empty() || value.len() > 128) {
+        if asset
+            .mime_type
+            .as_ref()
+            .is_some_and(|value| value.is_empty() || value.len() > 128)
+        {
             return Err("Invalid embedded asset MIME type".into());
         }
 
-        if asset.file_name.as_ref().is_some_and(|value| value.len() > 512) {
+        if asset
+            .file_name
+            .as_ref()
+            .is_some_and(|value| value.len() > 512)
+        {
             return Err("Embedded asset filename is too long".into());
         }
 
@@ -880,7 +894,6 @@ pub fn get_attachment_document_context(
     })
 }
 
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AttachmentDocumentAsset {
@@ -904,27 +917,32 @@ pub fn list_attachment_document_assets(
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
     let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
-    let mut statement = storage.connection.prepare(
-        "SELECT a.id, a.asset_type, a.mime_type, a.file_name, a.ordinal,
+    let mut statement = storage
+        .connection
+        .prepare(
+            "SELECT a.id, a.asset_type, a.mime_type, a.file_name, a.ordinal,
                 a.metadata_json, d.id, s.title
          FROM document_assets a
          JOIN extracted_documents d ON d.id = a.document_id
          LEFT JOIN document_sections s ON s.id = a.section_id
          WHERE d.blob_sha256 = ?1 AND d.status = 'completed'
-         ORDER BY a.ordinal ASC"
-    ).map_err(|error| format!("Cannot prepare document asset query: {error}"))?;
-    let rows = statement.query_map([sha256], |row| {
-        Ok(AttachmentDocumentAsset {
-            asset_id: row.get(0)?,
-            asset_type: row.get(1)?,
-            mime_type: row.get(2)?,
-            file_name: row.get(3)?,
-            ordinal: row.get(4)?,
-            metadata_json: row.get(5)?,
-            document_id: row.get(6)?,
-            section_title: row.get(7)?,
+         ORDER BY a.ordinal ASC",
+        )
+        .map_err(|error| format!("Cannot prepare document asset query: {error}"))?;
+    let rows = statement
+        .query_map([sha256], |row| {
+            Ok(AttachmentDocumentAsset {
+                asset_id: row.get(0)?,
+                asset_type: row.get(1)?,
+                mime_type: row.get(2)?,
+                file_name: row.get(3)?,
+                ordinal: row.get(4)?,
+                metadata_json: row.get(5)?,
+                document_id: row.get(6)?,
+                section_title: row.get(7)?,
+            })
         })
-    }).map_err(|error| format!("Cannot query document assets: {error}"))?;
+        .map_err(|error| format!("Cannot query document assets: {error}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Cannot read document asset metadata: {error}"))
 }
@@ -940,16 +958,20 @@ pub fn read_attachment_document_asset(
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
     let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
-    let relative_path: String = storage.connection.query_row(
-        "SELECT b.relative_path
+    let relative_path: String = storage
+        .connection
+        .query_row(
+            "SELECT b.relative_path
          FROM document_assets a
          JOIN extracted_documents d ON d.id = a.document_id
          JOIN blobs b ON b.sha256 = a.blob_sha256
          WHERE a.id = ?1 AND d.blob_sha256 = ?2 AND d.status = 'completed'",
-        params![asset_id, sha256],
-        |row| row.get(0),
-    ).optional().map_err(|error| format!("Cannot resolve document asset: {error}"))?
-      .ok_or_else(|| "Document asset does not belong to the specified attachment".to_string())?;
+            params![asset_id, sha256],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("Cannot resolve document asset: {error}"))?
+        .ok_or_else(|| "Document asset does not belong to the specified attachment".to_string())?;
     let path = storage.resolve_blob_path(&relative_path)?;
     let metadata = std::fs::metadata(&path)
         .map_err(|error| format!("Cannot inspect document asset: {error}"))?;
@@ -1003,8 +1025,13 @@ pub fn save_attachment_document_asset_vision_description(
         .transaction()
         .map_err(|error| format!("Cannot begin Vision metadata transaction: {error}"))?;
 
-    let (document_id, section_id, file_name, ordinal, metadata_json):
-        (String, Option<String>, Option<String>, i64, Option<String>) = transaction
+    let (document_id, section_id, file_name, ordinal, metadata_json): (
+        String,
+        Option<String>,
+        Option<String>,
+        i64,
+        Option<String>,
+    ) = transaction
         .query_row(
             "SELECT d.id, a.section_id, a.file_name, a.ordinal, a.metadata_json
              FROM document_assets a
@@ -1012,7 +1039,15 @@ pub fn save_attachment_document_asset_vision_description(
              WHERE a.id = ?1 AND d.blob_sha256 = ?2
                AND d.status = 'completed' AND a.asset_type = 'image'",
             params![asset_id, sha256],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(|error| format!("Cannot resolve Vision asset: {error}"))?
@@ -1056,12 +1091,10 @@ pub fn save_attachment_document_asset_vision_description(
         let Some(candidate_object) = candidate_metadata.as_object() else {
             continue;
         };
-        let same_ordinal = candidate_object
-            .get("assetOrdinal")
-            .and_then(Value::as_i64) == Some(ordinal);
-        let same_name = candidate_object
-            .get("fileName")
-            .and_then(Value::as_str) == file_name.as_deref();
+        let same_ordinal =
+            candidate_object.get("assetOrdinal").and_then(Value::as_i64) == Some(ordinal);
+        let same_name =
+            candidate_object.get("fileName").and_then(Value::as_str) == file_name.as_deref();
         let source_matches = matches!(
             candidate_object.get("source").and_then(Value::as_str),
             Some("embedded_asset") | Some("embedded_asset_vision")
@@ -1077,7 +1110,11 @@ pub fn save_attachment_document_asset_vision_description(
         .filter(|value| !value.is_empty() && value.len() <= 128)
         .map(str::to_owned);
     let chunk_id = stored_chunk_id
-        .filter(|stored| matching_chunk_ids.iter().any(|candidate| candidate == stored))
+        .filter(|stored| {
+            matching_chunk_ids
+                .iter()
+                .any(|candidate| candidate == stored)
+        })
         .or_else(|| matching_chunk_ids.first().cloned())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
@@ -1108,7 +1145,10 @@ pub fn save_attachment_document_asset_vision_description(
         .filter(|value| !value.trim().is_empty())
         .map(str::to_owned);
 
-    metadata_object.insert("visionDescription".into(), Value::String(description.to_string()));
+    metadata_object.insert(
+        "visionDescription".into(),
+        Value::String(description.to_string()),
+    );
     metadata_object.insert("visionModel".into(), Value::String(model_name.clone()));
     metadata_object.insert("visionPromptVersion".into(), Value::from(prompt_version));
     metadata_object.insert("visionAnalyzedAt".into(), Value::from(timestamp));
@@ -1151,42 +1191,64 @@ pub fn save_attachment_document_asset_vision_description(
         "fileName": file_name,
         "visionModel": model_name,
         "visionPromptVersion": prompt_version
-    }).to_string();
+    })
+    .to_string();
 
-    let next_ordinal: i64 = transaction.query_row(
-        "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM document_chunks WHERE document_id = ?1",
-        [&document_id],
-        |row| row.get(0),
-    ).map_err(|error| format!("Cannot allocate Vision search chunk order: {error}"))?;
-    transaction.execute(
-        "INSERT INTO document_chunks (
+    let next_ordinal: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(ordinal), -1) + 1 FROM document_chunks WHERE document_id = ?1",
+            [&document_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Cannot allocate Vision search chunk order: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO document_chunks (
             id, document_id, ordinal, content, token_count,
             start_offset, end_offset, section_id, chunk_type, metadata_json
          ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6, 'asset_vision', ?7)",
-        params![chunk_id, document_id, next_ordinal, chunk_content,
-            (chunk_content.len() / 4) as i64, section_id, chunk_metadata],
-    ).map_err(|error| format!("Cannot insert Vision search chunk: {error}"))?;
+            params![
+                chunk_id,
+                document_id,
+                next_ordinal,
+                chunk_content,
+                (chunk_content.len() / 4) as i64,
+                section_id,
+                chunk_metadata
+            ],
+        )
+        .map_err(|error| format!("Cannot insert Vision search chunk: {error}"))?;
 
-    transaction.execute(
-        "UPDATE document_assets SET metadata_json = ?1 WHERE id = ?2",
-        params![serialized_metadata, asset_id],
-    ).map_err(|error| format!("Cannot persist Vision asset metadata: {error}"))?;
+    transaction
+        .execute(
+            "UPDATE document_assets SET metadata_json = ?1 WHERE id = ?2",
+            params![serialized_metadata, asset_id],
+        )
+        .map_err(|error| format!("Cannot persist Vision asset metadata: {error}"))?;
 
     // Document summaries are derived from document_chunks. Invalidate every
     // cached Map-Reduce stage so later requests cannot reuse stale image facts.
-    transaction.execute(
-        "DELETE FROM document_summary_parts WHERE document_id = ?1",
-        [&document_id],
-    ).map_err(|error| format!("Cannot invalidate Vision summary parts: {error}"))?;
-    transaction.execute(
-        "DELETE FROM document_summaries WHERE document_id = ?1",
-        [&document_id],
-    ).map_err(|error| format!("Cannot invalidate Vision document summary: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM document_summary_parts WHERE document_id = ?1",
+            [&document_id],
+        )
+        .map_err(|error| format!("Cannot invalidate Vision summary parts: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM document_summaries WHERE document_id = ?1",
+            [&document_id],
+        )
+        .map_err(|error| format!("Cannot invalidate Vision document summary: {error}"))?;
 
-    transaction.commit()
+    transaction
+        .commit()
         .map_err(|error| format!("Cannot commit Vision metadata transaction: {error}"))?;
 
-    Ok(SavedVisionDescription { document_id, chunk_id })
+    Ok(SavedVisionDescription {
+        document_id,
+        chunk_id,
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1246,10 +1308,8 @@ pub fn search_attachment_documents(
         .lock()
         .map_err(|_| "Storage lock is poisoned".to_string())?;
 
-    let mut ranked: std::collections::HashMap<
-        String,
-        (DocumentSearchResult, f64),
-    > = std::collections::HashMap::new();
+    let mut ranked: std::collections::HashMap<String, (DocumentSearchResult, f64)> =
+        std::collections::HashMap::new();
 
     // Lexical retrieval: FTS5 / BM25.
     let lexical_results = {
@@ -1291,17 +1351,14 @@ pub fn search_attachment_documents(
             .map_err(|error| format!("Cannot prepare lexical search: {error}"))?;
 
         let rows = statement
-            .query_map(
-                params![fts_query, chat_id, candidate_limit as i64],
-                |row| {
-                    Ok(DocumentSearchResult {
-                        chunk_id: row.get(0)?,
-                        file_name: row.get(1)?,
-                        detected_format: row.get(2)?,
-                        content: row.get(3)?,
-                    })
-                },
-            )
+            .query_map(params![fts_query, chat_id, candidate_limit as i64], |row| {
+                Ok(DocumentSearchResult {
+                    chunk_id: row.get(0)?,
+                    file_name: row.get(1)?,
+                    detected_format: row.get(2)?,
+                    content: row.get(3)?,
+                })
+            })
             .map_err(|error| format!("Cannot execute lexical search: {error}"))?;
 
         rows.collect::<Result<Vec<_>, _>>()
@@ -1634,7 +1691,6 @@ pub fn finalize_document_embedding_index(
         .map_err(|error| format!("Cannot commit embedding finalization: {error}"))
 }
 
-
 // ============================================================
 // DOCUMENT MAP-REDUCE SUMMARIES
 // ============================================================
@@ -1712,8 +1768,10 @@ pub fn get_document_summary_chunk_batch(
         .lock()
         .map_err(|_| "Storage lock is poisoned".to_string())?;
 
-    let mut statement = storage.connection.prepare(
-        "SELECT
+    let mut statement = storage
+        .connection
+        .prepare(
+            "SELECT
             c.id,
             c.ordinal,
             c.content,
@@ -1726,12 +1784,12 @@ pub fn get_document_summary_chunk_batch(
          LEFT JOIN document_sections s ON s.id = c.section_id
          WHERE c.document_id = ?1 AND c.ordinal > ?2
          ORDER BY c.ordinal ASC
-         LIMIT ?3"
-    ).map_err(|error| format!("Cannot prepare summary chunk query: {error}"))?;
+         LIMIT ?3",
+        )
+        .map_err(|error| format!("Cannot prepare summary chunk query: {error}"))?;
 
-    let rows = statement.query_map(
-        params![document_id, after, limit as i64],
-        |row| {
+    let rows = statement
+        .query_map(params![document_id, after, limit as i64], |row| {
             Ok(DocumentSummaryChunk {
                 chunk_id: row.get(0)?,
                 ordinal: row.get(1)?,
@@ -1742,8 +1800,8 @@ pub fn get_document_summary_chunk_batch(
                 section_title: row.get(6)?,
                 section_metadata: row.get(7)?,
             })
-        },
-    ).map_err(|error| format!("Cannot query summary chunks: {error}"))?;
+        })
+        .map_err(|error| format!("Cannot query summary chunks: {error}"))?;
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Cannot collect summary chunks: {error}"))
@@ -1763,10 +1821,13 @@ pub fn clear_document_summary_stage(
         .lock()
         .map_err(|_| "Storage lock is poisoned".to_string())?;
 
-    let changed = storage.connection.execute(
-        "DELETE FROM document_summary_parts WHERE document_id = ?1 AND stage = ?2",
-        params![document_id, stage],
-    ).map_err(|error| format!("Cannot clear document summary stage: {error}"))?;
+    let changed = storage
+        .connection
+        .execute(
+            "DELETE FROM document_summary_parts WHERE document_id = ?1 AND stage = ?2",
+            params![document_id, stage],
+        )
+        .map_err(|error| format!("Cannot clear document summary stage: {error}"))?;
 
     Ok(changed)
 }
@@ -1817,22 +1878,27 @@ pub fn save_document_summary_parts(
         .map_err(|_| "Storage lock is poisoned".to_string())?;
     let timestamp = now_timestamp()?;
 
-    let transaction = storage.connection.transaction()
+    let transaction = storage
+        .connection
+        .transaction()
         .map_err(|error| format!("Cannot begin summary transaction: {error}"))?;
 
-    let exists: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM extracted_documents WHERE id = ?1)",
-        [&document_id],
-        |row| row.get(0),
-    ).map_err(|error| format!("Cannot validate summary document: {error}"))?;
+    let exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM extracted_documents WHERE id = ?1)",
+            [&document_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Cannot validate summary document: {error}"))?;
 
     if !exists {
         return Err("Summary document does not exist".into());
     }
 
     for part in &parts {
-        transaction.execute(
-            "INSERT INTO document_summary_parts (
+        transaction
+            .execute(
+                "INSERT INTO document_summary_parts (
                 document_id, stage, ordinal, content, source_chunk_count,
                 model_name, summarizer_version, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -1843,20 +1909,22 @@ pub fn save_document_summary_parts(
                 model_name = excluded.model_name,
                 summarizer_version = excluded.summarizer_version,
                 updated_at = excluded.updated_at",
-            params![
-                document_id,
-                stage,
-                part.ordinal,
-                part.content,
-                part.source_chunk_count,
-                model_name,
-                summarizer_version,
-                timestamp
-            ],
-        ).map_err(|error| format!("Cannot save summary part: {error}"))?;
+                params![
+                    document_id,
+                    stage,
+                    part.ordinal,
+                    part.content,
+                    part.source_chunk_count,
+                    model_name,
+                    summarizer_version,
+                    timestamp
+                ],
+            )
+            .map_err(|error| format!("Cannot save summary part: {error}"))?;
     }
 
-    transaction.commit()
+    transaction
+        .commit()
         .map_err(|error| format!("Cannot commit summary parts: {error}"))?;
 
     Ok(parts.len())
@@ -1888,18 +1956,20 @@ pub fn get_document_summary_parts(
         .lock()
         .map_err(|_| "Storage lock is poisoned".to_string())?;
 
-    let mut statement = storage.connection.prepare(
-        "SELECT ordinal, content, source_chunk_count,
+    let mut statement = storage
+        .connection
+        .prepare(
+            "SELECT ordinal, content, source_chunk_count,
                 model_name, summarizer_version
          FROM document_summary_parts
          WHERE document_id = ?1 AND stage = ?2 AND ordinal > ?3
          ORDER BY ordinal ASC
-         LIMIT ?4"
-    ).map_err(|error| format!("Cannot prepare summary parts query: {error}"))?;
+         LIMIT ?4",
+        )
+        .map_err(|error| format!("Cannot prepare summary parts query: {error}"))?;
 
-    let rows = statement.query_map(
-        params![document_id, stage, after, limit as i64],
-        |row| {
+    let rows = statement
+        .query_map(params![document_id, stage, after, limit as i64], |row| {
             Ok(DocumentSummaryPart {
                 ordinal: row.get(0)?,
                 content: row.get(1)?,
@@ -1907,8 +1977,8 @@ pub fn get_document_summary_parts(
                 model_name: row.get(3)?,
                 summarizer_version: row.get(4)?,
             })
-        },
-    ).map_err(|error| format!("Cannot query summary parts: {error}"))?;
+        })
+        .map_err(|error| format!("Cannot query summary parts: {error}"))?;
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Cannot collect summary parts: {error}"))
@@ -1942,14 +2012,18 @@ pub fn finalize_document_summary(
         .map_err(|_| "Storage lock is poisoned".to_string())?;
     let timestamp = now_timestamp()?;
 
-    let transaction = storage.connection.transaction()
+    let transaction = storage
+        .connection
+        .transaction()
         .map_err(|error| format!("Cannot begin final summary transaction: {error}"))?;
 
-    let actual_count: i64 = transaction.query_row(
-        "SELECT COUNT(*) FROM document_chunks WHERE document_id = ?1",
-        [&document_id],
-        |row| row.get(0),
-    ).map_err(|error| format!("Cannot verify summarized chunk count: {error}"))?;
+    let actual_count: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM document_chunks WHERE document_id = ?1",
+            [&document_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Cannot verify summarized chunk count: {error}"))?;
 
     if actual_count == 0 || actual_count != source_chunk_count {
         return Err(format!(
@@ -1957,8 +2031,9 @@ pub fn finalize_document_summary(
         ));
     }
 
-    transaction.execute(
-        "INSERT INTO document_summaries (
+    transaction
+        .execute(
+            "INSERT INTO document_summaries (
             document_id, summary, model_name, summarizer_version,
             status, source_chunk_count, error_message, created_at, updated_at
          ) VALUES (?1, ?2, ?3, ?4, 'completed', ?5, NULL, ?6, ?6)
@@ -1971,17 +2046,19 @@ pub fn finalize_document_summary(
             source_chunk_count = excluded.source_chunk_count,
             error_message = NULL,
             updated_at = excluded.updated_at",
-        params![
-            document_id,
-            summary,
-            model_name,
-            summarizer_version,
-            source_chunk_count,
-            timestamp
-        ],
-    ).map_err(|error| format!("Cannot save final document summary: {error}"))?;
+            params![
+                document_id,
+                summary,
+                model_name,
+                summarizer_version,
+                source_chunk_count,
+                timestamp
+            ],
+        )
+        .map_err(|error| format!("Cannot save final document summary: {error}"))?;
 
-    transaction.commit()
+    transaction
+        .commit()
         .map_err(|error| format!("Cannot commit final document summary: {error}"))
 }
 
@@ -1998,24 +2075,26 @@ pub fn get_document_summary(
         .lock()
         .map_err(|_| "Storage lock is poisoned".to_string())?;
 
-    storage.connection.query_row(
-        "SELECT document_id, summary, model_name, summarizer_version,
+    storage
+        .connection
+        .query_row(
+            "SELECT document_id, summary, model_name, summarizer_version,
                 status, source_chunk_count, updated_at
          FROM document_summaries
          WHERE document_id = ?1",
-        [&document_id],
-        |row| {
-            Ok(DocumentSummaryRecord {
-                document_id: row.get(0)?,
-                summary: row.get(1)?,
-                model_name: row.get(2)?,
-                summarizer_version: row.get(3)?,
-                status: row.get(4)?,
-                source_chunk_count: row.get(5)?,
-                updated_at: row.get(6)?,
-            })
-        },
-    ).optional()
-    .map_err(|error| format!("Cannot read document summary: {error}"))
+            [&document_id],
+            |row| {
+                Ok(DocumentSummaryRecord {
+                    document_id: row.get(0)?,
+                    summary: row.get(1)?,
+                    model_name: row.get(2)?,
+                    summarizer_version: row.get(3)?,
+                    status: row.get(4)?,
+                    source_chunk_count: row.get(5)?,
+                    updated_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Cannot read document summary: {error}"))
 }
-

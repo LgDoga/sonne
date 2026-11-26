@@ -1,4 +1,6 @@
 pub mod archive;
+
+pub mod reconciliation;
 pub mod processing;
 mod schema;
 
@@ -10,7 +12,10 @@ use std::{
 };
 
 use rusqlite::{Connection, OpenFlags};
-use schema::{INITIAL_SCHEMA, MIGRATION_1_TO_2, MIGRATION_2_TO_3, MIGRATION_3_TO_4, MIGRATION_4_TO_5, SCHEMA_VERSION};
+use schema::{
+    INITIAL_SCHEMA, MIGRATION_1_TO_2, MIGRATION_2_TO_3, MIGRATION_3_TO_4, MIGRATION_4_TO_5,
+    SCHEMA_VERSION,
+};
 
 pub(super) const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 pub(super) const MAX_IMPORT_BATCH_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
@@ -355,13 +360,26 @@ mod sqlite_vec_integration_tests {
 #[cfg(test)]
 mod storage_lifecycle_tests {
     use super::Storage;
-    use std::{fs, io::Cursor, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        io::Cursor,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
     struct TestDirectory(PathBuf);
-    impl Drop for TestDirectory { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); } }
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
     fn storage() -> (TestDirectory, Storage) {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let directory = TestDirectory(std::env::temp_dir().join(format!(
-            "sonne-storage-lifecycle-{}-{nonce}", std::process::id()
+            "sonne-storage-lifecycle-{}-{nonce}",
+            std::process::id()
         )));
         fs::create_dir_all(&directory.0).unwrap();
         let storage = Storage::initialize(&directory.0).expect("storage should initialize");
@@ -373,21 +391,39 @@ mod storage_lifecycle_tests {
         let (_directory, mut storage) = storage();
         let first = storage.create_chat("first").unwrap();
         let second = storage.create_chat("second").unwrap();
-        let blob = storage.store_blob(Cursor::new(b"shared attachment".to_vec())).unwrap();
-        let version = storage.create_attachment_version(None, &blob.sha256, "shared.txt", "txt", "text/plain").unwrap();
-        storage.add_attachment_reference(&first.id, &version.id, None, "composer", 0).unwrap();
-        storage.add_attachment_reference(&second.id, &version.id, None, "composer", 0).unwrap();
+        let blob = storage
+            .store_blob(Cursor::new(b"shared attachment".to_vec()))
+            .unwrap();
+        let version = storage
+            .create_attachment_version(None, &blob.sha256, "shared.txt", "txt", "text/plain")
+            .unwrap();
+        storage
+            .add_attachment_reference(&first.id, &version.id, None, "composer", 0)
+            .unwrap();
+        storage
+            .add_attachment_reference(&second.id, &version.id, None, "composer", 0)
+            .unwrap();
 
         assert!(storage.delete_chat(&first.id).unwrap());
-        let shared: bool = storage.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)", [&blob.sha256], |row| row.get(0)
-        ).unwrap();
+        let shared: bool = storage
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(shared, "blob referenced by another chat must remain");
 
         assert!(storage.delete_chat(&second.id).unwrap());
-        let remains: bool = storage.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)", [&blob.sha256], |row| row.get(0)
-        ).unwrap();
+        let remains: bool = storage
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!remains, "last unreferenced blob should be pruned");
         assert!(!storage.root_dir().join(&blob.relative_path).exists());
     }
@@ -395,43 +431,514 @@ mod storage_lifecycle_tests {
     #[test]
     fn operation_journal_keeps_blob_hash_after_blob_row_is_deleted() {
         let (_directory, mut storage) = storage();
-        let blob = storage.store_blob(Cursor::new(b"journal snapshot".to_vec())).unwrap();
-        storage.connection().execute(
-            "INSERT INTO storage_operations (
+        let blob = storage
+            .store_blob(Cursor::new(b"journal snapshot".to_vec()))
+            .unwrap();
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
                 id, operation_type, blob_sha256, target_path, state, created_at, updated_at
              ) VALUES ('journal-test', 'delete_blob', ?1, ?2, 'PENDING', 1, 1)",
-            rusqlite::params![blob.sha256, blob.relative_path],
-        ).unwrap();
-        storage.connection().execute("DELETE FROM blobs WHERE sha256 = ?1", [&blob.sha256]).unwrap();
-        let retained: String = storage.connection().query_row(
-            "SELECT blob_sha256 FROM storage_operations WHERE id = 'journal-test'", [], |row| row.get(0)
-        ).unwrap();
+                rusqlite::params![blob.sha256, blob.relative_path],
+            )
+            .unwrap();
+        storage
+            .connection()
+            .execute("DELETE FROM blobs WHERE sha256 = ?1", [&blob.sha256])
+            .unwrap();
+        let retained: String = storage
+            .connection()
+            .query_row(
+                "SELECT blob_sha256 FROM storage_operations WHERE id = 'journal-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(retained, blob.sha256);
     }
     #[test]
+    fn startup_recovers_blob_deletion_after_chat_delete_commit() {
+        let (directory, mut storage) = storage();
+        let chat = storage.create_chat("interrupted deletion").unwrap();
+        let blob = storage
+            .store_blob(Cursor::new(b"delete chat crash recovery".to_vec()))
+            .unwrap();
+        let version = storage
+            .create_attachment_version(None, &blob.sha256, "recovery.txt", "txt", "text/plain")
+            .unwrap();
+
+        storage
+            .add_attachment_reference(&chat.id, &version.id, None, "composer", 0)
+            .unwrap();
+
+        let attachment_id: String = storage
+            .connection()
+            .query_row(
+                "SELECT attachment_id FROM attachment_versions WHERE id = ?1",
+                [&version.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
+                    id, operation_type, blob_sha256, target_path,
+                    state, created_at, updated_at
+                ) VALUES (
+                    'delete-chat-crash-test', 'delete_blob', ?1, ?2,
+                    'PENDING', 1, 1
+                )",
+                rusqlite::params![blob.sha256, blob.relative_path],
+            )
+            .unwrap();
+
+        // Simulate the committed database state after delete_chat,
+        // but before its physical blob removal.
+        storage
+            .connection()
+            .execute("DELETE FROM chats WHERE id = ?1", [&chat.id])
+            .unwrap();
+
+        storage
+            .connection()
+            .execute(
+                "DELETE FROM attachment_versions
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attachment_references
+                       WHERE attachment_version_id = ?1
+                   )",
+                [&version.id],
+            )
+            .unwrap();
+
+        storage
+            .connection()
+            .execute(
+                "DELETE FROM attachments
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attachment_versions
+                       WHERE attachment_id = ?1
+                   )",
+                [&attachment_id],
+            )
+            .unwrap();
+
+        storage
+            .connection()
+            .execute(
+                "DELETE FROM blobs
+                 WHERE sha256 = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attachment_versions WHERE blob_sha256 = ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM document_assets WHERE blob_sha256 = ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM archive_entries WHERE blob_sha256 = ?1
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1
+                   )",
+                [&blob.sha256],
+            )
+            .unwrap();
+
+        assert!(
+            storage.root_dir().join(&blob.relative_path).exists(),
+            "physical blob must still exist at the simulated crash point"
+        );
+
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0)
+            .expect("startup should recover interrupted chat deletion");
+
+        assert!(
+            !recovered.root_dir().join(&blob.relative_path).exists(),
+            "recovery should remove the orphan physical blob"
+        );
+
+        let metadata_exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!metadata_exists, "orphan blob metadata must remain deleted");
+
+        let state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations
+                 WHERE id = 'delete-chat-crash-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "COMPLETED");
+
+        drop(recovered);
+
+        let recovered_again =
+            Storage::initialize(&directory.0).expect("second startup should remain successful");
+
+        let state_again: String = recovered_again
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations
+                 WHERE id = 'delete-chat-crash-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_again, "COMPLETED");
+    }
+
+    #[test]
+    fn startup_recovery_preserves_blob_referenced_by_another_chat_during_delete() {
+        let (directory, mut storage) = storage();
+        let first = storage.create_chat("first shared chat").unwrap();
+        let second = storage.create_chat("second shared chat").unwrap();
+
+        let blob = storage
+            .store_blob(Cursor::new(b"still referenced blob".to_vec()))
+            .unwrap();
+
+        let version = storage
+            .create_attachment_version(
+                None,
+                &blob.sha256,
+                "shared-recovery.txt",
+                "txt",
+                "text/plain",
+            )
+            .unwrap();
+
+        storage
+            .add_attachment_reference(&first.id, &version.id, None, "composer", 0)
+            .unwrap();
+        storage
+            .add_attachment_reference(&second.id, &version.id, None, "composer", 0)
+            .unwrap();
+
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
+                    id, operation_type, blob_sha256, target_path,
+                    state, created_at, updated_at
+                ) VALUES (
+                    'shared-delete-recovery-test', 'delete_blob', ?1, ?2,
+                    'PENDING', 1, 1
+                )",
+                rusqlite::params![blob.sha256, blob.relative_path],
+            )
+            .unwrap();
+
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0)
+            .expect("startup should preserve a still-referenced blob");
+
+        let metadata_exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            metadata_exists,
+            "referenced blob metadata must be preserved"
+        );
+        assert!(
+            recovered.root_dir().join(&blob.relative_path).exists(),
+            "referenced physical blob must be preserved"
+        );
+
+        let second_reference_exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM attachment_references
+                    WHERE chat_id = ?1 AND attachment_version_id = ?2
+                )",
+                rusqlite::params![second.id, version.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            second_reference_exists,
+            "the other chat's attachment reference must remain intact"
+        );
+
+        let state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations
+                 WHERE id = 'shared-delete-recovery-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(
+            state, "FAILED",
+            "recovery must retain a diagnostic state when deletion is unsafe"
+        );
+    }
+
+    #[test]
     fn startup_recovers_unreferenced_blobs_from_failed_import_journal() {
         let (directory, mut storage) = storage();
-        let blob = storage.store_blob(Cursor::new(b"interrupted import".to_vec())).unwrap();
+        let blob = storage
+            .store_blob(Cursor::new(b"interrupted import".to_vec()))
+            .unwrap();
         let metadata = serde_json::json!({
             "chatId": "deleted-chat",
             "files": [{"blobSha256": blob.sha256}]
-        }).to_string();
+        })
+        .to_string();
 
-        storage.connection().execute(
-            "INSERT INTO storage_operations (
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
                 id, operation_type, state, metadata_json, created_at, updated_at
              ) VALUES ('failed-import-test', 'import_batch', 'FAILED', ?1, 1, 1)",
-            [metadata],
-        ).unwrap();
+                [metadata],
+            )
+            .unwrap();
         drop(storage);
 
         let recovered = Storage::initialize(&directory.0).expect("startup recovery should succeed");
-        let exists: bool = recovered.connection().query_row(
-            "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
-            [&blob.sha256], |row| row.get(0)
-        ).unwrap();
+        let exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!exists, "orphan blob metadata should be removed");
         assert!(!recovered.root_dir().join(&blob.relative_path).exists());
+
+        let state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations WHERE id = 'failed-import-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "COMPLETED");
+
+        drop(recovered);
+
+        let recovered_again =
+            Storage::initialize(&directory.0).expect("second startup recovery should succeed");
+        let state_again: String = recovered_again
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations WHERE id = 'failed-import-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_again, "COMPLETED");
     }
 
+    #[test]
+    fn startup_recovery_preserves_blobs_referenced_by_attachments() {
+        let (directory, mut storage) = storage();
+        let chat = storage.create_chat("shared").unwrap();
+        let blob = storage
+            .store_blob(Cursor::new(b"referenced import blob".to_vec()))
+            .unwrap();
+        let version = storage
+            .create_attachment_version(None, &blob.sha256, "shared.txt", "txt", "text/plain")
+            .unwrap();
+        storage
+            .add_attachment_reference(&chat.id, &version.id, None, "composer", 0)
+            .unwrap();
+
+        let metadata = serde_json::json!({
+            "chatId": chat.id,
+            "files": [{"blobSha256": blob.sha256}]
+        })
+        .to_string();
+
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
+                id, operation_type, state, metadata_json, created_at, updated_at
+             ) VALUES ('referenced-import-test', 'import_batch', 'FAILED', ?1, 1, 1)",
+                [metadata],
+            )
+            .unwrap();
+
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0)
+            .expect("startup recovery should preserve referenced blob");
+
+        let exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists);
+        assert!(recovered.root_dir().join(&blob.relative_path).exists());
+
+        let state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations WHERE id = 'referenced-import-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "COMPLETED");
+    }
+
+    #[test]
+    fn startup_recovery_keeps_invalid_import_journal_failed() {
+        let (directory, mut storage) = storage();
+        let metadata = serde_json::json!({
+            "chatId": "invalid-chat",
+            "files": [{"blobSha256": "invalid-hash"}]
+        })
+        .to_string();
+
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
+                id, operation_type, state, metadata_json, created_at, updated_at
+             ) VALUES ('invalid-import-test', 'import_batch', 'FAILED', ?1, 1, 1)",
+                [metadata],
+            )
+            .unwrap();
+
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0)
+            .expect("invalid import journal should not prevent startup");
+
+        let (state, error): (String, Option<String>) = recovered.connection().query_row(
+            "SELECT state, error_message FROM storage_operations WHERE id = 'invalid-import-test'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(state, "FAILED");
+        assert!(
+            error.unwrap_or_default().contains("invalid SHA-256"),
+            "invalid journal should retain a diagnostic error"
+        );
+    }
+    #[test]
+    fn startup_recovers_blob_completed_before_parent_import_metadata_update() {
+        let (directory, mut storage) = storage();
+
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
+                    id, operation_type, state, metadata_json, created_at, updated_at
+                 ) VALUES (
+                    'import-crash-window-test',
+                    'import_batch',
+                    'PROCESSING',
+                    ?1,
+                    1,
+                    1
+                 )",
+                [serde_json::json!({
+                    "chatId": "crash-window-chat",
+                    "files": []
+                })
+                .to_string()],
+            )
+            .unwrap();
+
+        // Simulate a child blob that completed successfully, followed by
+        // a crash before the parent import journal recorded its SHA.
+        let blob = storage
+            .store_blob_with_parent(
+                Cursor::new(b"completed child before parent update".to_vec()),
+                1024 * 1024,
+                Some("import-crash-window-test"),
+            )
+            .unwrap();
+
+        let child_id: String = storage
+            .connection()
+            .query_row(
+                "SELECT id FROM storage_operations
+                 WHERE operation_type = 'store_blob'
+                   AND metadata_json IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(storage.root_dir().join(&blob.relative_path).exists());
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0)
+            .expect("startup should recover the interrupted import");
+
+        let blob_exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(!blob_exists, "orphan blob metadata should be removed");
+        assert!(
+            !recovered.root_dir().join(&blob.relative_path).exists(),
+            "orphan physical blob should be removed"
+        );
+
+        let parent_state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations
+                 WHERE id = 'import-crash-window-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let child_state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations WHERE id = ?1",
+                [&child_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(parent_state, "COMPLETED");
+        assert_eq!(child_state, "COMPLETED");
+    }
 }

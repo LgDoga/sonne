@@ -1,4 +1,4 @@
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -526,9 +526,9 @@ impl Storage {
             let mut statement = transaction
                 .prepare(
                     "SELECT DISTINCT v.id, v.attachment_id, v.blob_sha256
-                     FROM attachment_references r
-                     JOIN attachment_versions v ON v.id = r.attachment_version_id
-                     WHERE r.chat_id = ?1",
+                 FROM attachment_references r
+                 JOIN attachment_versions v ON v.id = r.attachment_version_id
+                 WHERE r.chat_id = ?1",
                 )
                 .map_err(|error| format!("Cannot prepare chat attachment cleanup: {error}"))?;
 
@@ -557,16 +557,22 @@ impl Storage {
             return Ok(false);
         }
 
-        let mut candidate_blobs = Vec::new();
-        for (version_id, attachment_id, blob_sha256) in affected {
+        let mut candidate_blobs = affected
+            .iter()
+            .map(|(_, _, sha256)| sha256.clone())
+            .collect::<Vec<_>>();
+        candidate_blobs.sort();
+        candidate_blobs.dedup();
+
+        for (version_id, attachment_id, _) in affected {
             transaction
                 .execute(
                     "DELETE FROM attachment_versions
-                     WHERE id = ?1
-                       AND NOT EXISTS (
-                           SELECT 1 FROM attachment_references
-                           WHERE attachment_version_id = ?1
-                       )",
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attachment_references
+                       WHERE attachment_version_id = ?1
+                   )",
                     params![version_id],
                 )
                 .map_err(|error| format!("Cannot remove orphaned attachment version: {error}"))?;
@@ -574,26 +580,91 @@ impl Storage {
             transaction
                 .execute(
                     "DELETE FROM attachments
-                     WHERE id = ?1
-                       AND NOT EXISTS (
-                           SELECT 1 FROM attachment_versions
-                           WHERE attachment_id = ?1
-                       )",
+                 WHERE id = ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM attachment_versions
+                       WHERE attachment_id = ?1
+                   )",
                     params![attachment_id],
                 )
                 .map_err(|error| format!("Cannot remove empty attachment: {error}"))?;
+        }
 
-            candidate_blobs.push(blob_sha256);
+        let timestamp = now_timestamp()?;
+        let mut pending_deletions = Vec::new();
+
+        for sha256 in candidate_blobs {
+            let relative_path: Option<String> = transaction
+                .query_row(
+                    "SELECT relative_path FROM blobs
+                 WHERE sha256 = ?1
+                   AND NOT EXISTS (SELECT 1 FROM attachment_versions WHERE blob_sha256 = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM document_assets WHERE blob_sha256 = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM archive_entries WHERE blob_sha256 = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1)",
+                    params![sha256],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("Cannot resolve unreferenced chat blob: {error}"))?;
+
+            let Some(relative_path) = relative_path else {
+                continue;
+            };
+
+            let operation_id = Uuid::new_v4().to_string();
+
+            transaction
+                .execute(
+                    "INSERT INTO storage_operations (
+                    id, operation_type, blob_sha256, target_path,
+                    state, created_at, updated_at
+                 ) VALUES (?1, 'delete_blob', ?2, ?3, 'PENDING', ?4, ?4)",
+                    params![operation_id, sha256, relative_path, timestamp],
+                )
+                .map_err(|error| format!("Cannot journal chat blob deletion: {error}"))?;
+
+            let removed = transaction
+                .execute(
+                    "DELETE FROM blobs
+                 WHERE sha256 = ?1
+                   AND NOT EXISTS (SELECT 1 FROM attachment_versions WHERE blob_sha256 = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM document_assets WHERE blob_sha256 = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM archive_entries WHERE blob_sha256 = ?1)
+                   AND NOT EXISTS (SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1)",
+                    params![sha256],
+                )
+                .map_err(|error| format!("Cannot remove chat blob metadata: {error}"))?;
+
+            if removed == 1 {
+                pending_deletions.push((operation_id, relative_path));
+            } else {
+                transaction
+                    .execute(
+                        "UPDATE storage_operations
+                     SET state = 'COMPLETED', updated_at = ?1
+                     WHERE id = ?2",
+                        params![timestamp, operation_id],
+                    )
+                    .map_err(|error| format!("Cannot close unused deletion journal: {error}"))?;
+            }
         }
 
         transaction
             .commit()
             .map_err(|error| format!("Cannot commit chat deletion: {error}"))?;
 
-        candidate_blobs.sort();
-        candidate_blobs.dedup();
-        for sha256 in candidate_blobs {
-            self.delete_unreferenced_blob(&sha256)?;
+        for (operation_id, relative_path) in pending_deletions {
+            super::blobs::remove_recovered_blob_file(&self.root_dir, &relative_path)?;
+
+            self.connection
+                .execute(
+                    "UPDATE storage_operations
+                 SET state = 'COMPLETED', error_message = NULL, updated_at = ?1
+                 WHERE id = ?2 AND state = 'PENDING'",
+                    params![now_timestamp()?, operation_id],
+                )
+                .map_err(|error| format!("Cannot complete chat blob deletion journal: {error}"))?;
         }
 
         Ok(true)

@@ -13,8 +13,8 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::{
-    AttachmentReferenceRecord, MAX_FILE_SIZE_BYTES, MAX_IMPORT_BATCH_SIZE_BYTES, MAX_IMPORT_FILES,
-    Storage,
+    AttachmentReferenceRecord, Storage, MAX_FILE_SIZE_BYTES, MAX_IMPORT_BATCH_SIZE_BYTES,
+    MAX_IMPORT_FILES,
 };
 
 fn now_timestamp() -> Result<i64, String> {
@@ -202,7 +202,8 @@ impl Storage {
                 let remaining_batch_size =
                     MAX_IMPORT_BATCH_SIZE_BYTES.saturating_sub(imported_size);
                 let effective_limit = MAX_FILE_SIZE_BYTES.min(remaining_batch_size);
-                let blob = self.store_blob_with_limit(file, effective_limit)?;
+                let blob =
+                    self.store_blob_with_parent(file, effective_limit, Some(&operation_id))?;
 
                 imported_size = imported_size
                     .checked_add(
@@ -327,7 +328,10 @@ impl Storage {
 
             for item in &prepared {
                 if let Err(cleanup_error) = self.delete_unreferenced_blob(&item.blob_sha256) {
-                    eprintln!("Failed to clean up import blob {}: {}", item.blob_sha256, cleanup_error);
+                    eprintln!(
+                        "Failed to clean up import blob {}: {}",
+                        item.blob_sha256, cleanup_error
+                    );
                 }
             }
 
@@ -343,7 +347,10 @@ impl Storage {
             );
             for item in &prepared {
                 if let Err(cleanup_error) = self.delete_unreferenced_blob(&item.blob_sha256) {
-                    eprintln!("Failed to clean up import blob {}: {}", item.blob_sha256, cleanup_error);
+                    eprintln!(
+                        "Failed to clean up import blob {}: {}",
+                        item.blob_sha256, cleanup_error
+                    );
                 }
             }
             return Err(message);
