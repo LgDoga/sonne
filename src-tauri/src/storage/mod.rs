@@ -1,7 +1,7 @@
 pub mod archive;
 
-pub mod reconciliation;
 pub mod processing;
+pub mod reconciliation;
 mod schema;
 
 use std::{
@@ -13,7 +13,7 @@ use std::{
 use rusqlite::{Connection, OpenFlags};
 use schema::{
     INITIAL_SCHEMA, MIGRATION_1_TO_2, MIGRATION_2_TO_3, MIGRATION_3_TO_4, MIGRATION_4_TO_5,
-    SCHEMA_VERSION,
+    MIGRATION_5_TO_6, SCHEMA_VERSION,
 };
 
 pub(super) const MAX_FILE_SIZE_BYTES: u64 = 512 * 1024 * 1024;
@@ -182,10 +182,15 @@ impl Storage {
                             format!("Cannot migrate database schema 4 to 5: {error}")
                         })?;
                 }
+                5 => {}
                 version => {
                     return Err(format!("No migration path from database version {version}"));
                 }
             }
+
+            transaction
+                .execute_batch(MIGRATION_5_TO_6)
+                .map_err(|error| format!("Cannot migrate database schema 5 to 6: {error}"))?;
 
             transaction
                 .pragma_update(None, "user_version", SCHEMA_VERSION)

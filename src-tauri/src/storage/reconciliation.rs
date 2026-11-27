@@ -297,27 +297,26 @@ pub fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    use std::{fs, path::PathBuf};
 
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
         fn new() -> Self {
-            let nonce = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-
             let path = std::env::temp_dir().join(format!(
-                "sonne-reconciliation-{}-{nonce}",
-                std::process::id()
+                "sonne-reconciliation-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
             ));
-
-            fs::create_dir_all(&path).unwrap();
+            fs::create_dir(&path).unwrap_or_else(|error| {
+                panic!(
+                    "Cannot create test directory {}: {error}",
+                    path.display()
+                )
+            });
             Self(path)
         }
     }
-
     impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);

@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
@@ -22,6 +22,7 @@ const MAX_CONTEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DOCUMENT_ASSETS: usize = 1_000;
 const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DOCUMENT_ASSET_BYTES: usize = 64 * 1024 * 1024;
+const PROCESSING_LEASE_MS: i64 = 120_000;
 
 fn now_timestamp() -> Result<i64, String> {
     let duration = SystemTime::now()
@@ -139,18 +140,140 @@ fn query_status(
         })
 }
 
+fn claim_document_processing(
+    connection: &Connection,
+    document_id: &str,
+    sha256: &str,
+    extractor: &str,
+    extractor_version: &str,
+    source_size: i64,
+    processing_token: &str,
+    timestamp: i64,
+) -> Result<bool, String> {
+    let lease_cutoff = timestamp.saturating_sub(PROCESSING_LEASE_MS);
+
+    connection
+        .execute(
+            "INSERT INTO extracted_documents (
+                id, blob_sha256, extractor, extractor_version, status,
+                created_at, updated_at, source_size, processing_token
+             ) VALUES (?1, ?2, ?3, ?4, 'processing', ?5, ?5, ?6, ?7)
+             ON CONFLICT(blob_sha256, extractor, extractor_version)
+             DO UPDATE SET
+                status = 'processing',
+                error_code = NULL,
+                error_message = NULL,
+                updated_at = excluded.updated_at,
+                source_size = excluded.source_size,
+                processing_token = excluded.processing_token
+             WHERE extracted_documents.status <> 'completed'
+               AND (
+                    extracted_documents.status <> 'processing'
+                    OR extracted_documents.processing_token IS NULL
+                    OR extracted_documents.updated_at <= ?8
+               )",
+            params![
+                document_id,
+                sha256,
+                extractor,
+                extractor_version,
+                timestamp,
+                source_size,
+                processing_token,
+                lease_cutoff
+            ],
+        )
+        .map(|changed| changed == 1)
+        .map_err(|error| format!("Cannot claim document processing: {error}"))
+}
+
+fn validate_document_access(
+    connection: &Connection,
+    document_id: &str,
+    processing_token: Option<&str>,
+) -> Result<String, String> {
+    let state: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT status, processing_token
+             FROM extracted_documents
+             WHERE id = ?1",
+            [document_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("Cannot validate document processing owner: {error}"))?;
+
+    match state {
+        Some((status, None)) if status == "completed" && processing_token.is_none() => Ok(status),
+        Some((status, Some(owner)))
+            if status == "processing" && processing_token == Some(owner.as_str()) =>
+        {
+            Ok(status)
+        }
+        Some(_) => Err("Document processing claim is no longer active".into()),
+        None => Err("Document does not exist".into()),
+    }
+}
+
+fn find_processing_document(
+    connection: &Connection,
+    sha256: &str,
+    extractor: &str,
+    extractor_version: &str,
+    processing_token: &str,
+) -> Result<String, String> {
+    connection
+        .query_row(
+            "SELECT id FROM extracted_documents
+             WHERE blob_sha256 = ?1
+               AND extractor = ?2
+               AND extractor_version = ?3
+               AND status = 'processing'
+               AND processing_token = ?4",
+            params![sha256, extractor, extractor_version, processing_token],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("Cannot resolve owned processing document: {error}"))?
+        .ok_or_else(|| "Document processing claim is no longer active".into())
+}
+
+fn renew_document_claim(
+    connection: &Connection,
+    document_id: &str,
+    processing_token: &str,
+    timestamp: i64,
+) -> Result<bool, String> {
+    connection
+        .execute(
+            "UPDATE extracted_documents
+             SET updated_at = ?1
+             WHERE id = ?2
+               AND status = 'processing'
+               AND processing_token = ?3",
+            params![timestamp, document_id, processing_token],
+        )
+        .map(|changed| changed == 1)
+        .map_err(|error| format!("Cannot renew document processing claim: {error}"))
+}
+
 pub fn recover_interrupted_document_processing(
     connection: &rusqlite::Connection,
 ) -> Result<usize, String> {
+    let timestamp = now_timestamp()?;
+    let lease_cutoff = timestamp.saturating_sub(PROCESSING_LEASE_MS);
+
     connection
         .execute(
             "UPDATE extracted_documents
              SET status = 'pending',
+                 processing_token = NULL,
                  error_code = NULL,
                  error_message = NULL,
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-             WHERE status = 'processing'",
-            [],
+                 updated_at = ?1
+             WHERE status = 'processing'
+               AND updated_at <= ?2",
+            params![timestamp, lease_cutoff],
         )
         .map_err(|error| format!("Cannot recover interrupted document processing: {error}"))
 }
@@ -173,6 +296,13 @@ pub fn get_attachment_processing_status(
     query_status(&storage, &sha256, &extractor, &extractor_version)
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginAttachmentProcessingResult {
+    pub status: AttachmentProcessingStatus,
+    pub claim_token: Option<String>,
+}
+
 #[tauri::command]
 pub fn begin_attachment_processing(
     state: State<'_, Mutex<Storage>>,
@@ -180,7 +310,7 @@ pub fn begin_attachment_processing(
     reference_id: String,
     extractor: String,
     extractor_version: String,
-) -> Result<AttachmentProcessingStatus, String> {
+) -> Result<BeginAttachmentProcessingResult, String> {
     validate_extractor(&extractor, &extractor_version)?;
 
     let storage = state
@@ -190,45 +320,51 @@ pub fn begin_attachment_processing(
     let (sha256, source_size) = resolve_blob(&storage, &chat_id, &reference_id)?;
     let timestamp = now_timestamp()?;
     let document_id = Uuid::new_v4().to_string();
+    let claim_token = Uuid::new_v4().to_string();
 
-    storage
-        .connection
-        .execute(
-            "INSERT INTO extracted_documents (
-            id, blob_sha256, extractor, extractor_version, status,
-            created_at, updated_at, source_size
-         ) VALUES (?1, ?2, ?3, ?4, 'processing', ?5, ?5, ?6)
-         ON CONFLICT(blob_sha256, extractor, extractor_version)
-         DO UPDATE SET
-            status = CASE
-                WHEN extracted_documents.status = 'completed'
-                THEN 'completed'
-                ELSE 'processing'
-            END,
-            error_code = CASE
-                WHEN extracted_documents.status = 'completed'
-                THEN extracted_documents.error_code
-                ELSE NULL
-            END,
-            error_message = CASE
-                WHEN extracted_documents.status = 'completed'
-                THEN extracted_documents.error_message
-                ELSE NULL
-            END,
-            updated_at = excluded.updated_at,
-            source_size = excluded.source_size",
-            params![
-                document_id,
-                sha256,
-                extractor,
-                extractor_version,
-                timestamp,
-                source_size
-            ],
-        )
-        .map_err(|error| format!("Cannot start document processing: {error}"))?;
+    let claimed = claim_document_processing(
+        &storage.connection,
+        &document_id,
+        &sha256,
+        &extractor,
+        &extractor_version,
+        source_size,
+        &claim_token,
+        timestamp,
+    )?;
 
-    query_status(&storage, &sha256, &extractor, &extractor_version)
+    let status = query_status(&storage, &sha256, &extractor, &extractor_version)?;
+
+    Ok(BeginAttachmentProcessingResult {
+        status,
+        claim_token: claimed.then_some(claim_token),
+    })
+}
+
+#[tauri::command]
+pub fn renew_attachment_processing_claim(
+    state: State<'_, Mutex<Storage>>,
+    document_id: String,
+    processing_token: String,
+) -> Result<bool, String> {
+    if document_id.is_empty()
+        || document_id.len() > 128
+        || processing_token.is_empty()
+        || processing_token.len() > 128
+    {
+        return Err("Invalid document processing claim".into());
+    }
+
+    let storage = state
+        .lock()
+        .map_err(|error| format!("Storage lock poisoned: {error}"))?;
+
+    renew_document_claim(
+        &storage.connection,
+        &document_id,
+        &processing_token,
+        now_timestamp()?,
+    )
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -273,6 +409,7 @@ pub struct SaveExtractedDocumentInput {
     pub reference_id: String,
     pub extractor: String,
     pub extractor_version: String,
+    pub processing_token: String,
     pub detected_format: String,
     pub language: Option<String>,
     pub metadata: Option<Value>,
@@ -285,6 +422,10 @@ pub struct SaveExtractedDocumentInput {
 
 fn validate_document(input: &SaveExtractedDocumentInput) -> Result<(), String> {
     validate_extractor(&input.extractor, &input.extractor_version)?;
+
+    if input.processing_token.is_empty() || input.processing_token.len() > 128 {
+        return Err("Invalid document processing claim".into());
+    }
 
     if input.detected_format.is_empty() || input.detected_format.len() > 128 {
         return Err("Invalid detected document format".into());
@@ -485,6 +626,14 @@ pub fn save_extracted_document(
         return Err("Document source size does not match the stored attachment".into());
     }
 
+    let _owned_document_id = find_processing_document(
+        &storage.connection,
+        &sha256,
+        &input.extractor,
+        &input.extractor_version,
+        &input.processing_token,
+    )?;
+
     let timestamp = now_timestamp()?;
     let document_metadata = validate_json_size(&input.metadata, "Document metadata")?;
 
@@ -506,48 +655,43 @@ pub fn save_extracted_document(
         .transaction()
         .map_err(|error| format!("Cannot begin document transaction: {error}"))?;
 
-    let document_id = Uuid::new_v4().to_string();
+    let resolved_document_id = find_processing_document(
+        &transaction,
+        &sha256,
+        &input.extractor,
+        &input.extractor_version,
+        &input.processing_token,
+    )?;
 
-    transaction
+    let metadata_changed = transaction
         .execute(
-            "INSERT INTO extracted_documents (
-            id, blob_sha256, extractor, extractor_version, status,
-            language, created_at, updated_at, detected_format,
-            metadata_json, error_code, error_message, processed_at, source_size
-         ) VALUES (?1, ?2, ?3, ?4, 'processing', ?5, ?6, ?6, ?7, ?8, NULL, NULL, NULL, ?9)
-         ON CONFLICT(blob_sha256, extractor, extractor_version)
-         DO UPDATE SET
-            status = 'processing',
-            language = excluded.language,
-            updated_at = excluded.updated_at,
-            detected_format = excluded.detected_format,
-            metadata_json = excluded.metadata_json,
-            error_code = NULL,
-            error_message = NULL,
-            processed_at = NULL,
-            source_size = excluded.source_size",
+            "UPDATE extracted_documents
+     SET language = ?1,
+         updated_at = ?2,
+         detected_format = ?3,
+         metadata_json = ?4,
+         error_code = NULL,
+         error_message = NULL,
+         processed_at = NULL,
+         source_size = ?5
+     WHERE id = ?6
+       AND status = 'processing'
+       AND processing_token = ?7",
             params![
-                document_id,
-                sha256,
-                input.extractor,
-                input.extractor_version,
                 input.language,
                 timestamp,
                 input.detected_format,
                 document_metadata,
-                input.source_size
+                input.source_size,
+                resolved_document_id,
+                input.processing_token
             ],
         )
-        .map_err(|error| format!("Cannot prepare extracted document record: {error}"))?;
+        .map_err(|error| format!("Cannot update owned extracted document: {error}"))?;
 
-    let resolved_document_id: String = transaction
-        .query_row(
-            "SELECT id FROM extracted_documents
-         WHERE blob_sha256 = ?1 AND extractor = ?2 AND extractor_version = ?3",
-            params![sha256, input.extractor, input.extractor_version],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("Cannot resolve extracted document record: {error}"))?;
+    if metadata_changed != 1 {
+        return Err("Document processing claim is no longer active".into());
+    }
 
     transaction
         .execute(
@@ -712,17 +856,20 @@ pub fn mark_attachment_processing_failed(
     reference_id: String,
     extractor: String,
     extractor_version: String,
+    processing_token: String,
     error_code: String,
     error_message: String,
 ) -> Result<AttachmentProcessingStatus, String> {
     validate_extractor(&extractor, &extractor_version)?;
 
+    if processing_token.is_empty() || processing_token.len() > 128 {
+        return Err("Invalid document processing claim".into());
+    }
     if error_code.is_empty() || error_code.len() > 64 {
         return Err("Invalid processing error code".into());
     }
 
     let safe_message: String = error_message.chars().take(2_000).collect();
-
     let storage = state
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
@@ -730,34 +877,38 @@ pub fn mark_attachment_processing_failed(
     let (sha256, source_size) = resolve_blob(&storage, &chat_id, &reference_id)?;
     let timestamp = now_timestamp()?;
 
-    storage
+    let changed = storage
         .connection
         .execute(
-            "INSERT INTO extracted_documents (
-            id, blob_sha256, extractor, extractor_version, status,
-            created_at, updated_at, error_code, error_message,
-            processed_at, source_size
-         ) VALUES (?1, ?2, ?3, ?4, 'failed', ?5, ?5, ?6, ?7, ?5, ?8)
-         ON CONFLICT(blob_sha256, extractor, extractor_version)
-         DO UPDATE SET
-            status = 'failed',
-            error_code = excluded.error_code,
-            error_message = excluded.error_message,
-            updated_at = excluded.updated_at,
-            processed_at = excluded.processed_at,
-            source_size = excluded.source_size",
+            "UPDATE extracted_documents
+             SET status = 'failed',
+                 processing_token = NULL,
+                 error_code = ?1,
+                 error_message = ?2,
+                 updated_at = ?3,
+                 processed_at = ?3,
+                 source_size = ?4
+             WHERE blob_sha256 = ?5
+               AND extractor = ?6
+               AND extractor_version = ?7
+               AND status = 'processing'
+               AND processing_token = ?8",
             params![
-                Uuid::new_v4().to_string(),
+                error_code,
+                safe_message,
+                timestamp,
+                source_size,
                 sha256,
                 extractor,
                 extractor_version,
-                timestamp,
-                error_code,
-                safe_message,
-                source_size
+                processing_token
             ],
         )
         .map_err(|error| format!("Cannot save document processing failure: {error}"))?;
+
+    if changed != 1 {
+        return Err("Document processing claim is no longer active".into());
+    }
 
     query_status(&storage, &sha256, &extractor, &extractor_version)
 }
@@ -1466,6 +1617,7 @@ pub struct DocumentEmbeddingInput {
 pub fn get_document_embedding_batch(
     state: State<'_, Mutex<Storage>>,
     document_id: String,
+    processing_token: Option<String>,
     limit: Option<usize>,
 ) -> Result<Vec<DocumentEmbeddingChunk>, String> {
     if document_id.is_empty() || document_id.len() > 128 {
@@ -1476,6 +1628,12 @@ pub fn get_document_embedding_batch(
     let storage = state
         .lock()
         .map_err(|_| "Storage lock is poisoned".to_string())?;
+
+    validate_document_access(
+        &storage.connection,
+        &document_id,
+        processing_token.as_deref(),
+    )?;
 
     let mut statement = storage
         .connection
@@ -1513,6 +1671,7 @@ pub fn get_document_embedding_batch(
 pub fn save_document_embedding_batch(
     state: State<'_, Mutex<Storage>>,
     document_id: String,
+    processing_token: Option<String>,
     embeddings: Vec<DocumentEmbeddingInput>,
 ) -> Result<usize, String> {
     if document_id.is_empty() || document_id.len() > 128 {
@@ -1554,6 +1713,8 @@ pub fn save_document_embedding_batch(
         .connection
         .transaction()
         .map_err(|error| format!("Cannot begin embedding transaction: {error}"))?;
+
+    validate_document_access(&transaction, &document_id, processing_token.as_deref())?;
 
     let document_exists: bool = transaction
         .query_row(
@@ -1629,6 +1790,7 @@ pub fn save_document_embedding_batch(
 pub fn finalize_document_embedding_index(
     state: State<'_, Mutex<Storage>>,
     document_id: String,
+    processing_token: Option<String>,
 ) -> Result<(), String> {
     if document_id.is_empty() || document_id.len() > 128 {
         return Err("Invalid document ID".into());
@@ -1643,6 +1805,15 @@ pub fn finalize_document_embedding_index(
         .connection
         .transaction()
         .map_err(|error| format!("Cannot begin embedding finalization: {error}"))?;
+
+    let document_status =
+        validate_document_access(&transaction, &document_id, processing_token.as_deref())?;
+    if document_status == "completed" {
+        transaction
+            .commit()
+            .map_err(|error| format!("Cannot finish idempotent document finalization: {error}"))?;
+        return Ok(());
+    }
 
     let counts: (i64, i64, i64) = transaction
         .query_row(
@@ -1673,12 +1844,15 @@ pub fn finalize_document_embedding_index(
         .execute(
             "UPDATE extracted_documents
          SET status = 'completed',
+             processing_token = NULL,
              updated_at = ?1,
              processed_at = ?1,
              error_code = NULL,
              error_message = NULL
-         WHERE id = ?2",
-            params![timestamp, document_id],
+         WHERE id = ?2
+           AND status = 'processing'
+           AND processing_token = ?3",
+            params![timestamp, document_id, processing_token],
         )
         .map_err(|error| format!("Cannot finalize document processing: {error}"))?;
 
@@ -2097,4 +2271,278 @@ pub fn get_document_summary(
         )
         .optional()
         .map_err(|error| format!("Cannot read document summary: {error}"))
+}
+
+#[cfg(test)]
+mod processing_claim_tests {
+    use super::{
+        claim_document_processing, now_timestamp, recover_interrupted_document_processing,
+        renew_document_claim, validate_document_access, PROCESSING_LEASE_MS,
+    };
+    use rusqlite::Connection;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+        time::Duration,
+    };
+    use uuid::Uuid;
+
+    fn connection() -> Connection {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE extracted_documents (
+                    id TEXT PRIMARY KEY,
+                    blob_sha256 TEXT NOT NULL,
+                    extractor TEXT NOT NULL,
+                    extractor_version TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    source_size INTEGER NOT NULL,
+                    processing_token TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    UNIQUE(blob_sha256, extractor, extractor_version)
+                );",
+            )
+            .unwrap();
+        connection
+    }
+
+    fn claim(connection: &Connection, id: &str, token: &str, timestamp: i64) -> bool {
+        claim_document_processing(
+            connection,
+            id,
+            "aabbcc",
+            "sonne-unified",
+            "v1",
+            42,
+            token,
+            timestamp,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn simultaneous_claims_across_independent_connections_have_one_winner() {
+        let directory =
+            std::env::temp_dir().join(format!("sonne-processing-claim-{}", Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let database_path = directory.join("claims.sqlite");
+
+        let setup = Connection::open(&database_path).unwrap();
+        setup
+            .execute_batch(
+                "CREATE TABLE extracted_documents (
+                    id TEXT PRIMARY KEY,
+                    blob_sha256 TEXT NOT NULL,
+                    extractor TEXT NOT NULL,
+                    extractor_version TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    source_size INTEGER NOT NULL,
+                    processing_token TEXT,
+                    error_code TEXT,
+                    error_message TEXT,
+                    UNIQUE(blob_sha256, extractor, extractor_version)
+                );",
+            )
+            .unwrap();
+        drop(setup);
+
+        let first_connection = Connection::open(&database_path).unwrap();
+        first_connection
+            .busy_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let second_connection = Connection::open(&database_path).unwrap();
+        second_connection
+            .busy_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+
+        let first_barrier = Arc::clone(&barrier);
+        let first_thread = thread::spawn(move || {
+            first_barrier.wait();
+            claim(&first_connection, "doc-1", "owner-1", 1_000)
+        });
+
+        let second_barrier = Arc::clone(&barrier);
+        let second_thread = thread::spawn(move || {
+            second_barrier.wait();
+            claim(&second_connection, "doc-2", "owner-2", 1_000)
+        });
+
+        // Release both independent SQLite connections at the same time.
+        barrier.wait();
+
+        let first_won = first_thread.join().unwrap();
+        let second_won = second_thread.join().unwrap();
+
+        assert_ne!(
+            first_won, second_won,
+            "exactly one simultaneous processing claim must succeed"
+        );
+
+        let verification = Connection::open(&database_path).unwrap();
+        let (stored_id, stored_token): (String, String) = verification
+            .query_row(
+                "SELECT id, processing_token FROM extracted_documents",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        if first_won {
+            assert_eq!(stored_id, "doc-1");
+            assert_eq!(stored_token, "owner-1");
+        } else {
+            assert_eq!(stored_id, "doc-2");
+            assert_eq!(stored_token, "owner-2");
+        }
+
+        drop(verification);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn only_one_active_owner_can_claim_a_document() {
+        let connection = connection();
+
+        assert!(claim(&connection, "doc-1", "owner-1", 1_000));
+        assert!(!claim(&connection, "doc-2", "owner-2", 1_001));
+
+        assert_eq!(
+            validate_document_access(&connection, "doc-1", Some("owner-1")).unwrap(),
+            "processing"
+        );
+        assert!(validate_document_access(&connection, "doc-1", Some("owner-2")).is_err());
+    }
+
+    #[test]
+    fn expired_claim_can_be_reclaimed_and_old_owner_is_rejected() {
+        let connection = connection();
+
+        assert!(claim(&connection, "doc-1", "owner-1", 1_000));
+        assert!(claim(
+            &connection,
+            "doc-2",
+            "owner-2",
+            1_000 + PROCESSING_LEASE_MS + 1
+        ));
+
+        assert!(validate_document_access(&connection, "doc-1", Some("owner-1")).is_err());
+        assert_eq!(
+            validate_document_access(&connection, "doc-1", Some("owner-2")).unwrap(),
+            "processing"
+        );
+    }
+
+    #[test]
+    fn heartbeat_renews_only_the_current_owner_lease() {
+        let connection = connection();
+        assert!(claim(&connection, "doc-1", "owner-1", 1_000));
+
+        assert!(!renew_document_claim(&connection, "doc-1", "wrong-owner", 2_000).unwrap());
+        assert!(renew_document_claim(&connection, "doc-1", "owner-1", 2_000).unwrap());
+
+        assert!(!claim(
+            &connection,
+            "doc-2",
+            "owner-2",
+            1_000 + PROCESSING_LEASE_MS + 1
+        ));
+    }
+
+    #[test]
+    fn startup_recovery_preserves_active_claim_and_resets_expired_claim() {
+        let connection = connection();
+        let now = now_timestamp().unwrap();
+
+        assert!(claim(&connection, "doc-active", "active-owner", now));
+
+        let expired_timestamp = now.saturating_sub(PROCESSING_LEASE_MS).saturating_sub(1);
+
+        connection
+            .execute(
+                "INSERT INTO extracted_documents (
+                    id, blob_sha256, extractor, extractor_version, status,
+                    created_at, updated_at, source_size, processing_token
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, 'processing', ?5, ?5, ?6, ?7
+                )",
+                rusqlite::params![
+                    "doc-stale",
+                    "ddeeff",
+                    "sonne-unified",
+                    "v1",
+                    expired_timestamp,
+                    42,
+                    "stale-owner"
+                ],
+            )
+            .unwrap();
+
+        let recovered = recover_interrupted_document_processing(&connection).unwrap();
+        assert_eq!(recovered, 1);
+
+        let (active_status, active_token): (String, Option<String>) = connection
+            .query_row(
+                "SELECT status, processing_token
+                 FROM extracted_documents WHERE id = 'doc-active'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(active_status, "processing");
+        assert_eq!(active_token.as_deref(), Some("active-owner"));
+        assert_eq!(
+            validate_document_access(&connection, "doc-active", Some("active-owner")).unwrap(),
+            "processing"
+        );
+
+        let (stale_status, stale_token): (String, Option<String>) = connection
+            .query_row(
+                "SELECT status, processing_token
+                 FROM extracted_documents WHERE id = 'doc-stale'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(stale_status, "pending");
+        assert!(stale_token.is_none());
+        assert!(validate_document_access(&connection, "doc-stale", Some("stale-owner")).is_err());
+    }
+
+    #[test]
+    fn completed_document_cannot_be_claimed_again() {
+        let connection = connection();
+        assert!(claim(&connection, "doc-1", "owner-1", 1_000));
+
+        connection
+            .execute(
+                "UPDATE extracted_documents
+                 SET status = 'completed', processing_token = NULL
+                 WHERE id = 'doc-1'",
+                [],
+            )
+            .unwrap();
+
+        assert!(!claim(
+            &connection,
+            "doc-2",
+            "owner-2",
+            1_000 + PROCESSING_LEASE_MS + 10_000
+        ));
+
+        assert_eq!(
+            validate_document_access(&connection, "doc-1", None).unwrap(),
+            "completed"
+        );
+    }
 }

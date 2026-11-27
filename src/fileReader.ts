@@ -1028,6 +1028,7 @@ export async function processStoredAttachment(
 ): Promise<{ status: "completed" | "skipped"; documentId?: string }> {
   const onProgress = attachment.onProgress;
   onProgress?.("Витягування тексту, структури та зображень…");
+
   if (isArchiveName(attachment.fileName)) {
     return { status: "skipped" };
   }
@@ -1040,7 +1041,57 @@ export async function processStoredAttachment(
   };
 
   let documentId: string | null = null;
+  let processingToken: string | null = null;
   let stage: "extraction" | "embedding" = "extraction";
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let heartbeatInFlight = false;
+  let claimLost = false;
+
+  const renewClaim = async (): Promise<void> => {
+    if (!processingToken) return;
+
+    if (!documentId || claimLost) {
+      throw new Error("Обробка документа більше не має активного права запису.");
+    }
+
+    const renewed = await invoke<boolean>(
+      "renew_attachment_processing_claim",
+      { documentId, processingToken },
+    );
+
+    if (!renewed) {
+      claimLost = true;
+      throw new Error(
+        "Часове право обробки документа втрачено. Повторіть обробку.",
+      );
+    }
+  };
+
+  const startHeartbeat = (): void => {
+    if (!documentId || !processingToken) return;
+
+    heartbeatTimer = setInterval(() => {
+      if (heartbeatInFlight || claimLost || !documentId || !processingToken) {
+        return;
+      }
+
+      heartbeatInFlight = true;
+
+      void invoke<boolean>("renew_attachment_processing_claim", {
+        documentId,
+        processingToken,
+      })
+        .then((renewed) => {
+          if (!renewed) claimLost = true;
+        })
+        .catch((error: unknown) => {
+          console.warn("Не вдалося оновити lease обробки документа:", error);
+        })
+        .finally(() => {
+          heartbeatInFlight = false;
+        });
+    }, 30_000);
+  };
 
   try {
     const existing = await invoke<{
@@ -1048,28 +1099,63 @@ export async function processStoredAttachment(
       status: string | null;
     }>("get_attachment_processing_status", statusArgs);
 
-    documentId =
-      existing.status === "completed" ? existing.documentId : null;
+    let documentCompleted =
+      existing.status === "completed" && Boolean(existing.documentId);
+    documentId = documentCompleted ? existing.documentId : null;
 
     if (!documentId) {
       const started = await invoke<{
-        documentId: string | null;
-        status: string | null;
+        status: {
+          documentId: string | null;
+          status: string | null;
+        };
+        claimToken: string | null;
       }>("begin_attachment_processing", statusArgs);
 
-      documentId =
-        started.status === "completed" ? started.documentId : null;
+      documentId = started.status.documentId;
+      processingToken = started.claimToken;
+      documentCompleted = started.status.status === "completed";
+
+      if (!documentCompleted && !processingToken) {
+        if (started.status.status === "processing") {
+          throw new Error(
+            "Цей документ уже обробляється іншим процесом. Повторіть спробу пізніше.",
+          );
+        }
+
+        throw new Error("Не вдалося отримати право на обробку документа.");
+      }
     }
 
     if (!documentId) {
+      throw new Error("Не вдалося отримати ID документа.");
+    }
+
+    startHeartbeat();
+
+    if (!documentCompleted) {
+      if (!processingToken) {
+        throw new Error("Не вдалося підтвердити право на обробку документа.");
+      }
+
+      await renewClaim();
+
       const file = await loadStoredAttachment(attachment);
       const extracted = await extractStoredFile(file);
-      const visionAssets = await addBackgroundVisionDescriptions(extracted.assets, onProgress);
+      const visionAssets = await addBackgroundVisionDescriptions(
+        extracted.assets,
+        onProgress,
+      );
+
+      await renewClaim();
+
       onProgress?.("Підготовка пошукових фрагментів…");
+
       const chunks = [
         ...splitIntoChunks(extracted.content),
         ...createAssetIndexChunks(visionAssets),
       ];
+
       if (!chunks.length) {
         throw new Error("Не вдалося отримати текстові фрагменти документа.");
       }
@@ -1078,11 +1164,14 @@ export async function processStoredAttachment(
         throw new Error("Документ перевищує ліміт у 50000 фрагментів.");
       }
 
+      await renewClaim();
+
       const saved = await invoke<{ documentId: string }>(
         "save_extracted_document",
         {
           input: {
             ...statusArgs,
+            processingToken,
             detectedFormat: extensionOf(attachment.fileName),
             language: "eng+ukr",
             metadata: {
@@ -1106,15 +1195,20 @@ export async function processStoredAttachment(
       throw new Error("Не вдалося отримати ID документа.");
     }
 
+    const claimArgs = processingToken ? { processingToken } : {};
+
     stage = "embedding";
     onProgress?.("Створення локального пошукового індексу…");
 
     while (true) {
+      await renewClaim();
+
       const batch = await invoke<
         Array<{ chunkId: string; content: string }>
       >("get_document_embedding_batch", {
         documentId,
         limit: 32,
+        ...claimArgs,
       });
 
       if (batch.length === 0) break;
@@ -1135,8 +1229,11 @@ export async function processStoredAttachment(
         throw new Error("Некоректна відповідь embedding-моделі.");
       }
 
+      await renewClaim();
+
       await invoke("save_document_embedding_batch", {
         documentId,
+        ...claimArgs,
         embeddings: batch.map((chunk, index) => ({
           chunkId: chunk.chunkId,
           vector: vectors[index],
@@ -1144,25 +1241,37 @@ export async function processStoredAttachment(
       });
     }
 
-    await invoke("finalize_document_embedding_index", { documentId });
-    onProgress?.("Обробку завершено.");
+    await renewClaim();
 
+    await invoke("finalize_document_embedding_index", {
+      documentId,
+      ...claimArgs,
+    });
+
+    onProgress?.("Обробку завершено.");
     return { status: "completed", documentId };
   } catch (error) {
     const message =
       error instanceof Error ? error.message : String(error);
 
-    try {
-      await invoke("mark_attachment_processing_failed", {
-        ...statusArgs,
-        errorCode:
-          stage === "embedding" ? "embedding_failed" : "extraction_failed",
-        errorMessage: message,
-      });
-    } catch {
-      // Preserve the original processing error.
+    if (processingToken) {
+      try {
+        await invoke("mark_attachment_processing_failed", {
+          ...statusArgs,
+          processingToken,
+          errorCode:
+            stage === "embedding" ? "embedding_failed" : "extraction_failed",
+          errorMessage: message,
+        });
+      } catch {
+        // Preserve the original processing error.
+      }
     }
 
     throw error;
+  } finally {
+    if (heartbeatTimer !== null) {
+      clearInterval(heartbeatTimer);
+    }
   }
 }

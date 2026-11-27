@@ -1,4 +1,4 @@
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 pub const INITIAL_SCHEMA: &str = r#"
 PRAGMA foreign_keys = ON;
@@ -370,3 +370,48 @@ ON storage_operations(state, updated_at);
 
 UPDATE storage_metadata SET value = '5' WHERE key = 'schema_version';
 "#;
+
+pub const MIGRATION_5_TO_6: &str = r#"
+ALTER TABLE extracted_documents ADD COLUMN processing_token TEXT;
+UPDATE storage_metadata SET value = '6' WHERE key = 'schema_version';
+"#;
+
+#[cfg(test)]
+mod migration_tests {
+    use super::MIGRATION_5_TO_6;
+    use rusqlite::Connection;
+
+    #[test]
+    fn migration_5_to_6_adds_processing_token() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE extracted_documents (id TEXT PRIMARY KEY);
+                 CREATE TABLE storage_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO storage_metadata(key, value) VALUES ('schema_version', '5');",
+            )
+            .unwrap();
+
+        connection.execute_batch(MIGRATION_5_TO_6).unwrap();
+
+        let columns = connection
+            .prepare("PRAGMA table_info(extracted_documents)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(columns.iter().any(|column| column == "processing_token"));
+
+        let version: String = connection
+            .query_row(
+                "SELECT value FROM storage_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(version, "6");
+    }
+}

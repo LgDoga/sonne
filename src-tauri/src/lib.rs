@@ -85,6 +85,7 @@ pub fn run() {
             storage::archive::read_archive_entry_chunk,
             storage::processing::get_attachment_processing_status,
             storage::processing::begin_attachment_processing,
+            storage::processing::renew_attachment_processing_claim,
             storage::processing::save_extracted_document,
             storage::processing::mark_attachment_processing_failed,
             storage::processing::get_attachment_document_context,
