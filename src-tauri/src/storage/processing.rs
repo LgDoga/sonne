@@ -4022,6 +4022,71 @@ mod attachment_search_scope_tests {
                 .iter()
                 .all(|result| result.content.contains("current message only"))
         );
+
+        // The exact original message/reference/version is accepted for an
+        // explicitly resolved historical file, while an identity from another
+        // chat remains rejected by the same resolver.
+        let historical_blob = resolve_message_blob(
+            &storage,
+            "chat-a",
+            "message-old",
+            "reference-old",
+            "version-old",
+            1,
+        )
+        .expect("the exact earlier user message attachment must resolve");
+        assert_eq!(historical_blob.0, "a".repeat(64));
+        assert!(
+            resolve_message_blob(
+                &storage,
+                "chat-a",
+                "message-other-chat",
+                "reference-other",
+                "version-other",
+                1,
+            )
+            .is_err(),
+            "a reference from another chat must remain inaccessible"
+        );
+
+        let historical_results = search_attachment_documents_with_connection(
+            connection,
+            "chat-a",
+            Some("message-old"),
+            None,
+            None,
+            None,
+            "sonne-unified",
+            "scope-test-v1",
+            "needle",
+            &vector,
+            10,
+        )
+        .expect("an explicitly resolved historical message must be searchable");
+        assert!(!historical_results.is_empty());
+        assert!(historical_results.iter().all(|result| {
+            result.reference_id == "reference-old"
+                && result.attachment_version_id == "version-old"
+                && result.content.contains("older message")
+        }));
+
+        let cross_chat_result = search_attachment_documents_with_connection(
+            connection,
+            "chat-a",
+            Some("message-other-chat"),
+            None,
+            None,
+            None,
+            "sonne-unified",
+            "scope-test-v1",
+            "needle",
+            &vector,
+            10,
+        );
+        assert!(
+            cross_chat_result.is_err(),
+            "a historical message from another chat must remain inaccessible"
+        );
     }
 
     #[test]
