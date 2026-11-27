@@ -70,7 +70,18 @@ fn resolve_blob(
     storage: &Storage,
     chat_id: &str,
     reference_id: &str,
+    attachment_version_id: &str,
+    version_number: i64,
 ) -> Result<(String, i64), String> {
+    if reference_id.is_empty()
+        || reference_id.len() > 128
+        || attachment_version_id.is_empty()
+        || attachment_version_id.len() > 128
+        || version_number < 1
+    {
+        return Err("Invalid attachment reference/version identity".into());
+    }
+
     storage
         .connection
         .query_row(
@@ -78,13 +89,64 @@ fn resolve_blob(
              FROM attachment_references r
              JOIN attachment_versions v ON v.id = r.attachment_version_id
              JOIN blobs b ON b.sha256 = v.blob_sha256
-             WHERE r.id = ?1 AND r.chat_id = ?2",
-            params![reference_id, chat_id],
+             WHERE r.id = ?1
+               AND r.chat_id = ?2
+               AND v.id = ?3
+               AND v.version_number = ?4",
+            params![reference_id, chat_id, attachment_version_id, version_number],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map_err(|error| format!("Cannot resolve attachment for processing: {error}"))?
-        .ok_or_else(|| "Attachment does not belong to the specified chat".into())
+        .map_err(|error| format!("Cannot resolve exact attachment version: {error}"))?
+        .ok_or_else(|| "Attachment reference does not match the specified chat and version".into())
+}
+
+fn resolve_message_blob(
+    storage: &Storage,
+    chat_id: &str,
+    message_id: &str,
+    reference_id: &str,
+    attachment_version_id: &str,
+    version_number: i64,
+) -> Result<(String, i64), String> {
+    if message_id.is_empty() || message_id.len() > 128 {
+        return Err("Invalid message identity for attachment access".into());
+    }
+
+    let resolved = resolve_blob(
+        storage,
+        chat_id,
+        reference_id,
+        attachment_version_id,
+        version_number,
+    )?;
+
+    let belongs_to_message: bool = storage
+        .connection
+        .query_row(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM attachment_references r
+                JOIN messages m
+                  ON m.id = r.message_id
+                 AND m.chat_id = r.chat_id
+                WHERE r.id = ?1
+                  AND r.chat_id = ?2
+                  AND r.attachment_version_id = ?3
+                  AND r.message_id = ?4
+                  AND r.purpose = 'message'
+                  AND m.role = 'user'
+            )",
+            params![reference_id, chat_id, attachment_version_id, message_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Cannot validate message attachment ownership: {error}"))?;
+
+    if !belongs_to_message {
+        return Err("Attachment version is not attached to the specified user message".into());
+    }
+
+    Ok(resolved)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +347,8 @@ pub fn get_attachment_processing_status(
     state: State<'_, Mutex<Storage>>,
     chat_id: String,
     reference_id: String,
+    attachment_version_id: String,
+    version_number: i64,
     extractor: String,
     extractor_version: String,
 ) -> Result<AttachmentProcessingStatus, String> {
@@ -294,7 +358,13 @@ pub fn get_attachment_processing_status(
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
 
-    let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let (sha256, _) = resolve_blob(
+        &storage,
+        &chat_id,
+        &reference_id,
+        &attachment_version_id,
+        version_number,
+    )?;
     query_status(&storage, &sha256, &extractor, &extractor_version)
 }
 
@@ -310,6 +380,8 @@ pub fn begin_attachment_processing(
     state: State<'_, Mutex<Storage>>,
     chat_id: String,
     reference_id: String,
+    attachment_version_id: String,
+    version_number: i64,
     extractor: String,
     extractor_version: String,
 ) -> Result<BeginAttachmentProcessingResult, String> {
@@ -319,7 +391,13 @@ pub fn begin_attachment_processing(
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
 
-    let (sha256, source_size) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let (sha256, source_size) = resolve_blob(
+        &storage,
+        &chat_id,
+        &reference_id,
+        &attachment_version_id,
+        version_number,
+    )?;
     let timestamp = now_timestamp()?;
     let document_id = Uuid::new_v4().to_string();
     let claim_token = Uuid::new_v4().to_string();
@@ -409,6 +487,8 @@ pub struct ExtractedAssetInput {
 pub struct SaveExtractedDocumentInput {
     pub chat_id: String,
     pub reference_id: String,
+    pub attachment_version_id: String,
+    pub version_number: i64,
     pub extractor: String,
     pub extractor_version: String,
     pub processing_token: String,
@@ -787,7 +867,13 @@ pub fn save_extracted_document(
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
 
-    let (sha256, actual_source_size) = resolve_blob(&storage, &input.chat_id, &input.reference_id)?;
+    let (sha256, actual_source_size) = resolve_blob(
+        &storage,
+        &input.chat_id,
+        &input.reference_id,
+        &input.attachment_version_id,
+        input.version_number,
+    )?;
     if actual_source_size != input.source_size {
         return Err("Document source size does not match the stored attachment".into());
     }
@@ -1269,6 +1355,8 @@ pub fn mark_attachment_processing_failed(
     state: State<'_, Mutex<Storage>>,
     chat_id: String,
     reference_id: String,
+    attachment_version_id: String,
+    version_number: i64,
     extractor: String,
     extractor_version: String,
     processing_token: String,
@@ -1289,7 +1377,13 @@ pub fn mark_attachment_processing_failed(
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
 
-    let (sha256, source_size) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let (sha256, source_size) = resolve_blob(
+        &storage,
+        &chat_id,
+        &reference_id,
+        &attachment_version_id,
+        version_number,
+    )?;
     let timestamp = now_timestamp()?;
 
     let changed = storage
@@ -1344,7 +1438,10 @@ pub struct AttachmentDocumentContext {
 pub fn get_attachment_document_context(
     state: State<'_, Mutex<Storage>>,
     chat_id: String,
+    message_id: String,
     reference_id: String,
+    attachment_version_id: String,
+    version_number: i64,
     extractor: String,
     extractor_version: String,
     max_bytes: Option<usize>,
@@ -1363,7 +1460,14 @@ pub fn get_attachment_document_context(
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
 
-    let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let (sha256, _) = resolve_message_blob(
+        &storage,
+        &chat_id,
+        &message_id,
+        &reference_id,
+        &attachment_version_id,
+        version_number,
+    )?;
 
     let document: Option<(
         String,
@@ -1378,14 +1482,29 @@ pub fn get_attachment_document_context(
              FROM extracted_documents d
              JOIN attachment_versions v ON v.blob_sha256 = d.blob_sha256
              JOIN attachment_references r ON r.attachment_version_id = v.id
+             JOIN messages m ON m.id = r.message_id AND m.chat_id = r.chat_id
              WHERE d.blob_sha256 = ?1
                AND d.extractor = ?2
                AND d.extractor_version = ?3
                AND d.status = 'completed'
-               AND r.id = ?4 AND r.chat_id = ?5
-             ORDER BY r.created_at DESC
+               AND r.id = ?4
+               AND r.chat_id = ?5
+               AND v.id = ?6
+               AND v.version_number = ?7
+               AND r.message_id = ?8
+               AND r.purpose = 'message'
+               AND m.role = 'user'
              LIMIT 1",
-            params![sha256, extractor, extractor_version, reference_id, chat_id],
+            params![
+                sha256,
+                extractor,
+                extractor_version,
+                reference_id,
+                chat_id,
+                attachment_version_id,
+                version_number,
+                message_id
+            ],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -1397,10 +1516,12 @@ pub fn get_attachment_document_context(
             },
         )
         .optional()
-        .map_err(|error| format!("Cannot resolve processed attachment: {error}"))?;
+        .map_err(|error| format!("Cannot resolve exact processed attachment: {error}"))?;
 
     let (document_id, file_name, detected_format, language, metadata_json) =
-        document.ok_or_else(|| "Attachment has no completed extraction result".to_string())?;
+        document.ok_or_else(|| {
+            "Attachment has no completed extraction for this message/version".to_string()
+        })?;
 
     let metadata = metadata_json
         .as_deref()
@@ -1412,8 +1533,8 @@ pub fn get_attachment_document_context(
         .connection
         .prepare(
             "SELECT content FROM document_chunks
-         WHERE document_id = ?1
-         ORDER BY ordinal ASC",
+             WHERE document_id = ?1
+             ORDER BY ordinal ASC",
         )
         .map_err(|error| format!("Cannot prepare document context query: {error}"))?;
 
@@ -1435,12 +1556,10 @@ pub fn get_attachment_document_context(
             while end > 0 && !chunk.is_char_boundary(end) {
                 end -= 1;
             }
-
             if end > 0 {
                 content.push_str(separator);
                 content.push_str(&chunk[..end]);
             }
-
             truncated = true;
             break;
         }
@@ -1477,26 +1596,43 @@ pub struct AttachmentDocumentAsset {
 pub fn list_attachment_document_assets(
     state: State<'_, Mutex<Storage>>,
     chat_id: String,
+    message_id: String,
     reference_id: String,
+    attachment_version_id: String,
+    version_number: i64,
+    extractor: String,
+    extractor_version: String,
 ) -> Result<Vec<AttachmentDocumentAsset>, String> {
+    validate_extractor(&extractor, &extractor_version)?;
+
     let storage = state
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
-    let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let (sha256, _) = resolve_message_blob(
+        &storage,
+        &chat_id,
+        &message_id,
+        &reference_id,
+        &attachment_version_id,
+        version_number,
+    )?;
     let mut statement = storage
         .connection
         .prepare(
             "SELECT a.id, a.asset_type, a.mime_type, a.file_name, a.ordinal,
                 a.metadata_json, d.id, s.title
-         FROM document_assets a
-         JOIN extracted_documents d ON d.id = a.document_id
-         LEFT JOIN document_sections s ON s.id = a.section_id
-         WHERE d.blob_sha256 = ?1 AND d.status = 'completed'
-         ORDER BY a.ordinal ASC",
+             FROM document_assets a
+             JOIN extracted_documents d ON d.id = a.document_id
+             LEFT JOIN document_sections s ON s.id = a.section_id
+             WHERE d.blob_sha256 = ?1
+               AND d.extractor = ?2
+               AND d.extractor_version = ?3
+               AND d.status = 'completed'
+             ORDER BY a.ordinal ASC",
         )
         .map_err(|error| format!("Cannot prepare document asset query: {error}"))?;
     let rows = statement
-        .query_map([sha256], |row| {
+        .query_map(params![sha256, extractor, extractor_version], |row| {
             Ok(AttachmentDocumentAsset {
                 asset_id: row.get(0)?,
                 asset_type: row.get(1)?,
@@ -1517,27 +1653,46 @@ pub fn list_attachment_document_assets(
 pub fn read_attachment_document_asset(
     state: State<'_, Mutex<Storage>>,
     chat_id: String,
+    message_id: String,
     reference_id: String,
+    attachment_version_id: String,
+    version_number: i64,
+    extractor: String,
+    extractor_version: String,
     asset_id: String,
 ) -> Result<Vec<u8>, String> {
+    validate_extractor(&extractor, &extractor_version)?;
     let storage = state
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
-    let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let (sha256, _) = resolve_message_blob(
+        &storage,
+        &chat_id,
+        &message_id,
+        &reference_id,
+        &attachment_version_id,
+        version_number,
+    )?;
     let relative_path: String = storage
         .connection
         .query_row(
             "SELECT b.relative_path
-         FROM document_assets a
-         JOIN extracted_documents d ON d.id = a.document_id
-         JOIN blobs b ON b.sha256 = a.blob_sha256
-         WHERE a.id = ?1 AND d.blob_sha256 = ?2 AND d.status = 'completed'",
-            params![asset_id, sha256],
+             FROM document_assets a
+             JOIN extracted_documents d ON d.id = a.document_id
+             JOIN blobs b ON b.sha256 = a.blob_sha256
+             WHERE a.id = ?1
+               AND d.blob_sha256 = ?2
+               AND d.extractor = ?3
+               AND d.extractor_version = ?4
+               AND d.status = 'completed'",
+            params![asset_id, sha256, extractor, extractor_version],
             |row| row.get(0),
         )
         .optional()
         .map_err(|error| format!("Cannot resolve document asset: {error}"))?
-        .ok_or_else(|| "Document asset does not belong to the specified attachment".to_string())?;
+        .ok_or_else(|| {
+            "Document asset does not belong to the exact attachment version".to_string()
+        })?;
     let path = storage.resolve_blob_path(&relative_path)?;
     let metadata = std::fs::metadata(&path)
         .map_err(|error| format!("Cannot inspect document asset: {error}"))?;
@@ -1558,12 +1713,18 @@ pub struct SavedVisionDescription {
 pub fn save_attachment_document_asset_vision_description(
     state: State<'_, Mutex<Storage>>,
     chat_id: String,
+    message_id: String,
     reference_id: String,
+    attachment_version_id: String,
+    version_number: i64,
+    extractor: String,
+    extractor_version: String,
     asset_id: String,
     description: String,
     model_name: Option<String>,
     prompt_version: Option<i64>,
 ) -> Result<SavedVisionDescription, String> {
+    validate_extractor(&extractor, &extractor_version)?;
     let description = description.trim();
     if description.is_empty() || description.len() > 32 * 1024 {
         return Err("Vision description is empty or exceeds the 32 KiB limit".into());
@@ -1584,7 +1745,14 @@ pub fn save_attachment_document_asset_vision_description(
     let mut storage = state
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
-    let (sha256, _) = resolve_blob(&storage, &chat_id, &reference_id)?;
+    let (sha256, _) = resolve_message_blob(
+        &storage,
+        &chat_id,
+        &message_id,
+        &reference_id,
+        &attachment_version_id,
+        version_number,
+    )?;
     let timestamp = now_timestamp()?;
     let transaction = storage
         .connection
@@ -1603,8 +1771,9 @@ pub fn save_attachment_document_asset_vision_description(
              FROM document_assets a
              JOIN extracted_documents d ON d.id = a.document_id
              WHERE a.id = ?1 AND d.blob_sha256 = ?2
+               AND d.extractor = ?3 AND d.extractor_version = ?4
                AND d.status = 'completed' AND a.asset_type = 'image'",
-            params![asset_id, sha256],
+            params![asset_id, sha256, extractor, extractor_version],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -1821,27 +1990,50 @@ pub fn save_attachment_document_asset_vision_description(
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSearchResult {
     pub chunk_id: String,
+    pub reference_id: String,
+    pub attachment_version_id: String,
+    pub version_number: i64,
     pub file_name: String,
+    pub document_id: String,
+    pub section_id: Option<String>,
+    pub section_title: Option<String>,
+    pub ordinal: i64,
+    pub chunk_type: String,
     pub detected_format: Option<String>,
     pub content: String,
 }
 
-#[tauri::command]
-pub fn search_attachment_documents(
-    state: State<'_, Mutex<Storage>>,
-    chat_id: String,
-    query: String,
-    query_embedding: Vec<f32>,
-    limit: Option<usize>,
-) -> Result<Vec<DocumentSearchResult>, String> {
-    let query = query.trim();
+fn map_document_search_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentSearchResult> {
+    Ok(DocumentSearchResult {
+        chunk_id: row.get(0)?,
+        reference_id: row.get(1)?,
+        attachment_version_id: row.get(2)?,
+        version_number: row.get(3)?,
+        file_name: row.get(4)?,
+        document_id: row.get(5)?,
+        section_id: row.get(6)?,
+        section_title: row.get(7)?,
+        ordinal: row.get(8)?,
+        chunk_type: row.get(9)?,
+        detected_format: row.get(10)?,
+        content: row.get(11)?,
+    })
+}
 
-    if query.is_empty() {
-        return Ok(Vec::new());
-    }
-    if query.len() > 512 {
-        return Err("Search query exceeds 512 bytes".into());
-    }
+fn search_attachment_documents_with_connection(
+    connection: &Connection,
+    chat_id: &str,
+    message_id: Option<&str>,
+    reference_id: Option<&str>,
+    attachment_version_id: Option<&str>,
+    version_number: Option<i64>,
+    extractor: &str,
+    extractor_version: &str,
+    query: &str,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<DocumentSearchResult>, String> {
+    validate_extractor(extractor, extractor_version)?;
     if query_embedding.len() != NOMIC_EMBEDDING_DIMENSIONS
         || query_embedding.iter().any(|value| !value.is_finite())
     {
@@ -1851,163 +2043,326 @@ pub fn search_attachment_documents(
         ));
     }
 
+    let (scope_cte, scope_values): (&str, Vec<rusqlite::types::Value>) = if let Some(reference_id) =
+        reference_id
+    {
+        let attachment_version_id = attachment_version_id
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "A version ID is required for attachment-scoped search".to_string())?;
+        let version_number = version_number.filter(|value| *value > 0).ok_or_else(|| {
+            "A positive version number is required for attachment-scoped search".to_string()
+        })?;
+        if reference_id.is_empty() || reference_id.len() > 128 || attachment_version_id.len() > 128
+        {
+            return Err("Invalid attachment scope identity".into());
+        }
+
+        let exact_scope_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                        SELECT 1
+                        FROM attachment_references r
+                        JOIN attachment_versions v ON v.id = r.attachment_version_id
+                        WHERE r.id = ?1
+                          AND r.chat_id = ?2
+                          AND v.id = ?3
+                          AND v.version_number = ?4
+                          AND (
+                            (?5 IS NULL AND r.purpose = 'composer' AND r.message_id IS NULL)
+                            OR
+                            (?5 IS NOT NULL AND r.purpose = 'message' AND r.message_id = ?5
+                             AND EXISTS (
+                                SELECT 1 FROM messages m
+                                WHERE m.id = r.message_id
+                                  AND m.chat_id = r.chat_id
+                                  AND m.role = 'user'
+                             ))
+                          )
+                    )",
+                rusqlite::params![
+                    reference_id,
+                    chat_id,
+                    attachment_version_id,
+                    version_number,
+                    message_id
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Cannot validate attachment search scope: {error}"))?;
+        if !exact_scope_exists {
+            return Err(
+                "Attachment search scope does not match the exact reference/version/message".into(),
+            );
+        }
+
+        (
+            r#"WITH authorized AS (
+                    SELECT DISTINCT
+                        d.id AS document_id,
+                        r.id AS reference_id,
+                        v.id AS attachment_version_id,
+                        v.version_number,
+                        v.file_name
+                    FROM extracted_documents d
+                    JOIN attachment_versions v ON v.blob_sha256 = d.blob_sha256
+                    JOIN attachment_references r ON r.attachment_version_id = v.id
+                    WHERE d.status = 'completed'
+                      AND d.extractor = ?8
+                      AND d.extractor_version = ?9
+                      AND r.chat_id = ?3
+                      AND r.id = ?4
+                      AND v.id = ?5
+                      AND v.version_number = ?6
+                      AND (
+                        (?7 IS NULL AND r.purpose = 'composer' AND r.message_id IS NULL)
+                        OR
+                        (?7 IS NOT NULL AND r.purpose = 'message' AND r.message_id = ?7
+                         AND EXISTS (
+                            SELECT 1 FROM messages m
+                            WHERE m.id = r.message_id
+                              AND m.chat_id = r.chat_id
+                              AND m.role = 'user'
+                         ))
+                      )
+                )"#,
+            vec![
+                rusqlite::types::Value::Text(chat_id.to_owned()),
+                rusqlite::types::Value::Text(reference_id.to_owned()),
+                rusqlite::types::Value::Text(attachment_version_id.to_owned()),
+                rusqlite::types::Value::Integer(version_number),
+                message_id.map_or(rusqlite::types::Value::Null, |value| {
+                    rusqlite::types::Value::Text(value.to_owned())
+                }),
+                rusqlite::types::Value::Text(extractor.to_owned()),
+                rusqlite::types::Value::Text(extractor_version.to_owned()),
+            ],
+        )
+    } else if let Some(message_id) = message_id {
+        if message_id.is_empty()
+            || message_id.len() > 128
+            || attachment_version_id.is_some()
+            || version_number.is_some()
+        {
+            return Err("Invalid message-scoped search identity".into());
+        }
+        let valid_message: bool = connection
+            .query_row(
+                "SELECT EXISTS (
+                        SELECT 1 FROM messages
+                        WHERE id = ?1 AND chat_id = ?2 AND role = 'user'
+                    )",
+                rusqlite::params![message_id, chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Cannot validate message search scope: {error}"))?;
+        if !valid_message {
+            return Err("Search message does not belong to the specified chat".into());
+        }
+
+        (
+            r#"WITH authorized AS (
+                    SELECT DISTINCT
+                        d.id AS document_id,
+                        r.id AS reference_id,
+                        v.id AS attachment_version_id,
+                        v.version_number,
+                        v.file_name
+                    FROM extracted_documents d
+                    JOIN attachment_versions v ON v.blob_sha256 = d.blob_sha256
+                    JOIN attachment_references r ON r.attachment_version_id = v.id
+                    JOIN messages m
+                      ON m.id = r.message_id
+                     AND m.chat_id = r.chat_id
+                     AND m.role = 'user'
+                    WHERE d.status = 'completed'
+                      AND d.extractor = ?5
+                      AND d.extractor_version = ?6
+                      AND r.chat_id = ?3
+                      AND r.message_id = ?4
+                      AND r.purpose = 'message'
+                )"#,
+            vec![
+                rusqlite::types::Value::Text(chat_id.to_owned()),
+                rusqlite::types::Value::Text(message_id.to_owned()),
+                rusqlite::types::Value::Text(extractor.to_owned()),
+                rusqlite::types::Value::Text(extractor_version.to_owned()),
+            ],
+        )
+    } else {
+        return Err(
+            "Attachment search requires a user message ID or an exact attachment reference/version"
+                .into(),
+        );
+    };
+
     let terms: Vec<String> = query
         .split_whitespace()
         .take(16)
         .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
         .collect();
-
     if terms.is_empty() {
         return Ok(Vec::new());
     }
 
     let fts_query = terms.join(" OR ");
-    let limit = limit.unwrap_or(20).clamp(1, 50);
+    let limit = limit.clamp(1, 50);
     let candidate_limit = (limit * 4).clamp(20, 200);
-
     let query_vector: Vec<u8> = query_embedding
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
 
-    let storage = state
-        .lock()
-        .map_err(|_| "Storage lock is poisoned".to_string())?;
-
-    let mut ranked: std::collections::HashMap<String, (DocumentSearchResult, f64)> =
-        std::collections::HashMap::new();
-
-    // Lexical retrieval: FTS5 / BM25.
     let lexical_results = {
-        let mut statement = storage
-            .connection
-            .prepare(
-                "SELECT
-                    c.id,
-                    (
-                        SELECT v.file_name
-                        FROM attachment_versions v
-                        JOIN attachment_references r
-                            ON r.attachment_version_id = v.id
-                        WHERE v.blob_sha256 = d.blob_sha256
-                          AND r.chat_id = ?2
-                        ORDER BY r.created_at DESC
-                        LIMIT 1
-                    ),
-                    d.detected_format,
-                    c.content
-                 FROM chunk_search
-                 JOIN document_chunks c
-                    ON c.id = chunk_search.chunk_id
-                 JOIN extracted_documents d
-                    ON d.id = c.document_id
-                 WHERE chunk_search MATCH ?1
-                   AND d.status = 'completed'
-                   AND EXISTS (
-                       SELECT 1
-                       FROM attachment_versions v
-                       JOIN attachment_references r
-                           ON r.attachment_version_id = v.id
-                       WHERE v.blob_sha256 = d.blob_sha256
-                         AND r.chat_id = ?2
-                   )
-                 ORDER BY bm25(chunk_search) ASC
-                 LIMIT ?3",
-            )
-            .map_err(|error| format!("Cannot prepare lexical search: {error}"))?;
-
+        let sql = format!(
+            "{scope_cte}
+             SELECT c.id, a.reference_id, a.attachment_version_id, a.version_number,
+                    a.file_name, d.id, c.section_id, s.title, c.ordinal, c.chunk_type,
+                    d.detected_format, c.content
+             FROM chunk_search
+             JOIN document_chunks c ON c.id = chunk_search.chunk_id
+             JOIN extracted_documents d ON d.id = c.document_id
+             JOIN authorized a ON a.document_id = d.id
+             LEFT JOIN document_sections s ON s.id = c.section_id
+             WHERE chunk_search MATCH ?1
+             ORDER BY bm25(chunk_search) ASC
+             LIMIT ?2"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| format!("Cannot prepare scoped lexical search: {error}"))?;
+        let mut values = vec![
+            rusqlite::types::Value::Text(fts_query),
+            rusqlite::types::Value::Integer(candidate_limit as i64),
+        ];
+        values.extend(scope_values.iter().cloned());
         let rows = statement
-            .query_map(params![fts_query, chat_id, candidate_limit as i64], |row| {
-                Ok(DocumentSearchResult {
-                    chunk_id: row.get(0)?,
-                    file_name: row.get(1)?,
-                    detected_format: row.get(2)?,
-                    content: row.get(3)?,
-                })
-            })
-            .map_err(|error| format!("Cannot execute lexical search: {error}"))?;
-
+            .query_map(
+                rusqlite::params_from_iter(values.iter()),
+                map_document_search_result,
+            )
+            .map_err(|error| format!("Cannot execute scoped lexical search: {error}"))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Cannot read lexical search results: {error}"))?
+            .map_err(|error| format!("Cannot read scoped lexical search results: {error}"))?
     };
 
+    let mut ranked: HashMap<String, (DocumentSearchResult, f64)> = HashMap::new();
     for (index, result) in lexical_results.into_iter().enumerate() {
-        let key = result.chunk_id.clone();
+        let key = format!(
+            "{}:{}:{}",
+            result.chunk_id, result.reference_id, result.attachment_version_id
+        );
         let entry = ranked.entry(key).or_insert((result, 0.0));
         entry.1 += 1.0 / (60.0 + (index + 1) as f64);
     }
 
-    // Semantic retrieval: sqlite-vec cosine distance.
+    // sqlite-vec v0.1.9 supports an ID-IN prefilter as part of the vec0 KNN
+    // virtual-table query plan. Keep this predicate inside vec0: an outer WHERE
+    // after KNN would allow unrelated vectors to consume the top-K candidate set.
     let semantic_results = {
-        let mut statement = storage
-            .connection
-            .prepare(
-                "SELECT
-                    c.id,
-                    (
-                        SELECT v.file_name
-                        FROM attachment_versions v
-                        JOIN attachment_references r
-                            ON r.attachment_version_id = v.id
-                        WHERE v.blob_sha256 = d.blob_sha256
-                          AND r.chat_id = ?3
-                        ORDER BY r.created_at DESC
-                        LIMIT 1
-                    ),
-                    d.detected_format,
-                    c.content
-                 FROM document_vectors_nomic
-                 JOIN document_chunks c
-                    ON c.id = document_vectors_nomic.chunk_id
-                 JOIN extracted_documents d
-                    ON d.id = c.document_id
-                 WHERE embedding MATCH ?1
-                   AND k = ?2
-                   AND d.status = 'completed'
-                   AND EXISTS (
-                       SELECT 1
-                       FROM attachment_versions v
-                       JOIN attachment_references r
-                           ON r.attachment_version_id = v.id
-                       WHERE v.blob_sha256 = d.blob_sha256
-                         AND r.chat_id = ?3
-                   )
-                 ORDER BY distance ASC",
-            )
-            .map_err(|error| format!("Cannot prepare semantic search: {error}"))?;
-
+        let sql = format!(
+            "{scope_cte}
+             SELECT c.id, a.reference_id, a.attachment_version_id, a.version_number,
+                    a.file_name, d.id, c.section_id, s.title, c.ordinal, c.chunk_type,
+                    d.detected_format, c.content
+             FROM document_vectors_nomic
+             JOIN document_chunks c ON c.id = document_vectors_nomic.chunk_id
+             JOIN extracted_documents d ON d.id = c.document_id
+             JOIN authorized a ON a.document_id = d.id
+             LEFT JOIN document_sections s ON s.id = c.section_id
+             WHERE embedding MATCH ?1
+               AND k = ?2
+               AND document_vectors_nomic.chunk_id IN (
+                    SELECT allowed_chunks.id
+                    FROM document_chunks allowed_chunks
+                    JOIN authorized allowed_docs
+                      ON allowed_docs.document_id = allowed_chunks.document_id
+               )
+             ORDER BY distance ASC"
+        );
+        let mut statement = connection
+            .prepare(&sql)
+            .map_err(|error| format!("Cannot prepare scoped semantic search: {error}"))?;
+        let mut values = vec![
+            rusqlite::types::Value::Blob(query_vector),
+            rusqlite::types::Value::Integer(candidate_limit as i64),
+        ];
+        values.extend(scope_values.iter().cloned());
         let rows = statement
             .query_map(
-                params![query_vector, candidate_limit as i64, chat_id],
-                |row| {
-                    Ok(DocumentSearchResult {
-                        chunk_id: row.get(0)?,
-                        file_name: row.get(1)?,
-                        detected_format: row.get(2)?,
-                        content: row.get(3)?,
-                    })
-                },
+                rusqlite::params_from_iter(values.iter()),
+                map_document_search_result,
             )
-            .map_err(|error| format!("Cannot execute semantic search: {error}"))?;
-
+            .map_err(|error| format!("Cannot execute scoped semantic search: {error}"))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("Cannot read semantic search results: {error}"))?
+            .map_err(|error| format!("Cannot read scoped semantic search results: {error}"))?
     };
 
     for (index, result) in semantic_results.into_iter().enumerate() {
-        let key = result.chunk_id.clone();
+        let key = format!(
+            "{}:{}:{}",
+            result.chunk_id, result.reference_id, result.attachment_version_id
+        );
         let entry = ranked.entry(key).or_insert((result, 0.0));
         entry.1 += 1.0 / (60.0 + (index + 1) as f64);
     }
 
     let mut results: Vec<_> = ranked.into_values().collect();
-    results.sort_by(|left, right| right.1.total_cmp(&left.1));
+    results.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.file_name.cmp(&right.0.file_name))
+            .then_with(|| left.0.ordinal.cmp(&right.0.ordinal))
+            .then_with(|| left.0.reference_id.cmp(&right.0.reference_id))
+    });
 
     Ok(results
         .into_iter()
         .take(limit)
         .map(|(result, _)| result)
         .collect())
+}
+
+#[tauri::command]
+pub fn search_attachment_documents(
+    state: State<'_, Mutex<Storage>>,
+    chat_id: String,
+    message_id: Option<String>,
+    reference_id: Option<String>,
+    attachment_version_id: Option<String>,
+    version_number: Option<i64>,
+    extractor: String,
+    extractor_version: String,
+    query: String,
+    query_embedding: Vec<f32>,
+    limit: Option<usize>,
+) -> Result<Vec<DocumentSearchResult>, String> {
+    validate_extractor(&extractor, &extractor_version)?;
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    if query.len() > 512 {
+        return Err("Search query exceeds 512 bytes".into());
+    }
+
+    let storage = state
+        .lock()
+        .map_err(|_| "Storage lock is poisoned".to_string())?;
+
+    search_attachment_documents_with_connection(
+        &storage.connection,
+        &chat_id,
+        message_id.as_deref(),
+        reference_id.as_deref(),
+        attachment_version_id.as_deref(),
+        version_number,
+        &extractor,
+        &extractor_version,
+        query,
+        &query_embedding,
+        limit.unwrap_or(20),
+    )
 }
 
 const NOMIC_EMBEDDING_MODEL: &str = "nomic-embed-text:latest";
@@ -3012,6 +3367,8 @@ mod extracted_asset_validation_tests {
         let input = SaveExtractedDocumentInput {
             chat_id: "chat".into(),
             reference_id: "attachment".into(),
+            attachment_version_id: "version-test".into(),
+            version_number: 1,
             extractor: "test".into(),
             extractor_version: "v1".into(),
             processing_token: "test-token".into(),
@@ -3423,6 +3780,292 @@ mod document_summary_persistence_tests {
                 "sonne-map-reduce-v1".to_string(),
                 123,
             )
+        );
+    }
+}
+
+#[cfg(test)]
+mod attachment_search_scope_tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+    use uuid::Uuid;
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_storage() -> (TestDirectory, Storage) {
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "sonne-attachment-scope-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        )));
+        fs::create_dir(&directory.0).expect("cannot create unique temporary test directory");
+        let storage =
+            Storage::initialize(&directory.0).expect("storage initialization must succeed");
+        (directory, storage)
+    }
+
+    fn insert_message_document(
+        connection: &Connection,
+        chat_id: &str,
+        message_id: &str,
+        attachment_id: &str,
+        version_id: &str,
+        reference_id: &str,
+        document_id: &str,
+        chunk_id: &str,
+        blob_hash: &str,
+        content: &str,
+        embedding: &[u8],
+    ) {
+        connection
+            .execute(
+                "INSERT INTO chats (id, title, created_at, updated_at)
+             VALUES (?1, 'test', 1, 1)
+             ON CONFLICT(id) DO NOTHING",
+                [chat_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages (id, chat_id, role, content, created_at)
+             VALUES (?1, ?2, 'user', 'test prompt', 1)",
+                rusqlite::params![message_id, chat_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO blobs (
+                sha256, relative_path, original_size, stored_size, storage_state,
+                created_at, last_accessed_at
+             ) VALUES (?1, ?2, 32, 32, 'original', 1, 1)",
+                rusqlite::params![blob_hash, format!("blobs/{blob_hash}")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO attachments (id, created_at, updated_at) VALUES (?1, 1, 1)",
+                [attachment_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO attachment_versions (
+                id, attachment_id, version_number, blob_sha256, file_name,
+                extension, mime_type, created_at
+             ) VALUES (?1, ?2, 1, ?3, 'same-name.txt', 'txt', 'text/plain', 1)",
+                rusqlite::params![version_id, attachment_id, blob_hash],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO attachment_references (
+                id, chat_id, attachment_version_id, message_id, purpose, position, created_at
+             ) VALUES (?1, ?2, ?3, ?4, 'message', 0, 1)",
+                rusqlite::params![reference_id, chat_id, version_id, message_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO extracted_documents (
+                id, blob_sha256, extractor, extractor_version, status, created_at,
+                updated_at, source_size, detected_format
+             ) VALUES (?1, ?2, 'sonne-unified', 'scope-test-v1', 'completed', 1, 1, 32, 'txt')",
+                rusqlite::params![document_id, blob_hash],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO document_chunks (id, document_id, ordinal, content, token_count)
+             VALUES (?1, ?2, 0, ?3, 2)",
+                rusqlite::params![chunk_id, document_id, content],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO document_vectors_nomic (chunk_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![chunk_id, embedding],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn message_search_excludes_older_messages_and_other_chats_even_with_same_filename() {
+        let (_directory, storage) = test_storage();
+        let connection = storage.connection();
+        let vector: Vec<f32> = (0..NOMIC_EMBEDDING_DIMENSIONS)
+            .map(|index| if index == 0 { 1.0 } else { 0.0 })
+            .collect();
+        let embedding: Vec<u8> = vector
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+
+        insert_message_document(
+            connection,
+            "chat-a",
+            "message-old",
+            "attachment-old",
+            "version-old",
+            "reference-old",
+            "document-old",
+            "chunk-old",
+            &"a".repeat(64),
+            "needle from an older message",
+            &embedding,
+        );
+        insert_message_document(
+            connection,
+            "chat-a",
+            "message-current",
+            "attachment-current",
+            "version-current",
+            "reference-current",
+            "document-current",
+            "chunk-current",
+            &"b".repeat(64),
+            "needle from the current message only",
+            &embedding,
+        );
+        insert_message_document(
+            connection,
+            "chat-b",
+            "message-other-chat",
+            "attachment-other",
+            "version-other",
+            "reference-other",
+            "document-other",
+            "chunk-other",
+            &"c".repeat(64),
+            "needle from another chat",
+            &embedding,
+        );
+
+        assert!(
+            storage
+                .get_preview_blob_exact("chat-a", "reference-current", "version-current", 1)
+                .is_ok(),
+            "the exact reference/version pair must resolve"
+        );
+        assert!(
+            storage
+                .get_preview_blob_exact("chat-a", "reference-current", "version-old", 1)
+                .is_err(),
+            "raw file reads must reject a mismatched immutable version"
+        );
+
+        let exact_message_blob = resolve_message_blob(
+            &storage,
+            "chat-a",
+            "message-current",
+            "reference-current",
+            "version-current",
+            1,
+        )
+        .expect("exact current-message identity must resolve");
+        assert_eq!(exact_message_blob.0, "b".repeat(64));
+        assert_eq!(exact_message_blob.1, 32);
+        assert!(
+            resolve_message_blob(
+                &storage,
+                "chat-a",
+                "message-old",
+                "reference-current",
+                "version-current",
+                1,
+            )
+            .is_err(),
+            "a valid same-chat but different message ID must be rejected"
+        );
+
+        let results = search_attachment_documents_with_connection(
+            connection,
+            "chat-a",
+            Some("message-current"),
+            None,
+            None,
+            None,
+            "sonne-unified",
+            "scope-test-v1",
+            "needle",
+            &vector,
+            10,
+        )
+        .expect("scoped hybrid search must succeed");
+
+        assert!(
+            !results.is_empty(),
+            "current message document should be searchable"
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.reference_id == "reference-current")
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.attachment_version_id == "version-current")
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.document_id == "document-current")
+        );
+        assert!(
+            results
+                .iter()
+                .all(|result| result.content.contains("current message only"))
+        );
+    }
+
+    #[test]
+    fn attachment_search_rejects_a_mismatched_version_id() {
+        let (_directory, storage) = test_storage();
+        let connection = storage.connection();
+        let vector: Vec<f32> = (0..NOMIC_EMBEDDING_DIMENSIONS)
+            .map(|index| if index == 0 { 1.0 } else { 0.0 })
+            .collect();
+        let embedding: Vec<u8> = vector
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        insert_message_document(
+            connection,
+            "chat-a",
+            "message-current",
+            "attachment-current",
+            "version-current",
+            "reference-current",
+            "document-current",
+            "chunk-current",
+            &"b".repeat(64),
+            "needle from the current message",
+            &embedding,
+        );
+
+        let result = search_attachment_documents_with_connection(
+            connection,
+            "chat-a",
+            Some("message-current"),
+            Some("reference-current"),
+            Some("version-from-another-file"),
+            Some(1),
+            "sonne-unified",
+            "scope-test-v1",
+            "needle",
+            &vector,
+            10,
+        );
+
+        assert!(
+            result.is_err(),
+            "a reference must never be searched through a different version ID"
         );
     }
 }

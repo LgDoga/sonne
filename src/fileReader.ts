@@ -181,6 +181,8 @@ export async function readFile(file: File): Promise<ReadFileResult> {
 export interface StoredAttachmentInput {
   id: string;
   chatId: string;
+  attachmentVersionId: string;
+  versionNumber: number;
   fileName: string;
   mimeType: string;
   originalSize: number;
@@ -233,8 +235,8 @@ const MAX_ASSET_BYTES = 16 * 1024 * 1024;
 const MAX_DOCUMENT_ASSET_BYTES = 64 * 1024 * 1024;
 const MAX_ASSET_WARNING_MESSAGES = 100;
 
-function isArchiveName(name: string): boolean {
-  return /\.(zip|tar|gz|tgz)$/i.test(name);
+export function isArchiveName(name: string): boolean {
+  return /\.(zip|7z|rar|tar|gz|tgz|tar\.gz|bz2|tbz2?|tar\.bz2|xz|txz|tar\.xz|zst|zstd|tzst|tar\.zst|tar\.zstd|lz4|lzma|lz)$/i.test(name);
 }
 
 export async function loadStoredAttachment(
@@ -262,6 +264,8 @@ export async function loadStoredAttachment(
     const bytes = await invoke<number[]>("read_attachment_chunk", {
       chatId: attachment.chatId,
       referenceId: attachment.id,
+      attachmentVersionId: attachment.attachmentVersionId,
+      versionNumber: attachment.versionNumber,
       offset,
       length,
     });
@@ -1086,9 +1090,49 @@ function createAssetIndexChunks(assets: ExtractedAsset[]): IndexChunk[] {
   return result;
 }
 
-export async function processStoredAttachment(
+type StoredAttachmentProcessingResult = {
+  status: "completed" | "skipped";
+  documentId?: string;
+};
+
+const inFlightAttachmentProcessing = new Map<
+  string,
+  Promise<StoredAttachmentProcessingResult>
+>();
+
+function storedAttachmentProcessingKey(attachment: StoredAttachmentInput): string {
+  return [
+    attachment.chatId,
+    attachment.id,
+    attachment.attachmentVersionId,
+    String(attachment.versionNumber),
+  ].join("\u0000");
+}
+
+/**
+ * Share one processing operation between the composer background effect and
+ * the send pipeline. The reference and immutable version are both part of the
+ * key, so a later file version can never reuse an earlier processing promise.
+ */
+export function processStoredAttachment(
   attachment: StoredAttachmentInput,
-): Promise<{ status: "completed" | "skipped"; documentId?: string }> {
+): Promise<StoredAttachmentProcessingResult> {
+  const key = storedAttachmentProcessingKey(attachment);
+  const existing = inFlightAttachmentProcessing.get(key);
+  if (existing) return existing;
+
+  const operation = processStoredAttachmentOnce(attachment).finally(() => {
+    if (inFlightAttachmentProcessing.get(key) === operation) {
+      inFlightAttachmentProcessing.delete(key);
+    }
+  });
+  inFlightAttachmentProcessing.set(key, operation);
+  return operation;
+}
+
+async function processStoredAttachmentOnce(
+  attachment: StoredAttachmentInput,
+): Promise<StoredAttachmentProcessingResult> {
   const onProgress = attachment.onProgress;
   onProgress?.("Витягування тексту, структури та зображень…");
 
@@ -1099,6 +1143,8 @@ export async function processStoredAttachment(
   const statusArgs = {
     chatId: attachment.chatId,
     referenceId: attachment.id,
+    attachmentVersionId: attachment.attachmentVersionId,
+    versionNumber: attachment.versionNumber,
     extractor: EXTRACTOR_ID,
     extractorVersion: EXTRACTOR_VERSION,
   };
@@ -1181,9 +1227,24 @@ export async function processStoredAttachment(
 
       if (!documentCompleted && !processingToken) {
         if (started.status.status === "processing") {
-          throw new Error(
-            "Цей документ уже обробляється іншим процесом. Повторіть спробу пізніше.",
-          );
+          // Another app window/process owns the lease. Wait for that exact
+          // blob+extractor job instead of failing the send while it is indexing.
+          for (let attempt = 0; attempt < 120; attempt += 1) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            const latest = await invoke<{
+              documentId: string | null;
+              status: string | null;
+            }>("get_attachment_processing_status", statusArgs);
+
+            if (latest.status === "completed" && latest.documentId) {
+              onProgress?.("Обробку документа завершено в іншому процесі.");
+              return { status: "completed", documentId: latest.documentId };
+            }
+            if (latest.status === "failed") {
+              throw new Error("Індексація вкладення завершилася помилкою в іншому процесі.");
+            }
+          }
+          throw new Error("Не дочекалися завершення індексації вкладення в іншому процесі.");
         }
 
         throw new Error("Не вдалося отримати право на обробку документа.");

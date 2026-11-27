@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import ArchiveBrowser, { type ArchiveContextItem } from "./ArchiveBrowser";
-import { processStoredAttachment } from "../fileReader";
+import { isArchiveName, processStoredAttachment } from "../fileReader";
 
 export interface AttachmentReference {
   id: string;
@@ -61,7 +61,7 @@ export default function FileAttachments({
     let disposed = false;
 
     const pending = attachments.filter((attachment) => {
-      if (/\.(zip|tar|gz|tgz)$/i.test(attachment.fileName)) return false;
+      if (isArchiveName(attachment.fileName)) return false;
       if (processingReferences.current.has(attachment.id)) return false;
 
       processingReferences.current.add(attachment.id);
@@ -77,6 +77,8 @@ export default function FileAttachments({
       void processStoredAttachment({
         id: attachment.id,
         chatId: attachment.chatId || chatId,
+        attachmentVersionId: attachment.attachmentVersionId,
+        versionNumber: attachment.versionNumber,
         fileName: attachment.fileName,
         mimeType: attachment.mimeType,
         originalSize: attachment.originalSize,
@@ -224,6 +226,8 @@ export default function FileAttachments({
       await processStoredAttachment({
         id: attachment.id,
         chatId: attachment.chatId || chatId,
+        attachmentVersionId: attachment.attachmentVersionId,
+        versionNumber: attachment.versionNumber,
         fileName: attachment.fileName,
         mimeType: attachment.mimeType,
         originalSize: attachment.originalSize,

@@ -6,7 +6,14 @@ import ChatHeader from "./components/ChatHeader";
 import ChatInput from "./components/ChatInput";
 import type { AttachmentReference } from "./components/FileAttachments";
 import type { ArchiveContextItem } from "./components/ArchiveBrowser";
-import { EXTRACTOR_ID, EXTRACTOR_VERSION, loadStoredAttachment } from "./fileReader";
+import {
+  EXTRACTOR_ID,
+  EXTRACTOR_VERSION,
+  isArchiveName,
+  loadStoredAttachment,
+  processStoredAttachment,
+  readStoredAttachment,
+} from "./fileReader";
 import { generateDocumentSummary } from "./documentSummaries";
 // Вміст вкладень береться зі збереженого індексу SQLite.
 import ChatMessageItem, { type ChatMessage } from "./components/ChatMessage";
@@ -55,6 +62,33 @@ import {
   selectHistory,
 } from "./contextManager";
 import { getPromptEvalMetrics } from "./ollamaMetrics";
+
+function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) {
+    return Promise.reject(new DOMException("Операцію скасовано", "AbortError"));
+  }
+
+  return new Promise<T>((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      reject(new DOMException("Операцію скасовано", "AbortError"));
+    };
+
+    signal.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
 
 // ============================================================
 // TYPES
@@ -1223,13 +1257,52 @@ CSS підключено
       // SQLite transaction is the source of truth: process exactly the
       // attachments promoted into this message by start_turn.
       const attachmentResults: Array<{
+        referenceId: string;
+        versionNumber: number;
         name: string;
         format: string;
         content: string;
         kind: "retrieval" | "fallback" | "summary";
       }> = [];
 
+      const processableAttachments = promotedAttachments.filter(
+        (file) => !isArchiveName(file.fileName),
+      );
+
       if (promotedAttachments.length > 0) {
+        const processedDocuments = new Map<string, string>();
+        // start_turn has now assigned these references to savedUser.id. Wait
+        // for each exact immutable version before embedding/searching the prompt.
+        // processStoredAttachment is single-flight, so this awaits the same job
+        // already started by FileAttachments rather than launching a duplicate.
+        await Promise.all(processableAttachments.map(async (file) => {
+          try {
+            if (generationController?.signal.aborted) {
+              throw new DOMException("Операцію скасовано", "AbortError");
+            }
+            const processing = await awaitWithAbort(
+              processStoredAttachment({
+                id: file.id,
+                chatId: file.chatId || chatId,
+                attachmentVersionId: file.attachmentVersionId,
+                versionNumber: file.versionNumber,
+                fileName: file.fileName,
+                mimeType: file.mimeType,
+                originalSize: file.originalSize,
+              }),
+              generationController?.signal,
+            );
+            if (processing.status === "completed" && processing.documentId) {
+              processedDocuments.set(file.id, processing.documentId);
+            }
+          } catch (error) {
+            if (generationController?.signal.aborted) {
+              throw new DOMException("Операцію скасовано", "AbortError");
+            }
+            console.warn(`[Sonne] Індексація ${file.fileName} не завершилася:`, error);
+          }
+        }));
+
         if (!explicitImageAnalysis) {
           try {
             const queryVectors = await createEmbeddings(OLLAMA_URL, [prompt]);
@@ -1241,11 +1314,25 @@ CSS підключено
 
             const searchResults = await invoke<Array<{
               chunkId: string;
+              referenceId: string;
+              attachmentVersionId: string;
+              versionNumber: number;
               fileName: string;
+              documentId: string;
+              sectionId: string | null;
+              sectionTitle: string | null;
+              ordinal: number;
+              chunkType: string;
               detectedFormat: string | null;
               content: string;
             }>>("search_attachment_documents", {
               chatId,
+              messageId: savedUser.id,
+              referenceId: null,
+              attachmentVersionId: null,
+              versionNumber: null,
+              extractor: EXTRACTOR_ID,
+              extractorVersion: EXTRACTOR_VERSION,
               query: prompt,
               queryEmbedding,
               limit: 12,
@@ -1253,9 +1340,16 @@ CSS підключено
 
             attachmentResults.push(
               ...searchResults.map((result) => ({
+                referenceId: result.referenceId,
+                versionNumber: result.versionNumber,
                 name: result.fileName || "Документ",
                 format: result.detectedFormat || "невідомий формат",
-                content: result.content || "",
+                content: [
+                  `[Джерело: ${result.fileName || "Документ"}; версія: ${result.versionNumber}]`,
+                  result.sectionTitle ? `Розділ: ${result.sectionTitle}` : "",
+                  `Фрагмент #${result.ordinal + 1} · тип: ${result.chunkType}`,
+                  result.content || "",
+                ].filter(Boolean).join("\n"),
                 kind: "retrieval" as const,
               })),
             );
@@ -1266,109 +1360,128 @@ CSS підключено
             );
           }
 
-          if (attachmentResults.length === 0) {
-            const totalAttachmentBudget = 2 * 1024 * 1024;
-            const attachmentBudget = Math.max(
-              1,
-              Math.floor(totalAttachmentBudget / promotedAttachments.length),
-            );
+          const searchedReferenceIds = new Set(
+            attachmentResults.map((result) => result.referenceId),
+          );
+          const fallbackAttachments = processableAttachments.filter(
+            (file) => !searchedReferenceIds.has(file.id),
+          );
+          const totalFallbackBudget = 2 * 1024 * 1024;
+          const fallbackBudget = fallbackAttachments.length > 0
+            ? Math.max(1, Math.floor(totalFallbackBudget / fallbackAttachments.length))
+            : 0;
 
-            const fallbackResults = await Promise.all(
-              promotedAttachments.map(async (file) => {
-                const document = await invoke<{
-                  documentId: string;
-                  fileName: string;
-                  detectedFormat: string | null;
-                  language: string | null;
-                  metadata: unknown;
-                  content: string;
-                  truncated: boolean;
-                }>("get_attachment_document_context", {
+          // A hit for one file must not suppress fallback for another. Handle
+          // each missing file independently so one parser failure cannot abort
+          // the rest of the message's attachment context.
+          for (const file of fallbackAttachments) {
+            const identity = {
+              id: file.id,
+              chatId: file.chatId || chatId,
+              attachmentVersionId: file.attachmentVersionId,
+              versionNumber: file.versionNumber,
+              fileName: file.fileName,
+              mimeType: file.mimeType,
+              originalSize: file.originalSize,
+            };
+
+            try {
+              const document = await invoke<{
+                documentId: string;
+                fileName: string;
+                detectedFormat: string | null;
+                language: string | null;
+                metadata: unknown;
+                content: string;
+                truncated: boolean;
+              }>("get_attachment_document_context", {
+                chatId: file.chatId || chatId,
+                messageId: savedUser.id,
+                referenceId: file.id,
+                attachmentVersionId: file.attachmentVersionId,
+                versionNumber: file.versionNumber,
+                extractor: EXTRACTOR_ID,
+                extractorVersion: EXTRACTOR_VERSION,
+                maxBytes: fallbackBudget,
+              });
+
+              if (document.content.trim()) {
+                attachmentResults.push({
                   referenceId: file.id,
-                  chatId: file.chatId || chatId,
-                  extractor: EXTRACTOR_ID,
-                  extractorVersion: EXTRACTOR_VERSION,
-                  maxBytes: attachmentBudget,
-                });
-
-                return {
+                  versionNumber: file.versionNumber,
                   name: document.fileName || file.fileName,
-                  format:
-                    document.detectedFormat ||
-                    file.mimeType ||
-                    "невідомий формат",
-                  content: document.content || "",
-                  kind: "fallback" as const,
-                };
-              }),
-            );
-
-            attachmentResults.push(...fallbackResults);
+                  format: document.detectedFormat || file.mimeType || "невідомий формат",
+                  content: document.content,
+                  kind: "fallback",
+                });
+                continue;
+              }
+              throw new Error("Індекс повернув порожній текстовий вміст.");
+            } catch (indexError) {
+              try {
+                // Last-resort local read: do not widen SQL scope or silently
+                // substitute another same-named attachment from this chat.
+                const direct = await readStoredAttachment(identity);
+                const directContent = direct.content.slice(0, fallbackBudget);
+                if (!directContent.trim()) {
+                  throw new Error("Локальний витяг не містить тексту.");
+                }
+                attachmentResults.push({
+                  referenceId: file.id,
+                  versionNumber: file.versionNumber,
+                  name: file.fileName,
+                  format: file.extension || file.mimeType || "невідомий формат",
+                  content: directContent,
+                  kind: "fallback",
+                });
+              } catch (directError) {
+                const indexMessage = indexError instanceof Error
+                  ? indexError.message
+                  : String(indexError);
+                const directMessage = directError instanceof Error
+                  ? directError.message
+                  : String(directError);
+                attachmentResults.push({
+                  referenceId: file.id,
+                  versionNumber: file.versionNumber,
+                  name: file.fileName,
+                  format: file.extension || file.mimeType || "невідомий формат",
+                  content: `[Вміст саме цієї версії файлу не вдалося прочитати. Індекс: ${indexMessage}. Локальне читання: ${directMessage}.]`,
+                  kind: "fallback",
+                });
+              }
+            }
           }
 
         }
 
-        if (backendConfig) {
-          for (const file of promotedAttachments) {
+        if (backendConfig && fullDocumentSummaryRequest && !explicitImageAnalysis) {
+          for (const file of processableAttachments) {
+            const documentId = processedDocuments.get(file.id);
+            if (!documentId) continue;
+
             try {
-              const statusArgs = {
-                chatId: file.chatId || chatId,
-                referenceId: file.id,
-                extractor: EXTRACTOR_ID,
-                extractorVersion: EXTRACTOR_VERSION,
-              };
+              const summary = await generateDocumentSummary(
+                documentId,
+                backendConfig.ollamaModel,
+                backendConfig.options,
+                generationController?.signal,
+              );
 
-              let processing: {
-                documentId: string | null;
-                status: string | null;
-              } | null = null;
-
-              for (let attempt = 0; attempt < 120; attempt++) {
-                if (generationController?.signal.aborted) {
-                  throw new DOMException("Операцію скасовано", "AbortError");
-                }
-
-                processing = await invoke<{
-                  documentId: string | null;
-                  status: string | null;
-                }>("get_attachment_processing_status", statusArgs);
-
-                if (processing.status === "completed" && processing.documentId) {
-                  break;
-                }
-
-                if (processing.status === "failed") {
-                  throw new Error("Індексація вкладення завершилася помилкою.");
-                }
-
-                await new Promise((resolve) => setTimeout(resolve, 500));
-              }
-
-              if (
-                processing?.status !== "completed" ||
-                !processing.documentId
-              ) {
-                throw new Error("Не дочекалися завершення індексації вкладення.");
-              }
-
-              if (fullDocumentSummaryRequest && !explicitImageAnalysis) {
-                const summary = await generateDocumentSummary(
-                  processing.documentId,
-                  backendConfig.ollamaModel,
-                  backendConfig.options,
-                  generationController?.signal,
-                );
-
-                if (summary.trim()) {
-                  attachmentResults.push({
-                    name: file.fileName,
-                    format: "Map-Reduce summary",
-                    content: summary,
-                    kind: "summary",
-                  });
-                }
+              if (summary.trim()) {
+                attachmentResults.push({
+                  referenceId: file.id,
+                  versionNumber: file.versionNumber,
+                  name: file.fileName,
+                  format: "Map-Reduce summary",
+                  content: summary,
+                  kind: "summary",
+                });
               }
             } catch (error) {
+              if (generationController?.signal.aborted) {
+                throw new DOMException("Операцію скасовано", "AbortError");
+              }
               console.warn(
                 `[Sonne] Не вдалося створити повний підсумок для ${file.fileName}:`,
                 error,
@@ -1386,29 +1499,38 @@ CSS підключено
         if (!fullDocumentSummaryRequest) return item.kind !== "summary";
         if (item.kind === "summary") return true;
         return !attachmentResults.some(
-          (candidate) => candidate.kind === "summary" && candidate.name === item.name,
+          (candidate) => candidate.kind === "summary" && candidate.referenceId === item.referenceId,
         );
       });
 
-      const groupedAttachmentContext = new Map<string, { format: string; kind: "retrieval" | "fallback" | "summary"; content: string[] }>();
+      const groupedAttachmentContext = new Map<string, {
+        name: string;
+        versionNumber: number;
+        format: string;
+        kind: "retrieval" | "fallback" | "summary";
+        content: string[];
+      }>();
       for (const result of preferredAttachmentResults) {
-        const current = groupedAttachmentContext.get(result.name) ?? {
+        const current = groupedAttachmentContext.get(result.referenceId) ?? {
+          name: result.name,
+          versionNumber: result.versionNumber,
           format: result.format,
           kind: result.kind,
           content: [],
         };
         current.content.push(result.content || "Текстовий вміст не знайдено в індексі.");
-        groupedAttachmentContext.set(result.name, current);
+        groupedAttachmentContext.set(result.referenceId, current);
       }
 
       const contextSections: Array<{ label: string; content: string; priority?: number }> = [];
-      for (const [fileName, group] of groupedAttachmentContext) {
+      for (const group of groupedAttachmentContext.values()) {
+        const sourceLabel = `${group.name} · версія ${group.versionNumber} (${group.format})`;
         contextSections.push({
           label: group.kind === "summary"
-            ? `Вкладений файл: ${fileName} (${group.format}) — повний підсумок`
+            ? `Вкладений файл: ${sourceLabel} — повний підсумок`
             : group.kind === "retrieval"
-              ? `Вкладений файл: ${fileName} (${group.format}) — релевантні фрагменти семантичного пошуку; це не повний текст документа`
-              : `Вкладений файл: ${fileName} (${group.format}) — резервний витяг документа`,
+              ? `Вкладений файл: ${sourceLabel} — релевантні фрагменти семантичного пошуку; це не повний текст документа`
+              : `Вкладений файл: ${sourceLabel} — резервний витяг документа`,
           content: group.content.join("\n\n--- Фрагмент документа ---\n\n"),
           priority: 100,
         });
@@ -1424,7 +1546,7 @@ CSS підключено
 
       // Explicit image analysis: enumerate every image, reuse only current-version
       // cache entries, persist each new result, and expose deterministic progress.
-      if (explicitImageAnalysis && attachmentFiles.length > 0) {
+      if (explicitImageAnalysis && processableAttachments.length > 0) {
         type VisionAsset = {
           assetId: string;
           assetType: string;
@@ -1436,7 +1558,10 @@ CSS підключено
           sectionTitle: string | null;
           attachmentName: string;
           chatId: string;
+          messageId: string;
           referenceId: string;
+          attachmentVersionId: string;
+          versionNumber: number;
         };
 
         const formatVisionEvidence = (
@@ -1468,7 +1593,7 @@ CSS підключено
         const enumerationErrors: string[] = [];
         const seenAssetIds = new Set<string>();
 
-        for (const attachment of attachmentFiles) {
+        for (const attachment of processableAttachments) {
           if (generationController.signal.aborted) {
             throw new DOMException("Generation cancelled", "AbortError");
           }
@@ -1484,7 +1609,12 @@ CSS підключено
               sectionTitle: string | null;
             }>>("list_attachment_document_assets", {
               chatId: attachment.chatId || chatId,
+              messageId: savedUser.id,
               referenceId: attachment.id,
+              attachmentVersionId: attachment.attachmentVersionId,
+              versionNumber: attachment.versionNumber,
+              extractor: EXTRACTOR_ID,
+              extractorVersion: EXTRACTOR_VERSION,
             });
 
             for (const asset of assets) {
@@ -1494,7 +1624,10 @@ CSS підключено
                 ...asset,
                 attachmentName: attachment.fileName,
                 chatId: attachment.chatId || chatId,
+                messageId: savedUser.id,
                 referenceId: attachment.id,
+                attachmentVersionId: attachment.attachmentVersionId,
+                versionNumber: attachment.versionNumber,
               });
             }
           } catch (error) {
@@ -1583,7 +1716,12 @@ CSS підключено
               const readStartedAt = performance.now();
               const bytes = await invoke<number[]>("read_attachment_document_asset", {
                 chatId: asset.chatId,
+                messageId: asset.messageId,
                 referenceId: asset.referenceId,
+                attachmentVersionId: asset.attachmentVersionId,
+                versionNumber: asset.versionNumber,
+                extractor: EXTRACTOR_ID,
+                extractorVersion: EXTRACTOR_VERSION,
                 assetId: asset.assetId,
               });
               const readMs = Math.round(performance.now() - readStartedAt);
@@ -1612,7 +1750,12 @@ CSS підключено
                 "save_attachment_document_asset_vision_description",
                 {
                   chatId: asset.chatId,
+                  messageId: asset.messageId,
                   referenceId: asset.referenceId,
+                  attachmentVersionId: asset.attachmentVersionId,
+                  versionNumber: asset.versionNumber,
+                  extractor: EXTRACTOR_ID,
+                  extractorVersion: EXTRACTOR_VERSION,
                   assetId: asset.assetId,
                   description,
                   modelName: "sonne-gemma:latest",
@@ -1769,7 +1912,7 @@ CSS підключено
       let visionBytes = 0;
 
       if (backendConfig.backend === "gemma") {
-        for (const attachment of attachmentFiles) {
+        for (const attachment of processableAttachments) {
           if (visionBytes >= maxVisionBytes) break;
 
           const supportedImage =
@@ -1787,6 +1930,8 @@ CSS підключено
             const imageFile = await loadStoredAttachment({
               id: attachment.id,
               chatId: attachment.chatId || chatId,
+              attachmentVersionId: attachment.attachmentVersionId,
+              versionNumber: attachment.versionNumber,
               fileName: attachment.fileName,
               mimeType: attachment.mimeType,
               originalSize: attachment.originalSize,

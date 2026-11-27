@@ -344,6 +344,41 @@ mod sqlite_vec_integration_tests {
 
         assert_eq!(matched_chunk, "test-chunk-001");
 
+        // sqlite-vec v0.1.9 accepts an ID-IN subquery as a KNN prefilter.
+        // The excluded vector is intentionally identical and would otherwise
+        // tie for the nearest result; it must not appear in the filtered top-K.
+        connection
+            .execute(
+                "INSERT INTO document_vectors_nomic (chunk_id, embedding)
+                 VALUES (?1, ?2)",
+                rusqlite::params!["test-chunk-002", vector_bytes.as_slice()],
+            )
+            .expect("vec0 must accept a second text-primary-key vector");
+
+        let filtered_chunks = {
+            let mut statement = connection
+                .prepare(
+                    "WITH allowed_ids(chunk_id) AS (
+                        SELECT 'test-chunk-001'
+                     )
+                     SELECT chunk_id
+                     FROM document_vectors_nomic
+                     WHERE embedding MATCH ?1
+                       AND k = 2
+                       AND document_vectors_nomic.chunk_id IN (
+                            SELECT chunk_id FROM allowed_ids
+                       )
+                     ORDER BY distance ASC",
+                )
+                .expect("vec0 must prepare the ID-IN KNN prefilter query");
+            let rows = statement
+                .query_map([vector_bytes.as_slice()], |row| row.get::<_, String>(0))
+                .expect("vec0 must execute the ID-IN KNN prefilter query");
+            rows.collect::<Result<Vec<_>, _>>()
+                .expect("vec0 must return the filtered IDs")
+        };
+        assert_eq!(filtered_chunks, vec!["test-chunk-001".to_string()]);
+
         drop(storage);
 
         println!("sqlite-vec version: {extension_version}");

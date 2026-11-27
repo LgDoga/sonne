@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  EXTRACTOR_ID,
+  EXTRACTOR_VERSION,
   loadStoredAttachment,
   readStoredAttachment,
 } from "../fileReader";
@@ -56,6 +58,12 @@ export default function FilePreviewPane({
         "search_attachment_documents",
         {
           chatId: attachment.chatId,
+          messageId: attachment.messageId,
+          referenceId: attachment.id,
+          attachmentVersionId: attachment.attachmentVersionId,
+          versionNumber: attachment.versionNumber,
+          extractor: EXTRACTOR_ID,
+          extractorVersion: EXTRACTOR_VERSION,
           query,
           queryEmbedding,
           limit: 30,
@@ -84,6 +92,8 @@ export default function FilePreviewPane({
     const input = {
       id: attachment.id,
       chatId: attachment.chatId,
+      attachmentVersionId: attachment.attachmentVersionId,
+      versionNumber: attachment.versionNumber,
       fileName: attachment.fileName,
       mimeType: attachment.mimeType,
       originalSize: attachment.originalSize,
@@ -168,8 +178,8 @@ export default function FilePreviewPane({
           type="search"
           value={searchQuery}
           onChange={(event) => setSearchQuery(event.target.value)}
-          placeholder="Пошук у документах чату…"
-          aria-label="Пошук у документах чату"
+          placeholder="Пошук у цьому файлі…"
+          aria-label="Пошук у цьому файлі"
           maxLength={512}
         />
         <button type="submit" disabled={searching || !searchQuery.trim()}>

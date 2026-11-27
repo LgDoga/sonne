@@ -532,6 +532,47 @@ impl Storage {
             .map_err(|error| format!("Cannot resolve preview attachment: {error}"))?
             .ok_or_else(|| "Attachment is unavailable for preview".to_string())
     }
+
+    /// Resolves a specific immutable attachment version for chunked local reads.
+    pub fn get_preview_blob_exact(
+        &self,
+        chat_id: &str,
+        reference_id: &str,
+        attachment_version_id: &str,
+        version_number: i64,
+    ) -> Result<PreviewBlobRecord, String> {
+        if attachment_version_id.is_empty()
+            || attachment_version_id.len() > 128
+            || version_number < 1
+        {
+            return Err("Invalid attachment version identity".into());
+        }
+
+        self.connection
+            .query_row(
+                "SELECT b.relative_path, v.file_name, v.mime_type, b.original_size
+                 FROM attachment_references r
+                 JOIN attachment_versions v ON v.id = r.attachment_version_id
+                 JOIN blobs b ON b.sha256 = v.blob_sha256
+                 WHERE r.id = ?1
+                   AND r.chat_id = ?2
+                   AND v.id = ?3
+                   AND v.version_number = ?4
+                   AND b.storage_state = 'original'",
+                params![reference_id, chat_id, attachment_version_id, version_number],
+                |row| {
+                    Ok(PreviewBlobRecord {
+                        relative_path: row.get(0)?,
+                        file_name: row.get(1)?,
+                        mime_type: row.get(2)?,
+                        original_size: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("Cannot resolve exact attachment version: {error}"))?
+            .ok_or_else(|| "Attachment reference does not match the requested version".to_string())
+    }
 }
 
 impl Storage {
@@ -595,6 +636,8 @@ pub fn read_attachment_chunk(
     state: tauri::State<'_, std::sync::Mutex<Storage>>,
     chat_id: String,
     reference_id: String,
+    attachment_version_id: String,
+    version_number: i64,
     offset: u64,
     length: usize,
 ) -> Result<Vec<u8>, String> {
@@ -611,8 +654,13 @@ pub fn read_attachment_chunk(
         .lock()
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
 
-    // The reference is resolved within the requested chat.
-    let blob = storage.get_preview_blob(&chat_id, &reference_id)?;
+    // Resolve the exact immutable version, not merely the current reference.
+    let blob = storage.get_preview_blob_exact(
+        &chat_id,
+        &reference_id,
+        &attachment_version_id,
+        version_number,
+    )?;
     let path = storage.resolve_blob_path(&blob.relative_path)?;
 
     use std::io::{Read, Seek, SeekFrom};
