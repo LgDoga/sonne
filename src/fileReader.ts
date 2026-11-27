@@ -188,7 +188,7 @@ export interface StoredAttachmentInput {
 }
 
 export const EXTRACTOR_ID = "sonne-unified";
-export const EXTRACTOR_VERSION = "officeparser-8.9.0_tesseract-7.0.0_assets-v3-on-demand-vision";
+export const EXTRACTOR_VERSION = "officeparser-8.9.0_tesseract-7.0.0_assets-v4-on-demand-vision";
 const STORED_READ_CHUNK_SIZE = 256 * 1024;
 const INDEX_CHUNK_TARGET_TOKENS = 800;
 const INDEX_CHUNK_OVERLAP_TOKENS = 120;
@@ -231,6 +231,7 @@ type ExtractedAsset = {
 const MAX_DOCUMENT_ASSETS = 1_000;
 const MAX_ASSET_BYTES = 16 * 1024 * 1024;
 const MAX_DOCUMENT_ASSET_BYTES = 64 * 1024 * 1024;
+const MAX_ASSET_WARNING_MESSAGES = 100;
 
 function isArchiveName(name: string): boolean {
   return /\.(zip|tar|gz|tgz)$/i.test(name);
@@ -552,7 +553,12 @@ function collectAstAssetSectionKeys(ast: unknown): Map<string, string> {
   return result;
 }
 
-function extractOfficeAssets(ast: unknown): ExtractedAsset[] {
+type OfficeAssetExtraction = {
+  assets: ExtractedAsset[];
+  warnings: string[];
+};
+
+function extractOfficeAssets(ast: unknown): OfficeAssetExtraction {
   const root = ast as Record<string, unknown>;
   const attachments = Array.isArray(root?.attachments)
     ? root.attachments
@@ -560,13 +566,24 @@ function extractOfficeAssets(ast: unknown): ExtractedAsset[] {
 
   const sectionKeys = collectAstAssetSectionKeys(ast);
   const assets: ExtractedAsset[] = [];
+  const warnings: string[] = [];
   let totalBytes = 0;
+  let omittedWarnings = 0;
+
+  const warn = (message: string): void => {
+    if (warnings.length < MAX_ASSET_WARNING_MESSAGES - 1) {
+      warnings.push(message);
+    } else {
+      omittedWarnings += 1;
+    }
+  };
 
   for (let index = 0; index < attachments.length; index++) {
     const raw = attachments[index];
 
     if (!raw || typeof raw !== "object") {
-      throw new Error(`Некоректне вкладення OfficeParser №${index + 1}.`);
+      warn(`Вкладення OfficeParser №${index + 1} пропущено: некоректний запис.`);
+      continue;
     }
 
     const attachment = raw as Record<string, unknown>;
@@ -577,15 +594,17 @@ function extractOfficeAssets(ast: unknown): ExtractedAsset[] {
     }
 
     if (assets.length >= MAX_DOCUMENT_ASSETS) {
-      throw new Error(
-        `Документ містить більше ${MAX_DOCUMENT_ASSETS} зображень і діаграм.`,
+      warn(
+        `Вкладення OfficeParser №${index + 1} пропущено: досягнуто ліміт ${MAX_DOCUMENT_ASSETS} assets.`,
       );
+      continue;
     }
 
     if (typeof attachment.data !== "string" || !attachment.data.trim()) {
-      throw new Error(
-        `OfficeParser не повернув дані вкладення №${index + 1}.`,
+      warn(
+        `Вкладення OfficeParser №${index + 1} пропущено: парсер не повернув дані.`,
       );
+      continue;
     }
 
     let base64 = attachment.data.trim();
@@ -594,7 +613,10 @@ function extractOfficeAssets(ast: unknown): ExtractedAsset[] {
     if (base64.startsWith("data:")) {
       const comma = base64.indexOf(",");
       if (comma < 0 || !base64.slice(0, comma).includes(";base64")) {
-        throw new Error(`Некоректний Base64 data URI у вкладенні №${index + 1}.`);
+        warn(
+          `Вкладення OfficeParser №${index + 1} пропущено: некоректний Base64 data URI.`,
+        );
+        continue;
       }
 
       const header = base64.slice(5, comma);
@@ -609,7 +631,10 @@ function extractOfficeAssets(ast: unknown): ExtractedAsset[] {
       base64.length % 4 !== 0 ||
       !/^[A-Za-z0-9+/]*={0,2}$/.test(base64)
     ) {
-      throw new Error(`Некоректне Base64-кодування вкладення №${index + 1}.`);
+      warn(
+        `Вкладення OfficeParser №${index + 1} пропущено: некоректне Base64-кодування.`,
+      );
+      continue;
     }
 
     const estimatedSize =
@@ -621,91 +646,109 @@ function extractOfficeAssets(ast: unknown): ExtractedAsset[] {
       estimatedSize <= 0 ||
       estimatedSize > MAX_ASSET_BYTES
     ) {
-      throw new Error(
-        `Вкладення №${index + 1} перевищує ліміт ${MAX_ASSET_BYTES / 1024 / 1024} MiB.`,
+      warn(
+        `Вкладення OfficeParser №${index + 1} пропущено: порожнє або перевищує ліміт ${MAX_ASSET_BYTES / 1024 / 1024} MiB.`,
       );
+      continue;
     }
 
     let binary: string;
-
     try {
       binary = atob(base64);
     } catch {
-      throw new Error(`Не вдалося декодувати вкладення №${index + 1}.`);
+      warn(
+        `Вкладення OfficeParser №${index + 1} пропущено: не вдалося декодувати Base64.`,
+      );
+      continue;
     }
 
     const bytes = new Uint8Array(binary.length);
-
     for (let byteIndex = 0; byteIndex < binary.length; byteIndex++) {
       bytes[byteIndex] = binary.charCodeAt(byteIndex);
     }
 
-    totalBytes += bytes.byteLength;
-
-    if (totalBytes > MAX_DOCUMENT_ASSET_BYTES) {
-      throw new Error(
-        `Сумарний розмір вкладень перевищує ліміт ${MAX_DOCUMENT_ASSET_BYTES / 1024 / 1024} MiB.`,
-      );
-    }
-
     const name =
       typeof attachment.name === "string" ? attachment.name : null;
-
-    const mimeType =
+    const rawMimeType =
       typeof attachment.mimeType === "string"
         ? attachment.mimeType
         : dataUriMime;
+    const mimeType = rawMimeType || null;
 
     if (name && name.length > 512) {
-      throw new Error(`Назва вкладення №${index + 1} задовга.`);
+      warn(`Вкладення OfficeParser №${index + 1} пропущено: назва задовга.`);
+      continue;
     }
 
-    if (mimeType && mimeType.length > 128) {
-      throw new Error(`MIME-тип вкладення №${index + 1} задовгий.`);
+    if (mimeType !== null && (mimeType.length === 0 || mimeType.length > 128)) {
+      warn(`Вкладення OfficeParser №${index + 1} пропущено: некоректний MIME-тип.`);
+      continue;
     }
 
     const metadata: Record<string, unknown> = {};
-
     if (name) metadata.attachmentName = name;
 
     if (typeof attachment.ocrText === "string" && attachment.ocrText) {
       metadata.ocrText = attachment.ocrText;
     }
 
-    if (typeof attachment.chartData === "object" && attachment.chartData !== null) {
+    if (
+      typeof attachment.chartData === "object" &&
+      attachment.chartData !== null
+    ) {
       metadata.chartData = attachment.chartData;
     }
 
     const astSectionKey = name ? sectionKeys.get(name) ?? null : null;
-
     if (astSectionKey) metadata.astSectionKey = astSectionKey;
 
     let metadataJson: string;
-
     try {
       metadataJson = JSON.stringify(metadata);
     } catch {
-      throw new Error(`Не вдалося серіалізувати метадані вкладення №${index + 1}.`);
+      warn(
+        `Вкладення OfficeParser №${index + 1} пропущено: не вдалося серіалізувати метадані.`,
+      );
+      continue;
     }
 
-    if (new TextEncoder().encode(metadataJson).byteLength > 256 * 1024) {
-      throw new Error(
-        `Метадані вкладення №${index + 1} перевищують ліміт 256 KiB.`,
+    if (
+      new TextEncoder().encode(metadataJson).byteLength >
+      256 * 1024
+    ) {
+      warn(
+        `Вкладення OfficeParser №${index + 1} пропущено: метадані перевищують 256 KiB.`,
       );
+      continue;
+    }
+
+    const nextTotal = totalBytes + bytes.byteLength;
+    if (!Number.isSafeInteger(nextTotal) || nextTotal > MAX_DOCUMENT_ASSET_BYTES) {
+      warn(
+        `Вкладення OfficeParser №${index + 1} пропущено: було б перевищено сумарний ліміт ${MAX_DOCUMENT_ASSET_BYTES / 1024 / 1024} MiB.`,
+      );
+      continue;
     }
 
     assets.push({
       sectionKey: astSectionKey,
       assetType,
-      mimeType: mimeType ?? null,
+      mimeType,
       fileName: name,
       ordinal: index,
       data: Array.from(bytes),
       metadata: Object.keys(metadata).length ? metadata : null,
     });
+    totalBytes = nextTotal;
   }
 
-  return assets;
+  if (omittedWarnings > 0) {
+    warnings.push(
+      `Ще ${omittedWarnings} попереджень про вкладення не показано через ліміт діагностики.`,
+    );
+  }
+
+  return { assets, warnings };
 }
 
 async function extractStoredFile(
@@ -755,24 +798,52 @@ async function extractStoredFile(
     }
 
     const sections = collectAstSections(ast);
-    const assets = extractOfficeAssets(ast);
+    const assetExtraction = extractOfficeAssets(ast);
+    const metadata = getAstMetadata(ast);
+    if (assetExtraction.warnings.length) {
+      metadata.assetExtractionWarnings = assetExtraction.warnings;
+    }
 
     return {
       type,
       content: result.value,
       sections,
-      assets,
-      metadata: getAstMetadata(ast),
+      assets: assetExtraction.assets,
+      metadata,
     };
   }
 
   if (type === "image") {
-    // Keep the original image as a first-class asset even when OCR finds no text.
+    // Keep OCR text even when the original image is too large to embed as an asset.
     const ocrText = await readImageFile(file);
+    const assets: ExtractedAsset[] = [];
+    const metadata: Record<string, unknown> = {
+      fileName: file.name,
+      mimeType: file.type,
+      extraction: "tesseract-ocr",
+    };
+
     if (file.size > MAX_ASSET_BYTES) {
-      throw new Error(`Зображення перевищує ліміт ${MAX_ASSET_BYTES / 1024 / 1024} MiB.`);
+      metadata.assetExtractionWarnings = [
+        `Зображення "${file.name}" не збережено як asset: перевищено ліміт ${MAX_ASSET_BYTES / 1024 / 1024} MiB. OCR-текст збережено.`,
+      ];
+    } else if (file.size > 0) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      assets.push({
+        sectionKey: "root",
+        assetType: "image",
+        mimeType: file.type || null,
+        fileName: file.name,
+        ordinal: 0,
+        data: Array.from(bytes),
+        metadata: ocrText.trim() ? { ocrText: ocrText.trim() } : null,
+      });
+    } else {
+      metadata.assetExtractionWarnings = [
+        `Зображення "${file.name}" не збережено як asset: файл порожній.`,
+      ];
     }
-    const bytes = new Uint8Array(await file.arrayBuffer());
+
     return {
       type,
       content: ocrText.trim() || `Зображення: ${file.name}`,
@@ -783,16 +854,8 @@ async function extractStoredFile(
         title: file.name,
         ordinal: 0,
       }],
-      assets: [{
-        sectionKey: "root",
-        assetType: "image",
-        mimeType: file.type || null,
-        fileName: file.name,
-        ordinal: 0,
-        data: Array.from(bytes),
-        metadata: ocrText.trim() ? { ocrText: ocrText.trim() } : null,
-      }],
-      metadata: { fileName: file.name, mimeType: file.type, extraction: "tesseract-ocr" },
+      assets,
+      metadata,
     };
   }
 
@@ -1166,7 +1229,13 @@ export async function processStoredAttachment(
 
       await renewClaim();
 
-      const saved = await invoke<{ documentId: string }>(
+      const saved = await invoke<{
+        documentId: string;
+        assetCount: number;
+        assetWarningCount: number;
+        assetWarnings: string[];
+        assetWarningsOmitted: number;
+      }>(
         "save_extracted_document",
         {
           input: {
@@ -1187,6 +1256,20 @@ export async function processStoredAttachment(
           },
         },
       );
+
+      if (saved.assetWarningCount > 0) {
+        onProgress?.(
+          `Збережено assets: ${saved.assetCount}; попереджень: ${saved.assetWarningCount}.`,
+        );
+        for (const warning of saved.assetWarnings.slice(0, 5)) {
+          onProgress?.(`Asset: ${warning}`);
+        }
+        if (saved.assetWarningCount > saved.assetWarnings.length) {
+          onProgress?.(
+            `Ще ${saved.assetWarningCount - saved.assetWarnings.length} попереджень не показано.`,
+          );
+        }
+      }
 
       documentId = saved.documentId;
     }

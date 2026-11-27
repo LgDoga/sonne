@@ -44,8 +44,9 @@ export default function ChatMessageItem({
   const isLastAssistant = isGenerating && index === totalMessages - 1;
   const assistantLabel = isLastAssistant && !message.content ? "Sonne думає" : "Sonne";
 
-  const copyContent = message.promptContent ??
-    message.content.replace(/\n\n📎 .*$/, "");
+  // Copy only the text shown in the user message bubble. `promptContent`
+  // is model-only context and may include extracted document text and AI summaries.
+  const copyContent = message.content;
 
   return (
     <div className={`msg ${message.role}`}>

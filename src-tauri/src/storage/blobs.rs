@@ -59,8 +59,8 @@ fn hash_file(path: &Path) -> Result<String, String> {
 }
 
 fn canonical_real_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| format!("Cannot inspect {label}: {error}"))?;
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("Cannot inspect {label}: {error}"))?;
 
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(format!("{label} is not a regular directory"));
@@ -77,9 +77,7 @@ fn ensure_child_directory(
 ) -> Result<PathBuf, String> {
     let mut components = Path::new(name).components();
 
-    if !matches!(components.next(), Some(Component::Normal(_)))
-        || components.next().is_some()
-    {
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
         return Err("Invalid storage directory component".to_string());
     }
 
@@ -88,13 +86,10 @@ fn ensure_child_directory(
 
     match fs::symlink_metadata(&child) {
         Ok(_) => {}
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound && create_if_missing =>
-        {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
             match fs::create_dir(&child) {
                 Ok(()) => {}
-                Err(create_error)
-                    if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(create_error) if create_error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(create_error) => {
                     return Err(format!(
                         "Cannot create storage directory {}: {create_error}",
@@ -373,8 +368,7 @@ impl Storage {
             .map_err(|error| format!("Cannot check blob deduplication: {error}"))?;
 
         let relative_path = if let Some((existing_relative, _)) = existing {
-            let existing_path =
-                ensure_blob_target_path(&storage_root, &existing_relative, true)?;
+            let existing_path = ensure_blob_target_path(&storage_root, &existing_relative, true)?;
 
             let existing_is_valid = match fs::symlink_metadata(&existing_path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -423,9 +417,10 @@ impl Storage {
             self.connection
                 .execute(
                     "UPDATE storage_operations
-                     SET state = 'COMMITTING', target_path = ?1, updated_at = ?2
-                     WHERE id = ?3",
-                    params![existing_relative, now_timestamp()?, operation_id],
+                     SET blob_sha256 = ?1, state = 'COMMITTING',
+                         target_path = ?2, updated_at = ?3
+                     WHERE id = ?4",
+                    params![sha256, existing_relative, now_timestamp()?, operation_id],
                 )
                 .map_err(|error| format!("Cannot update repair journal: {error}"))?;
 
@@ -454,9 +449,10 @@ impl Storage {
             self.connection
                 .execute(
                     "UPDATE storage_operations
-                     SET state = 'VERIFYING', target_path = ?1, updated_at = ?2
-                     WHERE id = ?3",
-                    params![relative, now_timestamp()?, operation_id],
+                     SET blob_sha256 = ?1, state = 'VERIFYING',
+                         target_path = ?2, updated_at = ?3
+                     WHERE id = ?4",
+                    params![sha256, relative, now_timestamp()?, operation_id],
                 )
                 .map_err(|error| format!("Cannot update verification journal: {error}"))?;
 
@@ -561,9 +557,23 @@ impl Storage {
             .map_err(|error| format!("Cannot resolve unused blob: {error}"))?;
 
         let Some(relative_path) = relative_path else {
+            // Do not mistake a registered-but-referenced blob for a missing
+            // blobs row. Shared assets must keep their physical CAS file.
+            let blob_is_registered: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                    params![sha256],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    format!("Cannot inspect blob registration during cleanup: {error}")
+                })?;
             transaction
                 .commit()
                 .map_err(|error| format!("Cannot finish blob cleanup check: {error}"))?;
+            if !blob_is_registered {
+                let _ = remove_unregistered_blob_file(&self.root_dir, sha256)?;
+            }
             return Ok(());
         };
 
@@ -698,7 +708,7 @@ fn resolve_recovery_temp_path(root: &Path, relative: &str) -> Result<Option<Path
     }
 }
 
-fn collect_import_child_blob_hashes(
+pub(super) fn collect_child_blob_hashes(
     connection: &Connection,
     parent_operation_id: &str,
 ) -> Result<Vec<String>, String> {
@@ -759,18 +769,94 @@ fn collect_import_child_blob_hashes(
     Ok(hashes)
 }
 
+fn parse_replaced_asset_hashes(metadata_json: Option<&str>) -> Result<Vec<String>, String> {
+    let raw_metadata =
+        metadata_json.ok_or_else(|| "Document asset batch metadata is missing".to_string())?;
+    let metadata = serde_json::from_str::<Value>(raw_metadata)
+        .map_err(|error| format!("Cannot parse document asset batch metadata: {error}"))?;
+    let object = metadata
+        .as_object()
+        .ok_or_else(|| "Document asset batch metadata must be a JSON object".to_string())?;
+    // Older/interrupted batches may predate this optional field. Treat an
+    // absent field as no previous assets, but reject a present malformed value.
+    let Some(values) = object.get("replacedAssetHashes") else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| "replacedAssetHashes must be a JSON array".to_string())?;
+
+    let mut hashes = Vec::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let hash = value
+            .as_str()
+            .ok_or_else(|| format!("Replaced asset hash {index} is not a string"))?;
+        if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "Replaced asset hash {index} is not a valid SHA-256"
+            ));
+        }
+        hashes.push(hash.to_owned());
+    }
+
+    Ok(hashes)
+}
+
+fn remove_unregistered_blob_file(root: &Path, sha256: &str) -> Result<bool, String> {
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Invalid SHA-256 for unregistered blob cleanup".into());
+    }
+    let normalized_hash = sha256.to_ascii_lowercase();
+    let prefix = &normalized_hash[..2];
+    let relative = format!("blobs/{prefix}/{normalized_hash}.blob");
+    let prefix_path = root.join("blobs").join(prefix);
+
+    match fs::symlink_metadata(&prefix_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Cannot inspect unregistered blob directory: {error}"
+            ))
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("Unregistered blob directory is not a regular directory".into());
+        }
+        Ok(_) => {}
+    }
+
+    let candidate = ensure_blob_target_path(root, &relative, false)?;
+    match fs::symlink_metadata(&candidate) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("Cannot inspect unregistered blob file: {error}")),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err("Unregistered blob target is not a regular file".into());
+        }
+        Ok(_) => {}
+    }
+
+    let actual_hash = hash_file(&candidate)?;
+    if actual_hash != normalized_hash {
+        return Err(
+            "Unregistered blob content does not match its journaled SHA-256; file preserved".into(),
+        );
+    }
+
+    remove_recovered_blob_file(root, &relative)?;
+    Ok(true)
+}
+
 fn recover_unreferenced_blob(
     connection: &Connection,
     root_dir: &Path,
     sha256: &str,
 ) -> Result<bool, String> {
     if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("Invalid SHA-256 in interrupted import journal".to_string());
+        return Err("Invalid SHA-256 in interrupted batch journal".to_string());
     }
     let timestamp = now_timestamp()?;
     let transaction = connection
         .unchecked_transaction()
-        .map_err(|error| format!("Cannot start import recovery cleanup: {error}"))?;
+        .map_err(|error| format!("Cannot start batch recovery cleanup: {error}"))?;
     let relative_path: Option<String> = transaction
         .query_row(
             "SELECT relative_path FROM blobs WHERE sha256 = ?1
@@ -782,12 +868,26 @@ fn recover_unreferenced_blob(
             |row| row.get(0),
         )
         .optional()
-        .map_err(|error| format!("Cannot inspect interrupted import blob: {error}"))?;
+        .map_err(|error| format!("Cannot inspect interrupted batch blob: {error}"))?;
     let Some(relative_path) = relative_path else {
+        // A missing path from the reference-filtered query is ambiguous:
+        // the blob may still be registered but referenced by an attachment,
+        // document asset, or archive entry. Only physical orphans whose
+        // blobs row is absent may be removed here.
+        let blob_is_registered: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                params![sha256],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Cannot inspect batch blob registration: {error}"))?;
         transaction
             .commit()
-            .map_err(|error| format!("Cannot finish import recovery check: {error}"))?;
-        return Ok(false);
+            .map_err(|error| format!("Cannot finish batch recovery check: {error}"))?;
+        if blob_is_registered {
+            return Ok(false);
+        }
+        return remove_unregistered_blob_file(root_dir, sha256);
     };
     let operation_id = Uuid::new_v4().to_string();
     transaction
@@ -807,10 +907,10 @@ fn recover_unreferenced_blob(
            AND NOT EXISTS (SELECT 1 FROM extracted_documents WHERE blob_sha256 = ?1)",
             params![sha256],
         )
-        .map_err(|error| format!("Cannot remove recovered orphan metadata: {error}"))?;
+        .map_err(|error| format!("Cannot remove recovered orphan blob metadata: {error}"))?;
     transaction
         .commit()
-        .map_err(|error| format!("Cannot commit recovered blob cleanup: {error}"))?;
+        .map_err(|error| format!("Cannot commit recovered batch blob cleanup: {error}"))?;
     if deleted == 0 {
         return Ok(false);
     }
@@ -819,7 +919,7 @@ fn recover_unreferenced_blob(
         "UPDATE storage_operations SET state = 'COMPLETED', error_message = NULL, updated_at = ?1
          WHERE id = ?2",
         params![now_timestamp()?, operation_id]
-    ).map_err(|error| format!("Cannot complete recovered blob cleanup: {error}"))?;
+    ).map_err(|error| format!("Cannot complete recovered batch blob cleanup: {error}"))?;
     Ok(true)
 }
 
@@ -833,7 +933,7 @@ pub(super) fn recover_interrupted_operations(
                 "SELECT id, operation_type, source_path, target_path, blob_sha256, metadata_json
                  FROM storage_operations
                  WHERE state IN ('PENDING', 'PROCESSING', 'VERIFYING', 'COMMITTING')
-                    OR (operation_type = 'import_batch' AND state = 'FAILED')
+                    OR (operation_type IN ('import_batch', 'document_assets_batch') AND state = 'FAILED')
                  ORDER BY created_at ASC",
             )
             .map_err(|error| format!("Cannot prepare interrupted operation query: {error}"))?;
@@ -1024,7 +1124,7 @@ pub(super) fn recover_interrupted_operations(
 
                     // Also recover blobs whose child journal completed before
                     // the parent import journal could record the SHA.
-                    hashes.extend(collect_import_child_blob_hashes(connection, &operation_id)?);
+                    hashes.extend(collect_child_blob_hashes(connection, &operation_id)?);
 
                     hashes.sort();
                     hashes.dedup();
@@ -1067,6 +1167,51 @@ pub(super) fn recover_interrupted_operations(
                     }
                 }
             }
+            "document_assets_batch" => {
+                let hashes_result = (|| -> Result<Vec<String>, String> {
+                    let mut hashes = collect_child_blob_hashes(connection, &operation_id)?;
+                    hashes.extend(parse_replaced_asset_hashes(metadata_json.as_deref())?);
+                    hashes.sort();
+                    hashes.dedup();
+                    Ok(hashes)
+                })();
+
+                match hashes_result {
+                    Err(error) => {
+                        recovery_message.push_str(&format!(
+                            " Document asset recovery deferred because child journal data is invalid: {error}"
+                        ));
+                    }
+                    Ok(hashes) => {
+                        let mut cleaned = 0usize;
+                        let mut preserved = 0usize;
+                        let mut cleanup_failed = false;
+
+                        for sha256 in hashes {
+                            match recover_unreferenced_blob(connection, root_dir, &sha256) {
+                                Ok(true) => cleaned += 1,
+                                Ok(false) => preserved += 1,
+                                Err(error) => {
+                                    cleanup_failed = true;
+                                    recovery_message.push_str(&format!(
+                                        " Cleanup deferred for asset blob {sha256}: {error}"
+                                    ));
+                                }
+                            }
+                        }
+
+                        recovery_message.push_str(&format!(
+                            " Interrupted document asset recovery removed {cleaned} unreferenced blobs and preserved {preserved} referenced or already unavailable blobs."
+                        ));
+
+                        recovered_state = if cleanup_failed {
+                            "FAILED"
+                        } else {
+                            "COMPLETED"
+                        };
+                    }
+                }
+            }
             _ => {
                 recovery_message
                     .push_str(" Unknown operation type; filesystem data was left untouched.");
@@ -1080,7 +1225,7 @@ pub(super) fn recover_interrupted_operations(
                  WHERE id = ?4
                    AND (
                        state IN ('PENDING', 'PROCESSING', 'VERIFYING', 'COMMITTING')
-                       OR (operation_type = 'import_batch' AND state = 'FAILED')
+                       OR (operation_type IN ('import_batch', 'document_assets_batch') AND state = 'FAILED')
                    )",
                 params![
                     recovered_state,
@@ -1114,10 +1259,9 @@ mod path_safety_tests {
                 match fs::create_dir(&path) {
                     Ok(()) => return Self(path),
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => panic!(
-                        "Cannot create test directory {}: {error}",
-                        path.display()
-                    ),
+                    Err(error) => {
+                        panic!("Cannot create test directory {}: {error}", path.display())
+                    }
                 }
             }
 
@@ -1250,5 +1394,103 @@ mod path_safety_tests {
             root.join("blobs").join("ef").canonicalize().unwrap()
         );
         assert!(!target.exists());
+    }
+}
+
+#[cfg(test)]
+mod document_asset_batch_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn replaced_asset_hashes_must_be_an_array() {
+        let error = parse_replaced_asset_hashes(Some(r#"{"replacedAssetHashes":"not-an-array"}"#))
+            .unwrap_err();
+        assert!(error.contains("must be a JSON array"));
+    }
+
+    #[test]
+    fn replaced_asset_hashes_must_contain_valid_sha256_values() {
+        let error =
+            parse_replaced_asset_hashes(Some(r#"{"replacedAssetHashes":["short"]}"#)).unwrap_err();
+        assert!(error.contains("valid SHA-256"));
+    }
+
+    #[test]
+    fn missing_replaced_asset_hashes_is_compatible_with_legacy_batches() {
+        assert_eq!(
+            parse_replaced_asset_hashes(Some(r#"{"documentId":"legacy-batch"}"#)).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn child_blob_collection_includes_hash_before_blob_row_commit() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE storage_operations (
+                    operation_type TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    blob_sha256 TEXT,
+                    metadata_json TEXT
+                );",
+            )
+            .unwrap();
+        let hash = "b".repeat(64);
+        let metadata = serde_json::json!({
+            "parentOperationId": "asset-batch-test"
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO storage_operations (operation_type,state,blob_sha256,metadata_json)
+             VALUES ('store_blob','COMMITTING',?1,?2)",
+                params![hash, metadata],
+            )
+            .unwrap();
+
+        assert_eq!(
+            collect_child_blob_hashes(&connection, "asset-batch-test").unwrap(),
+            vec![hash]
+        );
+    }
+
+    #[test]
+    fn replaced_asset_hashes_accepts_an_empty_array() {
+        assert_eq!(
+            parse_replaced_asset_hashes(Some(r#"{"replacedAssetHashes":[]}"#)).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn child_blob_collection_includes_durable_child_hashes() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE storage_operations (
+                    operation_type TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    blob_sha256 TEXT,
+                    metadata_json TEXT
+                );",
+            )
+            .unwrap();
+
+        let hash = "a".repeat(64);
+        let metadata = serde_json::json!({ "parentOperationId": "asset-batch-test" }).to_string();
+        connection
+            .execute(
+                "INSERT INTO storage_operations (
+                    operation_type, state, blob_sha256, metadata_json
+                 ) VALUES ('store_blob', 'COMPLETED', ?1, ?2)",
+                rusqlite::params![hash, metadata],
+            )
+            .unwrap();
+
+        assert_eq!(
+            collect_child_blob_hashes(&connection, "asset-batch-test").unwrap(),
+            vec![hash]
+        );
     }
 }

@@ -937,4 +937,251 @@ mod storage_lifecycle_tests {
         assert_eq!(parent_state, "COMPLETED");
         assert_eq!(child_state, "COMPLETED");
     }
+
+    #[test]
+    fn startup_recovers_interrupted_document_asset_batch_from_child_journal() {
+        let (directory, mut storage) = storage();
+        let operation_id = "document-assets-crash-window-test";
+
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
+                    id, operation_type, state, metadata_json, created_at, updated_at
+                 ) VALUES (?1, 'document_assets_batch', 'PROCESSING', ?2, 1, 1)",
+                rusqlite::params![
+                    operation_id,
+                    serde_json::json!({
+                        "documentId": "document-before-transaction",
+                        "expectedAssetCount": 1
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let blob = storage
+            .store_blob_with_parent(
+                Cursor::new(b"orphaned extracted document asset".to_vec()),
+                1024 * 1024,
+                Some(operation_id),
+            )
+            .unwrap();
+
+        assert!(storage.root_dir().join(&blob.relative_path).exists());
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0)
+            .expect("startup should recover interrupted document assets");
+
+        let blob_exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(!blob_exists, "orphan asset blob metadata should be removed");
+        assert!(
+            !recovered.root_dir().join(&blob.relative_path).exists(),
+            "orphan asset file should be removed"
+        );
+
+        let parent_state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations WHERE id = ?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(parent_state, "COMPLETED");
+    }
+
+    #[test]
+    fn startup_recovery_retires_replaced_blobs_and_preserves_shared_assets() {
+        let (directory, mut storage) = storage();
+        let operation_id = "document-assets-shared-blob-test";
+        let replaced_blob = storage
+            .store_blob(Cursor::new(b"old asset no longer referenced".to_vec()))
+            .unwrap();
+
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
+                    id, operation_type, state, metadata_json, created_at, updated_at
+                 ) VALUES (?1, 'document_assets_batch', 'COMMITTING', ?2, 1, 1)",
+                rusqlite::params![
+                    operation_id,
+                    serde_json::json!({
+                        "documentId": "interrupted-document",
+                        "replacedAssetHashes": [replaced_blob.sha256]
+                    })
+                    .to_string()
+                ],
+            )
+            .unwrap();
+
+        let blob = storage
+            .store_blob_with_parent(
+                Cursor::new(b"asset blob shared by an attachment".to_vec()),
+                1024 * 1024,
+                Some(operation_id),
+            )
+            .unwrap();
+
+        let chat = storage.create_chat("shared asset").unwrap();
+        let version = storage
+            .create_attachment_version(None, &blob.sha256, "shared-image.png", "png", "image/png")
+            .unwrap();
+        storage
+            .add_attachment_reference(&chat.id, &version.id, None, "composer", 0)
+            .unwrap();
+
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0)
+            .expect("startup recovery should preserve shared asset blobs");
+
+        let blob_exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(blob_exists, "blob referenced by an attachment must remain");
+        assert!(recovered.root_dir().join(&blob.relative_path).exists());
+
+        let replaced_blob_exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [&replaced_blob.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !replaced_blob_exists,
+            "replaced assets with no remaining references must be removed"
+        );
+        assert!(!recovered
+            .root_dir()
+            .join(&replaced_blob.relative_path)
+            .exists());
+
+        let parent_state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations WHERE id = ?1",
+                [operation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(parent_state, "COMPLETED");
+    }
+
+    #[test]
+    fn startup_recovery_removes_blob_left_by_failed_final_metadata_commit() {
+        let (directory, mut storage) = storage();
+        let batch_id = "document-assets-final-blob-commit-failure";
+        storage
+            .connection()
+            .execute(
+                "INSERT INTO storage_operations (
+                id, operation_type, state, metadata_json, created_at, updated_at
+             ) VALUES (?1, 'document_assets_batch', 'PROCESSING', ?2, 1, 1)",
+                rusqlite::params![
+                    batch_id,
+                    serde_json::json!({ "documentId": "interrupted-document" }).to_string()
+                ],
+            )
+            .unwrap();
+        storage
+            .connection()
+            .execute_batch(
+                "CREATE TRIGGER fail_blob_metadata_insert
+             BEFORE INSERT ON blobs
+             BEGIN SELECT RAISE(ABORT, 'forced final blob metadata failure'); END;",
+            )
+            .unwrap();
+
+        let result = storage.store_blob_with_parent(
+            Cursor::new(b"physical blob committed before metadata failure".to_vec()),
+            1024 * 1024,
+            Some(batch_id),
+        );
+        assert!(
+            result.is_err(),
+            "the trigger must force the final blobs INSERT to fail"
+        );
+
+        let (hash, target_path, child_state): (Option<String>, Option<String>, String) = storage
+            .connection()
+            .query_row(
+                "SELECT blob_sha256, target_path, state FROM storage_operations
+                 WHERE operation_type = 'store_blob'
+                 ORDER BY created_at DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let hash = hash.expect("child SHA must be durable before the file rename");
+        let relative = target_path.expect("target path must be durable before rename");
+        assert_eq!(child_state, "COMMITTING");
+        assert!(
+            storage.root_dir().join(&relative).exists(),
+            "the test must reach the physical-orphan crash window"
+        );
+        let row_exists: bool = storage
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [hash.clone()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !row_exists,
+            "the forced failure must roll back the blobs metadata row"
+        );
+
+        storage
+            .connection()
+            .execute_batch("DROP TRIGGER fail_blob_metadata_insert;")
+            .unwrap();
+        drop(storage);
+
+        let recovered = Storage::initialize(&directory.0)
+            .expect("startup should reconcile the ambiguous child blob commit");
+        assert!(
+            !recovered.root_dir().join(&relative).exists(),
+            "unregistered physical blob must be removed"
+        );
+        let row_exists: bool = recovered
+            .connection()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                [hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!row_exists);
+        let parent_state: String = recovered
+            .connection()
+            .query_row(
+                "SELECT state FROM storage_operations WHERE id = ?1",
+                [batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_state, "COMPLETED");
+    }
 }

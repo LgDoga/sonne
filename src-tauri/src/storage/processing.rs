@@ -7,7 +7,7 @@ use std::{
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tauri::State;
 use uuid::Uuid;
 
@@ -22,6 +22,8 @@ const MAX_CONTEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DOCUMENT_ASSETS: usize = 1_000;
 const MAX_ASSET_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DOCUMENT_ASSET_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ASSET_WARNINGS: usize = 100;
+const MAX_ASSET_WARNING_LENGTH: usize = 512;
 const PROCESSING_LEASE_MS: i64 = 120_000;
 
 fn now_timestamp() -> Result<i64, String> {
@@ -447,70 +449,7 @@ fn validate_document(input: &SaveExtractedDocumentInput) -> Result<(), String> {
         ));
     }
 
-    validate_json_size(&input.metadata, "Document metadata")?;
-
-    if input.assets.len() > MAX_DOCUMENT_ASSETS {
-        return Err(format!(
-            "Document contains more than {MAX_DOCUMENT_ASSETS} embedded assets"
-        ));
-    }
-
-    let section_keys: HashSet<&str> = input
-        .sections
-        .iter()
-        .map(|section| section.key.as_str())
-        .collect();
-
-    let mut total_asset_bytes = 0usize;
-
-    for asset in &input.assets {
-        if asset.asset_type != "image" && asset.asset_type != "chart" {
-            return Err(format!(
-                "Unsupported document asset type: {}",
-                asset.asset_type
-            ));
-        }
-
-        if asset.ordinal < 0 {
-            return Err("Asset ordinal cannot be negative".into());
-        }
-
-        if asset.data.is_empty() || asset.data.len() > MAX_ASSET_BYTES {
-            return Err("Embedded asset is empty or exceeds the 16 MiB limit".into());
-        }
-
-        total_asset_bytes = total_asset_bytes
-            .checked_add(asset.data.len())
-            .ok_or_else(|| "Document asset size overflow".to_string())?;
-
-        if total_asset_bytes > MAX_DOCUMENT_ASSET_BYTES {
-            return Err("Document embedded assets exceed the 64 MiB limit".into());
-        }
-
-        if asset
-            .mime_type
-            .as_ref()
-            .is_some_and(|value| value.is_empty() || value.len() > 128)
-        {
-            return Err("Invalid embedded asset MIME type".into());
-        }
-
-        if asset
-            .file_name
-            .as_ref()
-            .is_some_and(|value| value.len() > 512)
-        {
-            return Err("Embedded asset filename is too long".into());
-        }
-
-        if let Some(key) = &asset.section_key {
-            if !section_keys.contains(key.as_str()) {
-                return Err(format!("Unknown asset section key: {key}"));
-            }
-        }
-
-        validate_json_size(&asset.metadata, "Asset metadata")?;
-    }
+    validate_source_document_metadata(&input.metadata)?;
 
     let allowed_types = [
         "root",
@@ -599,6 +538,230 @@ fn validate_document(input: &SaveExtractedDocumentInput) -> Result<(), String> {
     Ok(())
 }
 
+fn bounded_asset_inputs(assets: &[ExtractedAssetInput]) -> (&[ExtractedAssetInput], usize) {
+    let accepted_count = assets.len().min(MAX_DOCUMENT_ASSETS);
+    (&assets[..accepted_count], assets.len() - accepted_count)
+}
+
+fn validate_asset(asset: &ExtractedAssetInput, section_keys: &HashSet<&str>) -> Result<(), String> {
+    if asset.asset_type != "image" && asset.asset_type != "chart" {
+        return Err(format!(
+            "Unsupported document asset type: {}",
+            asset.asset_type
+        ));
+    }
+    if asset.ordinal < 0 {
+        return Err("Asset ordinal cannot be negative".into());
+    }
+    if asset.data.is_empty() {
+        return Err("Embedded asset is empty".into());
+    }
+    if asset.data.len() > MAX_ASSET_BYTES {
+        return Err("Embedded asset exceeds the 16 MiB limit".into());
+    }
+    if asset
+        .mime_type
+        .as_ref()
+        .is_some_and(|value| value.is_empty() || value.len() > 128)
+    {
+        return Err("Invalid embedded asset MIME type".into());
+    }
+    if asset
+        .file_name
+        .as_ref()
+        .is_some_and(|value| value.len() > 512)
+    {
+        return Err("Embedded asset filename is too long".into());
+    }
+    if let Some(key) = &asset.section_key {
+        if !section_keys.contains(key.as_str()) {
+            return Err(format!("Unknown asset section key: {key}"));
+        }
+    }
+    validate_json_size(&asset.metadata, "Asset metadata")?;
+    Ok(())
+}
+
+fn push_asset_warning(warnings: &mut Vec<String>, omitted: &mut usize, message: impl AsRef<str>) {
+    if warnings.len() < MAX_ASSET_WARNINGS {
+        warnings.push(
+            message
+                .as_ref()
+                .chars()
+                .take(MAX_ASSET_WARNING_LENGTH)
+                .collect(),
+        );
+    } else {
+        *omitted = omitted.saturating_add(1);
+    }
+}
+
+fn collect_input_asset_warnings(
+    metadata: &Option<Value>,
+    warnings: &mut Vec<String>,
+    omitted: &mut usize,
+) {
+    let Some(Value::Object(object)) = metadata else {
+        return;
+    };
+
+    if let Some(Value::Array(values)) = object.get("assetExtractionWarnings") {
+        for value in values {
+            if let Some(message) = value.as_str() {
+                push_asset_warning(warnings, omitted, message);
+            }
+        }
+    }
+
+    if let Some(count) = object
+        .get("assetExtractionWarningsOmitted")
+        .and_then(Value::as_u64)
+    {
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        *omitted = omitted.saturating_add(count);
+    }
+}
+
+fn metadata_without_asset_diagnostics(metadata: &Option<Value>) -> Option<Value> {
+    let Some(Value::Object(object)) = metadata else {
+        return metadata.clone();
+    };
+
+    let mut source = object.clone();
+    source.remove("assetExtractionWarnings");
+    source.remove("assetExtractionWarningsOmitted");
+    Some(Value::Object(source))
+}
+
+fn validate_source_document_metadata(metadata: &Option<Value>) -> Result<(), String> {
+    let source_metadata = metadata_without_asset_diagnostics(metadata);
+    validate_json_size(&source_metadata, "Document metadata").map(|_| ())
+}
+
+fn build_document_metadata(
+    metadata: Option<Value>,
+    warnings: &[String],
+    omitted: usize,
+) -> Result<Option<String>, String> {
+    // Extraction diagnostics are bounded separately and must never make valid
+    // source metadata fail its own 256 KiB document metadata limit.
+    let original_metadata = metadata_without_asset_diagnostics(&metadata);
+
+    if warnings.is_empty() && omitted == 0 {
+        return validate_json_size(&original_metadata, "Document metadata");
+    }
+
+    let base = match &original_metadata {
+        Some(Value::Object(object)) => Value::Object(object.clone()),
+        Some(value) => json!({ "sourceMetadata": value }),
+        None => Value::Object(serde_json::Map::new()),
+    };
+
+    let mut retained = warnings.len();
+    loop {
+        let mut candidate = base.clone();
+        if let Some(object) = candidate.as_object_mut() {
+            if retained > 0 {
+                object.insert(
+                    "assetExtractionWarnings".into(),
+                    json!(&warnings[..retained]),
+                );
+            }
+
+            let omitted_count = omitted.saturating_add(warnings.len() - retained);
+            if omitted_count > 0 {
+                object.insert(
+                    "assetExtractionWarningsOmitted".into(),
+                    json!(omitted_count),
+                );
+            }
+        }
+
+        let serialized = serde_json::to_string(&candidate)
+            .map_err(|error| format!("Cannot serialize document metadata: {error}"))?;
+        if serialized.len() <= MAX_METADATA_BYTES {
+            return Ok(Some(serialized));
+        }
+
+        if retained == 0 {
+            break;
+        }
+        retained -= 1;
+    }
+
+    // If diagnostics cannot fit, preserve the original source metadata. The
+    // complete bounded diagnostics remain in the batch journal and response.
+    validate_json_size(&original_metadata, "Document metadata")
+}
+
+fn rollback_document_asset_batch(
+    storage: &mut Storage,
+    batch_operation_id: &str,
+    newly_stored_hashes: &[String],
+    replaced_asset_hashes: &[String],
+    cause: &str,
+    timestamp: i64,
+) -> Vec<String> {
+    let safe_error: String = cause.chars().take(2_000).collect();
+    let _ = storage.connection.execute(
+        "UPDATE storage_operations
+         SET state = 'FAILED', error_message = ?1, updated_at = ?2
+         WHERE id = ?3 AND operation_type = 'document_assets_batch'
+           AND state <> 'COMPLETED'",
+        params![
+            safe_error,
+            now_timestamp().unwrap_or(timestamp),
+            batch_operation_id
+        ],
+    );
+
+    let mut hashes: HashSet<String> = newly_stored_hashes.iter().cloned().collect();
+    hashes.extend(replaced_asset_hashes.iter().cloned());
+    let mut cleanup_errors = Vec::new();
+    match super::blobs::collect_child_blob_hashes(&storage.connection, batch_operation_id) {
+        Ok(child_hashes) => hashes.extend(child_hashes),
+        Err(error) => cleanup_errors.push(format!(
+            "Cannot inspect document asset child journals: {error}"
+        )),
+    }
+
+    for hash in hashes {
+        if let Err(cleanup_error) = storage.delete_unreferenced_blob(&hash) {
+            cleanup_errors.push(format!("{hash}: {cleanup_error}"));
+        }
+    }
+
+    if cleanup_errors.is_empty() {
+        let _ = storage.connection.execute(
+            "UPDATE storage_operations
+             SET state = 'COMPLETED',
+                 error_message = 'Document transaction rolled back; unreferenced asset cleanup completed',
+                 updated_at = ?1
+             WHERE id = ?2 AND operation_type = 'document_assets_batch'
+               AND state <> 'COMPLETED'",
+            params![now_timestamp().unwrap_or(timestamp), batch_operation_id],
+        );
+    } else {
+        let diagnostic = format!(
+            "{safe_error}; asset cleanup deferred for startup recovery: {}",
+            cleanup_errors.join("; ")
+        );
+        let _ = storage.connection.execute(
+            "UPDATE storage_operations
+             SET state = 'FAILED', error_message = ?1, updated_at = ?2
+             WHERE id = ?3 AND operation_type = 'document_assets_batch'
+               AND state <> 'COMPLETED'",
+            params![
+                diagnostic.chars().take(2_000).collect::<String>(),
+                now_timestamp().unwrap_or(timestamp),
+                batch_operation_id
+            ],
+        );
+    }
+
+    cleanup_errors
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedDocumentRecord {
@@ -607,6 +770,10 @@ pub struct SavedDocumentRecord {
     pub section_count: usize,
     pub chunk_count: usize,
     pub text_bytes: usize,
+    pub asset_count: usize,
+    pub asset_warning_count: usize,
+    pub asset_warnings: Vec<String>,
+    pub asset_warnings_omitted: usize,
 }
 
 #[tauri::command]
@@ -621,12 +788,11 @@ pub fn save_extracted_document(
         .map_err(|error| format!("Storage lock poisoned: {error}"))?;
 
     let (sha256, actual_source_size) = resolve_blob(&storage, &input.chat_id, &input.reference_id)?;
-
     if actual_source_size != input.source_size {
         return Err("Document source size does not match the stored attachment".into());
     }
 
-    let _owned_document_id = find_processing_document(
+    let document_id = find_processing_document(
         &storage.connection,
         &sha256,
         &input.extractor,
@@ -634,219 +800,468 @@ pub fn save_extracted_document(
         &input.processing_token,
     )?;
 
-    let timestamp = now_timestamp()?;
-    let document_metadata = validate_json_size(&input.metadata, "Document metadata")?;
-
-    let stored_assets = input
-        .assets
-        .iter()
-        .map(|asset| {
-            let blob = storage.store_blob_with_limit(
-                Cursor::new(asset.data.as_slice()),
-                MAX_ASSET_BYTES as u64,
-            )?;
-
-            Ok((asset, blob.sha256))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    let transaction = storage
+    let mut old_asset_statement = storage
         .connection
-        .transaction()
-        .map_err(|error| format!("Cannot begin document transaction: {error}"))?;
-
-    let resolved_document_id = find_processing_document(
-        &transaction,
-        &sha256,
-        &input.extractor,
-        &input.extractor_version,
-        &input.processing_token,
-    )?;
-
-    let metadata_changed = transaction
-        .execute(
-            "UPDATE extracted_documents
-     SET language = ?1,
-         updated_at = ?2,
-         detected_format = ?3,
-         metadata_json = ?4,
-         error_code = NULL,
-         error_message = NULL,
-         processed_at = NULL,
-         source_size = ?5
-     WHERE id = ?6
-       AND status = 'processing'
-       AND processing_token = ?7",
-            params![
-                input.language,
-                timestamp,
-                input.detected_format,
-                document_metadata,
-                input.source_size,
-                resolved_document_id,
-                input.processing_token
-            ],
+        .prepare(
+            "SELECT DISTINCT blob_sha256 FROM document_assets
+             WHERE document_id = ?1 AND blob_sha256 IS NOT NULL",
         )
-        .map_err(|error| format!("Cannot update owned extracted document: {error}"))?;
+        .map_err(|error| format!("Cannot inspect previous document assets: {error}"))?;
+    let old_asset_rows = old_asset_statement
+        .query_map([&document_id], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Cannot query previous document assets: {error}"))?;
+    let replaced_asset_hashes = old_asset_rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Cannot read previous document asset hashes: {error}"))?;
+    drop(old_asset_statement);
 
-    if metadata_changed != 1 {
-        return Err("Document processing claim is no longer active".into());
-    }
-
-    transaction
-        .execute(
-            "DELETE FROM document_assets WHERE document_id = ?1",
-            params![resolved_document_id],
-        )
-        .map_err(|error| format!("Cannot replace previous document assets: {error}"))?;
-
-    transaction
-        .execute(
-            "DELETE FROM document_vectors_nomic
-         WHERE chunk_id IN (
-             SELECT id FROM document_chunks WHERE document_id = ?1
-         )",
-            params![resolved_document_id],
-        )
-        .map_err(|error| format!("Cannot remove previous document vectors: {error}"))?;
-    transaction
-        .execute(
-            "DELETE FROM document_chunks WHERE document_id = ?1",
-            params![resolved_document_id],
-        )
-        .map_err(|error| format!("Cannot replace previous document chunks: {error}"))?;
-
-    transaction
-        .execute(
-            "DELETE FROM document_sections WHERE document_id = ?1",
-            params![resolved_document_id],
-        )
-        .map_err(|error| format!("Cannot replace previous document sections: {error}"))?;
-
-    let mut section_ids: HashMap<String, String> = HashMap::new();
-
-    for section in &input.sections {
-        let id = Uuid::new_v4().to_string();
-        let parent_id = match &section.parent_key {
-            Some(key) => Some(
-                section_ids
-                    .get(key)
-                    .ok_or_else(|| format!("Unknown parent section key: {key}"))?
-                    .clone(),
-            ),
-            None => None,
-        };
-        let metadata = validate_json_size(&section.metadata, "Section metadata")?;
-
-        transaction
-            .execute(
-                "INSERT INTO document_sections (
-                id, document_id, parent_id, section_type,
-                title, ordinal, metadata_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    id,
-                    resolved_document_id,
-                    parent_id,
-                    section.section_type,
-                    section.title,
-                    section.ordinal,
-                    metadata,
-                    timestamp
-                ],
-            )
-            .map_err(|error| format!("Cannot save document section: {error}"))?;
-
-        section_ids.insert(section.key.clone(), id);
-    }
-
-    for (asset, blob_sha256) in &stored_assets {
-        let section_id = match &asset.section_key {
-            Some(key) => Some(
-                section_ids
-                    .get(key)
-                    .ok_or_else(|| format!("Unknown asset section key: {key}"))?
-                    .clone(),
-            ),
-            None => None,
-        };
-
-        let metadata = validate_json_size(&asset.metadata, "Asset metadata")?;
-
-        transaction
-            .execute(
-                "INSERT INTO document_assets (
-                    id, document_id, section_id, blob_sha256,
-                    asset_type, mime_type, file_name, metadata_json,
-                    ordinal, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    Uuid::new_v4().to_string(),
-                    resolved_document_id,
-                    section_id,
-                    blob_sha256,
-                    asset.asset_type,
-                    asset.mime_type,
-                    asset.file_name,
-                    metadata,
-                    asset.ordinal,
-                    timestamp
-                ],
-            )
-            .map_err(|error| format!("Cannot save document asset: {error}"))?;
-    }
-
-    let mut total_text_bytes = 0usize;
-
-    for (ordinal, chunk) in input.chunks.iter().enumerate() {
-        total_text_bytes += chunk.content.len();
-
-        let section_id = match &chunk.section_key {
-            Some(key) => Some(
-                section_ids
-                    .get(key)
-                    .ok_or_else(|| format!("Unknown chunk section key: {key}"))?
-                    .clone(),
-            ),
-            None => None,
-        };
-
-        let metadata = validate_json_size(&chunk.metadata, "Chunk metadata")?;
-
-        transaction
-            .execute(
-                "INSERT INTO document_chunks (
-                id, document_id, ordinal, content, token_count,
-                start_offset, end_offset, section_id, chunk_type, metadata_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                params![
-                    Uuid::new_v4().to_string(),
-                    resolved_document_id,
-                    i64::try_from(ordinal)
-                        .map_err(|error| format!("Chunk ordinal overflow: {error}"))?,
-                    chunk.content,
-                    chunk.token_count,
-                    chunk.start_offset,
-                    chunk.end_offset,
-                    section_id,
-                    chunk.chunk_type,
-                    metadata
-                ],
-            )
-            .map_err(|error| format!("Cannot save document text chunk: {error}"))?;
-    }
-
-    transaction
-        .commit()
-        .map_err(|error| format!("Cannot commit extracted document: {error}"))?;
-
-    Ok(SavedDocumentRecord {
-        document_id: resolved_document_id,
-        status: "processing".into(),
-        section_count: input.sections.len(),
-        chunk_count: input.chunks.len(),
-        text_bytes: total_text_bytes,
+    let timestamp = now_timestamp()?;
+    let batch_operation_id = Uuid::new_v4().to_string();
+    let batch_metadata = json!({
+        "documentId": &document_id,
+        "extractor": &input.extractor,
+        "extractorVersion": &input.extractor_version,
+        "expectedAssetCount": input.assets.len(),
+        "replacedAssetHashes": &replaced_asset_hashes
     })
+    .to_string();
+
+    storage
+        .connection
+        .execute(
+            "INSERT INTO storage_operations (
+                id, operation_type, state, metadata_json, created_at, updated_at
+             ) VALUES (?1, 'document_assets_batch', 'PROCESSING', ?2, ?3, ?3)",
+            params![batch_operation_id, batch_metadata, timestamp],
+        )
+        .map_err(|error| format!("Cannot create document asset batch journal: {error}"))?;
+
+    let mut asset_warnings = Vec::new();
+    let mut omitted_asset_warnings = 0usize;
+    collect_input_asset_warnings(
+        &input.metadata,
+        &mut asset_warnings,
+        &mut omitted_asset_warnings,
+    );
+
+    let section_keys: HashSet<&str> = input
+        .sections
+        .iter()
+        .map(|section| section.key.as_str())
+        .collect();
+
+    let mut stored_assets: Vec<(&ExtractedAssetInput, String)> = Vec::new();
+    let mut total_asset_bytes = 0usize;
+
+    let (assets_to_process, skipped_asset_count) = bounded_asset_inputs(&input.assets);
+    if skipped_asset_count > 0 {
+        push_asset_warning(
+            &mut asset_warnings,
+            &mut omitted_asset_warnings,
+            format!(
+                "Skipped {skipped_asset_count} assets because the document limit is {MAX_DOCUMENT_ASSETS}"
+            ),
+        );
+    }
+
+    for (index, asset) in assets_to_process.iter().enumerate() {
+        if let Err(error) = validate_asset(asset, &section_keys) {
+            let name = asset
+                .file_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("unnamed asset");
+            push_asset_warning(
+                &mut asset_warnings,
+                &mut omitted_asset_warnings,
+                format!("Asset #{} ({name}) was skipped: {error}", index + 1),
+            );
+            continue;
+        }
+
+        let Some(next_total) = total_asset_bytes.checked_add(asset.data.len()) else {
+            push_asset_warning(
+                &mut asset_warnings,
+                &mut omitted_asset_warnings,
+                format!(
+                    "Asset #{} was skipped: aggregate asset size overflow",
+                    index + 1
+                ),
+            );
+            continue;
+        };
+
+        if next_total > MAX_DOCUMENT_ASSET_BYTES {
+            push_asset_warning(
+                &mut asset_warnings,
+                &mut omitted_asset_warnings,
+                format!(
+                    "Asset #{} was skipped: the 64 MiB aggregate asset limit would be exceeded",
+                    index + 1
+                ),
+            );
+            continue;
+        }
+
+        match storage.store_blob_with_parent(
+            Cursor::new(asset.data.as_slice()),
+            MAX_ASSET_BYTES as u64,
+            Some(&batch_operation_id),
+        ) {
+            Ok(blob) => {
+                total_asset_bytes = next_total;
+                stored_assets.push((asset, blob.sha256));
+            }
+            Err(error) => {
+                let name = asset
+                    .file_name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or("unnamed asset");
+                push_asset_warning(
+                    &mut asset_warnings,
+                    &mut omitted_asset_warnings,
+                    format!(
+                        "Asset #{} ({name}) could not be stored and was skipped: {error}",
+                        index + 1
+                    ),
+                );
+            }
+        }
+    }
+
+    let transaction_result = (|| -> Result<SavedDocumentRecord, String> {
+        let document_metadata = build_document_metadata(
+            input.metadata.clone(),
+            &asset_warnings,
+            omitted_asset_warnings,
+        )?;
+
+        // Keep the complete bounded diagnostics in the durable batch journal
+        // even when the document's source metadata has no remaining capacity.
+        let mut journal_metadata = serde_json::from_str::<Value>(&batch_metadata)
+            .map_err(|error| format!("Cannot prepare document asset journal metadata: {error}"))?;
+        if let Some(object) = journal_metadata.as_object_mut() {
+            object.insert("assetWarnings".into(), json!(&asset_warnings));
+            object.insert("assetWarningsOmitted".into(), json!(omitted_asset_warnings));
+        }
+        let journal_metadata = serde_json::to_string(&journal_metadata).map_err(|error| {
+            format!("Cannot serialize document asset journal metadata: {error}")
+        })?;
+
+        let transaction = storage
+            .connection
+            .transaction()
+            .map_err(|error| format!("Cannot begin document transaction: {error}"))?;
+
+        let resolved_document_id = find_processing_document(
+            &transaction,
+            &sha256,
+            &input.extractor,
+            &input.extractor_version,
+            &input.processing_token,
+        )?;
+
+        if resolved_document_id != document_id {
+            return Err("Document processing identity changed during asset persistence".into());
+        }
+
+        let metadata_changed = transaction
+            .execute(
+                "UPDATE extracted_documents
+                 SET language = ?1,
+                     updated_at = ?2,
+                     detected_format = ?3,
+                     metadata_json = ?4,
+                     error_code = NULL,
+                     error_message = NULL,
+                     processed_at = NULL,
+                     source_size = ?5
+                 WHERE id = ?6
+                   AND status = 'processing'
+                   AND processing_token = ?7",
+                params![
+                    input.language,
+                    timestamp,
+                    input.detected_format,
+                    document_metadata,
+                    input.source_size,
+                    resolved_document_id,
+                    input.processing_token
+                ],
+            )
+            .map_err(|error| format!("Cannot update owned extracted document: {error}"))?;
+
+        if metadata_changed != 1 {
+            return Err("Document processing claim is no longer active".into());
+        }
+
+        transaction
+            .execute(
+                "DELETE FROM document_assets WHERE document_id = ?1",
+                params![resolved_document_id],
+            )
+            .map_err(|error| format!("Cannot replace previous document assets: {error}"))?;
+
+        transaction
+            .execute(
+                "DELETE FROM document_vectors_nomic
+                 WHERE chunk_id IN (
+                     SELECT id FROM document_chunks WHERE document_id = ?1
+                 )",
+                params![resolved_document_id],
+            )
+            .map_err(|error| format!("Cannot remove previous document vectors: {error}"))?;
+
+        transaction
+            .execute(
+                "DELETE FROM document_chunks WHERE document_id = ?1",
+                params![resolved_document_id],
+            )
+            .map_err(|error| format!("Cannot replace previous document chunks: {error}"))?;
+
+        transaction
+            .execute(
+                "DELETE FROM document_sections WHERE document_id = ?1",
+                params![resolved_document_id],
+            )
+            .map_err(|error| format!("Cannot replace previous document sections: {error}"))?;
+
+        let mut section_ids: HashMap<String, String> = HashMap::new();
+
+        for section in &input.sections {
+            let id = Uuid::new_v4().to_string();
+            let parent_id = match &section.parent_key {
+                Some(key) => Some(
+                    section_ids
+                        .get(key)
+                        .ok_or_else(|| format!("Unknown parent section key: {key}"))?
+                        .clone(),
+                ),
+                None => None,
+            };
+            let metadata = validate_json_size(&section.metadata, "Section metadata")?;
+
+            transaction
+                .execute(
+                    "INSERT INTO document_sections (
+                        id, document_id, parent_id, section_type,
+                        title, ordinal, metadata_json, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    params![
+                        id,
+                        resolved_document_id,
+                        parent_id,
+                        section.section_type,
+                        section.title,
+                        section.ordinal,
+                        metadata,
+                        timestamp
+                    ],
+                )
+                .map_err(|error| format!("Cannot save document section: {error}"))?;
+
+            section_ids.insert(section.key.clone(), id);
+        }
+
+        for (asset, blob_sha256) in &stored_assets {
+            let section_id = match &asset.section_key {
+                Some(key) => Some(
+                    section_ids
+                        .get(key)
+                        .ok_or_else(|| format!("Unknown asset section key: {key}"))?
+                        .clone(),
+                ),
+                None => None,
+            };
+
+            let metadata = validate_json_size(&asset.metadata, "Asset metadata")?;
+
+            transaction
+                .execute(
+                    "INSERT INTO document_assets (
+                        id, document_id, section_id, blob_sha256,
+                        asset_type, mime_type, file_name, metadata_json,
+                        ordinal, created_at
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        resolved_document_id,
+                        section_id,
+                        blob_sha256,
+                        asset.asset_type,
+                        asset.mime_type,
+                        asset.file_name,
+                        metadata,
+                        asset.ordinal,
+                        timestamp
+                    ],
+                )
+                .map_err(|error| format!("Cannot save document asset: {error}"))?;
+        }
+
+        let mut total_text_bytes = 0usize;
+
+        for (ordinal, chunk) in input.chunks.iter().enumerate() {
+            total_text_bytes += chunk.content.len();
+
+            let section_id = match &chunk.section_key {
+                Some(key) => Some(
+                    section_ids
+                        .get(key)
+                        .ok_or_else(|| format!("Unknown chunk section key: {key}"))?
+                        .clone(),
+                ),
+                None => None,
+            };
+
+            let metadata = validate_json_size(&chunk.metadata, "Chunk metadata")?;
+
+            transaction
+                .execute(
+                    "INSERT INTO document_chunks (
+                        id, document_id, ordinal, content, token_count,
+                        start_offset, end_offset, section_id, chunk_type, metadata_json
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        resolved_document_id,
+                        i64::try_from(ordinal)
+                            .map_err(|error| format!("Chunk ordinal overflow: {error}"))?,
+                        chunk.content,
+                        chunk.token_count,
+                        chunk.start_offset,
+                        chunk.end_offset,
+                        section_id,
+                        chunk.chunk_type,
+                        metadata
+                    ],
+                )
+                .map_err(|error| format!("Cannot save document text chunk: {error}"))?;
+        }
+
+        let completed = transaction
+            .execute(
+                "UPDATE storage_operations
+                 SET state = 'COMMITTING', metadata_json = ?1,
+                     error_message = NULL, updated_at = ?2
+                 WHERE id = ?3
+                   AND operation_type = 'document_assets_batch'
+                   AND state = 'PROCESSING'",
+                params![journal_metadata, timestamp, batch_operation_id],
+            )
+            .map_err(|error| format!("Cannot complete document asset batch journal: {error}"))?;
+
+        if completed != 1 {
+            return Err("Document asset batch journal is no longer active".into());
+        }
+
+        let record = SavedDocumentRecord {
+            document_id: resolved_document_id,
+            status: "processing".into(),
+            section_count: input.sections.len(),
+            chunk_count: input.chunks.len(),
+            text_bytes: total_text_bytes,
+            asset_count: stored_assets.len(),
+            asset_warning_count: asset_warnings.len().saturating_add(omitted_asset_warnings),
+            asset_warnings: asset_warnings.clone(),
+            asset_warnings_omitted: omitted_asset_warnings,
+        };
+
+        transaction
+            .commit()
+            .map_err(|error| format!("Cannot commit extracted document and assets: {error}"))?;
+
+        Ok(record)
+    })();
+
+    match transaction_result {
+        Ok(mut record) => {
+            // The new document references and COMMITTING journal state are now
+            // durable together. Old asset blobs are retired only after this
+            // commit; recovery can finish the cleanup if the process exits here.
+            let mut cleanup_hashes: HashSet<String> =
+                replaced_asset_hashes.iter().cloned().collect();
+            let mut cleanup_errors = Vec::new();
+            match super::blobs::collect_child_blob_hashes(&storage.connection, &batch_operation_id)
+            {
+                Ok(child_hashes) => cleanup_hashes.extend(child_hashes),
+                Err(error) => cleanup_errors.push(format!(
+                    "Cannot inspect document asset child journals: {error}"
+                )),
+            }
+
+            for hash in cleanup_hashes {
+                if let Err(cleanup_error) = storage.delete_unreferenced_blob(&hash) {
+                    cleanup_errors.push(format!("{hash}: {cleanup_error}"));
+                }
+            }
+
+            let journal_result = if cleanup_errors.is_empty() {
+                storage.connection.execute(
+                    "UPDATE storage_operations
+                     SET state = 'COMPLETED', error_message = NULL, updated_at = ?1
+                     WHERE id = ?2 AND operation_type = 'document_assets_batch'
+                       AND state = 'COMMITTING'",
+                    params![now_timestamp()?, batch_operation_id],
+                )
+            } else {
+                let message = format!(
+                    "Replaced asset cleanup deferred for startup recovery: {}",
+                    cleanup_errors.join("; ")
+                );
+                push_asset_warning(
+                    &mut record.asset_warnings,
+                    &mut record.asset_warnings_omitted,
+                    &message,
+                );
+                storage.connection.execute(
+                    "UPDATE storage_operations
+                     SET state = 'FAILED', error_message = ?1, updated_at = ?2
+                     WHERE id = ?3 AND operation_type = 'document_assets_batch'
+                       AND state = 'COMMITTING'",
+                    params![
+                        message.chars().take(2_000).collect::<String>(),
+                        now_timestamp()?,
+                        batch_operation_id
+                    ],
+                )
+            };
+
+            match journal_result {
+                Ok(1) => {}
+                Ok(_) => push_asset_warning(
+                    &mut record.asset_warnings,
+                    &mut record.asset_warnings_omitted,
+                    "Asset cleanup journal changed unexpectedly; startup recovery will verify it.",
+                ),
+                Err(error) => push_asset_warning(
+                    &mut record.asset_warnings,
+                    &mut record.asset_warnings_omitted,
+                    format!("Asset cleanup journal update failed: {error}"),
+                ),
+            }
+
+            record.asset_warning_count = record
+                .asset_warnings
+                .len()
+                .saturating_add(record.asset_warnings_omitted);
+            Ok(record)
+        }
+        Err(error) => {
+            let newly_stored_hashes: Vec<String> =
+                stored_assets.iter().map(|(_, hash)| hash.clone()).collect();
+            let _cleanup_errors = rollback_document_asset_batch(
+                &mut storage,
+                &batch_operation_id,
+                &newly_stored_hashes,
+                &replaced_asset_hashes,
+                &error,
+                timestamp,
+            );
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -1874,6 +2289,20 @@ const MAX_SUMMARY_PART_BYTES: usize = 64 * 1024;
 const MAX_FINAL_SUMMARY_BYTES: usize = 1024 * 1024;
 const MAX_SUMMARY_MODEL_NAME: usize = 128;
 
+const DOCUMENT_SUMMARY_PART_UPSERT_SQL: &str = r#"
+INSERT INTO document_summary_parts (
+    document_id, stage, ordinal, content, source_chunk_count,
+    model_name, summarizer_version, updated_at
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+ON CONFLICT(document_id, stage, ordinal)
+DO UPDATE SET
+    content = excluded.content,
+    source_chunk_count = excluded.source_chunk_count,
+    model_name = excluded.model_name,
+    summarizer_version = excluded.summarizer_version,
+    updated_at = excluded.updated_at
+"#;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentSummaryChunk {
@@ -2072,17 +2501,7 @@ pub fn save_document_summary_parts(
     for part in &parts {
         transaction
             .execute(
-                "INSERT INTO document_summary_parts (
-                document_id, stage, ordinal, content, source_chunk_count,
-                model_name, summarizer_version, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(document_id, stage, ordinal)
-             DO UPDATE SET
-                content = excluded.content,
-                source_chunk_count = excluded.source_chunk_count,
-                model_name = excluded.model_name,
-                summarizer_version = excluded.summarizer_version,
-                updated_at = excluded.updated_at",
+                DOCUMENT_SUMMARY_PART_UPSERT_SQL,
                 params![
                     document_id,
                     stage,
@@ -2543,6 +2962,467 @@ mod processing_claim_tests {
         assert_eq!(
             validate_document_access(&connection, "doc-1", None).unwrap(),
             "completed"
+        );
+    }
+}
+#[cfg(test)]
+mod extracted_asset_validation_tests {
+    use super::*;
+
+    fn asset() -> ExtractedAssetInput {
+        ExtractedAssetInput {
+            section_key: Some("root".into()),
+            asset_type: "image".into(),
+            mime_type: Some("image/png".into()),
+            file_name: Some("image.png".into()),
+            ordinal: 0,
+            data: vec![1, 2, 3],
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn one_invalid_asset_can_be_rejected_without_invalidating_valid_peers() {
+        let section_keys = HashSet::from(["root"]);
+        let valid_before = asset();
+
+        let mut invalid = asset();
+        invalid.mime_type = Some(String::new());
+
+        let valid_after = asset();
+
+        assert!(validate_asset(&valid_before, &section_keys).is_ok());
+        assert!(validate_asset(&invalid, &section_keys).is_err());
+        assert!(validate_asset(&valid_after, &section_keys).is_ok());
+    }
+
+    #[test]
+    fn document_validation_allows_asset_overflow_for_bounded_processing() {
+        let assets = (0..(MAX_DOCUMENT_ASSETS + 3))
+            .map(|ordinal| ExtractedAssetInput {
+                section_key: Some("root".into()),
+                asset_type: "image".into(),
+                mime_type: Some("image/png".into()),
+                file_name: Some(format!("asset-{ordinal}.png")),
+                ordinal: ordinal as i64,
+                data: vec![1, 2, 3],
+                metadata: None,
+            })
+            .collect();
+        let input = SaveExtractedDocumentInput {
+            chat_id: "chat".into(),
+            reference_id: "attachment".into(),
+            extractor: "test".into(),
+            extractor_version: "v1".into(),
+            processing_token: "test-token".into(),
+            detected_format: "docx".into(),
+            language: None,
+            metadata: None,
+            source_size: 1,
+            sections: vec![ExtractedSectionInput {
+                key: "root".into(),
+                parent_key: None,
+                section_type: "root".into(),
+                title: Some("Document".into()),
+                ordinal: 0,
+                metadata: None,
+            }],
+            chunks: vec![ExtractedChunkInput {
+                section_key: Some("root".into()),
+                content: "Document text".into(),
+                token_count: Some(2),
+                start_offset: Some(0),
+                end_offset: Some(13),
+                chunk_type: "text".into(),
+                metadata: None,
+            }],
+            assets,
+        };
+
+        assert!(validate_document(&input).is_ok());
+        let (accepted, skipped) = bounded_asset_inputs(&input.assets);
+        assert_eq!(accepted.len(), MAX_DOCUMENT_ASSETS);
+        assert_eq!(skipped, 3);
+    }
+
+    #[test]
+    fn backend_caps_asset_inputs_at_the_document_limit() {
+        let assets = vec![asset(); MAX_DOCUMENT_ASSETS + 3];
+        let (accepted, skipped) = bounded_asset_inputs(&assets);
+
+        assert_eq!(accepted.len(), MAX_DOCUMENT_ASSETS);
+        assert_eq!(skipped, 3);
+    }
+
+    #[test]
+    fn asset_warnings_are_bounded_and_count_overflow() {
+        let mut warnings = Vec::new();
+        let mut omitted = 0usize;
+
+        for index in 0..(MAX_ASSET_WARNINGS + 4) {
+            push_asset_warning(&mut warnings, &mut omitted, format!("warning {index}"));
+        }
+
+        assert_eq!(warnings.len(), MAX_ASSET_WARNINGS);
+        assert_eq!(omitted, 4);
+    }
+
+    #[test]
+    fn oversized_asset_diagnostics_do_not_reject_source_metadata() {
+        let payload = "x".repeat(MAX_METADATA_BYTES - 32);
+        let mut metadata = serde_json::json!({ "payload": payload });
+        let object = metadata.as_object_mut().unwrap();
+        object.insert(
+            "assetExtractionWarnings".into(),
+            serde_json::json!(vec![
+                "w".repeat(MAX_ASSET_WARNING_LENGTH);
+                MAX_ASSET_WARNINGS
+            ]),
+        );
+        object.insert(
+            "assetExtractionWarningsOmitted".into(),
+            serde_json::json!(7),
+        );
+        let metadata = Some(metadata);
+
+        assert!(validate_json_size(&metadata, "Document metadata").is_err());
+        assert!(validate_source_document_metadata(&metadata).is_ok());
+
+        let saved = build_document_metadata(metadata, &["An asset was skipped".to_string()], 0)
+            .unwrap()
+            .unwrap();
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            saved["payload"].as_str().unwrap().len(),
+            MAX_METADATA_BYTES - 32
+        );
+        assert!(saved.get("assetExtractionWarnings").is_none());
+        assert!(saved.get("assetExtractionWarningsOmitted").is_none());
+    }
+
+    #[test]
+    fn asset_warnings_are_persisted_in_document_metadata() {
+        let warnings = vec!["Asset #2 was skipped: invalid MIME type".to_string()];
+        let serialized = build_document_metadata(
+            Some(serde_json::json!({ "fileName": "report.pdf" })),
+            &warnings,
+            2,
+        )
+        .unwrap()
+        .unwrap();
+
+        let value: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            value["assetExtractionWarnings"][0],
+            "Asset #2 was skipped: invalid MIME type"
+        );
+        assert_eq!(value["assetExtractionWarningsOmitted"], 2);
+        assert_eq!(value["fileName"], "report.pdf");
+    }
+}
+
+#[cfg(test)]
+mod document_asset_batch_rollback_tests {
+    use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TestDirectory(PathBuf);
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_storage() -> (TestDirectory, Storage) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = TestDirectory(std::env::temp_dir().join(format!(
+            "sonne-document-asset-rollback-{}-{nonce}",
+            std::process::id()
+        )));
+        fs::create_dir_all(&directory.0).unwrap();
+        let storage = Storage::initialize(&directory.0).expect("storage should initialize");
+        (directory, storage)
+    }
+
+    fn insert_document(storage: &Storage, id: &str, source_hash: &str) {
+        storage
+            .connection
+            .execute(
+                "INSERT INTO extracted_documents (
+                id, blob_sha256, extractor, extractor_version, status,
+                created_at, updated_at, detected_format, source_size
+             ) VALUES (?1, ?2, 'test', 'v1', 'completed', 1, 1, 'docx', 1)",
+                params![id, source_hash],
+            )
+            .unwrap();
+    }
+
+    fn insert_asset(storage: &Storage, id: &str, document_id: &str, blob_hash: &str) {
+        storage
+            .connection
+            .execute(
+                "INSERT INTO document_assets (
+                id, document_id, section_id, blob_sha256,
+                asset_type, ordinal, created_at
+             ) VALUES (?1, ?2, NULL, ?3, 'image', 0, 1)",
+                params![id, document_id, blob_hash],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn rolled_back_document_replacement_preserves_old_and_shared_assets_only() {
+        let (_directory, mut storage) = test_storage();
+        let timestamp = now_timestamp().unwrap();
+        let source_main = storage
+            .store_blob(Cursor::new(b"source-main".to_vec()))
+            .unwrap();
+        let source_other = storage
+            .store_blob(Cursor::new(b"source-other".to_vec()))
+            .unwrap();
+        let old_asset = storage
+            .store_blob(Cursor::new(b"old-document-asset".to_vec()))
+            .unwrap();
+        let shared_asset = storage
+            .store_blob(Cursor::new(b"shared-document-asset".to_vec()))
+            .unwrap();
+
+        insert_document(&storage, "document-main", &source_main.sha256);
+        insert_document(&storage, "document-other", &source_other.sha256);
+        insert_asset(
+            &storage,
+            "old-asset-row",
+            "document-main",
+            &old_asset.sha256,
+        );
+        insert_asset(
+            &storage,
+            "shared-asset-row",
+            "document-other",
+            &shared_asset.sha256,
+        );
+
+        let batch_id = "rollback-asset-batch-test";
+        let batch_metadata = serde_json::json!({
+            "documentId": "document-main",
+            "expectedAssetCount": 1,
+            "replacedAssetHashes": [&old_asset.sha256]
+        })
+        .to_string();
+        storage
+            .connection
+            .execute(
+                "INSERT INTO storage_operations (
+                id, operation_type, state, metadata_json, created_at, updated_at
+             ) VALUES (?1, 'document_assets_batch', 'PROCESSING', ?2, ?3, ?3)",
+                params![batch_id, batch_metadata, timestamp],
+            )
+            .unwrap();
+
+        let new_asset = storage
+            .store_blob_with_parent(
+                Cursor::new(b"new-document-asset".to_vec()),
+                1024 * 1024,
+                Some(batch_id),
+            )
+            .unwrap();
+
+        storage
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER force_document_asset_insert_failure
+             BEFORE INSERT ON document_assets
+             BEGIN SELECT RAISE(ABORT, 'forced rollback regression failure'); END;",
+            )
+            .unwrap();
+        let transaction = storage.connection.transaction().unwrap();
+        transaction
+            .execute(
+                "DELETE FROM document_assets WHERE document_id = 'document-main'",
+                [],
+            )
+            .unwrap();
+        let failed_insert = transaction.execute(
+            "INSERT INTO document_assets (
+                id, document_id, section_id, blob_sha256,
+                asset_type, ordinal, created_at
+             ) VALUES ('new-asset-row', 'document-main', NULL, ?1, 'image', 0, 2)",
+            params![&new_asset.sha256],
+        );
+        assert!(
+            failed_insert.is_err(),
+            "test trigger must abort the replacement insert"
+        );
+        drop(transaction); // Roll back the earlier DELETE as well.
+        storage
+            .connection
+            .execute_batch("DROP TRIGGER force_document_asset_insert_failure;")
+            .unwrap();
+
+        let old_reference_exists: bool = storage
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM document_assets
+             WHERE document_id = 'document-main' AND blob_sha256 = ?1)",
+                params![&old_asset.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            old_reference_exists,
+            "the previous asset row must survive rollback"
+        );
+
+        let cleanup_errors = rollback_document_asset_batch(
+            &mut storage,
+            batch_id,
+            std::slice::from_ref(&new_asset.sha256),
+            std::slice::from_ref(&old_asset.sha256),
+            "forced rollback regression failure",
+            timestamp,
+        );
+        assert!(
+            cleanup_errors.is_empty(),
+            "rollback cleanup should finish: {cleanup_errors:?}"
+        );
+
+        for (hash, path, label) in [
+            (
+                &old_asset.sha256,
+                &old_asset.relative_path,
+                "previous asset",
+            ),
+            (
+                &shared_asset.sha256,
+                &shared_asset.relative_path,
+                "shared asset",
+            ),
+        ] {
+            let exists: bool = storage
+                .connection
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                    params![hash],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "{label} metadata must remain");
+            assert!(
+                storage.root_dir.join(path).exists(),
+                "{label} file must remain"
+            );
+        }
+
+        let new_exists: bool = storage
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM blobs WHERE sha256 = ?1)",
+                params![&new_asset.sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !new_exists,
+            "unreferenced new asset metadata must be removed"
+        );
+        assert!(
+            !storage.root_dir.join(&new_asset.relative_path).exists(),
+            "unreferenced new asset file must be removed"
+        );
+
+        let parent_state: String = storage
+            .connection
+            .query_row(
+                "SELECT state FROM storage_operations WHERE id = ?1",
+                params![batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parent_state, "COMPLETED");
+    }
+}
+
+#[cfg(test)]
+mod document_summary_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn summary_part_upsert_persists_all_eight_columns() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE document_summary_parts (
+                    document_id TEXT NOT NULL,
+                    stage INTEGER NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    source_chunk_count INTEGER NOT NULL,
+                    model_name TEXT NOT NULL,
+                    summarizer_version TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (document_id, stage, ordinal)
+                );",
+            )
+            .unwrap();
+
+        let changed = connection
+            .execute(
+                DOCUMENT_SUMMARY_PART_UPSERT_SQL,
+                params![
+                    "doc-test",
+                    0_i64,
+                    0_i64,
+                    "Тестове резюме",
+                    3_i64,
+                    "sonne-gemma:latest",
+                    "sonne-map-reduce-v1",
+                    123_i64,
+                ],
+            )
+            .expect("summary part SQL must bind all eight columns");
+        assert_eq!(changed, 1);
+
+        let row: (String, i64, i64, String, i64, String, String, i64) = connection
+            .query_row(
+                "SELECT document_id, stage, ordinal, content, source_chunk_count,
+                        model_name, summarizer_version, updated_at
+                 FROM document_summary_parts",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            row,
+            (
+                "doc-test".to_string(),
+                0,
+                0,
+                "Тестове резюме".to_string(),
+                3,
+                "sonne-gemma:latest".to_string(),
+                "sonne-map-reduce-v1".to_string(),
+                123,
+            )
         );
     }
 }

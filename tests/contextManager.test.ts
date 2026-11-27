@@ -151,6 +151,76 @@ test("request-level num_ctx is used and output is reserved", () => {
   assert.ok(thinking.inputBudget < budget.inputBudget);
 });
 
+
+test("document context is fitted inside the model budget without changing the user request", async () => {
+  const { buildBoundedContextPrompt } = await import("../src/contextManager.ts");
+  const budget = budgetOf(900);
+  const result = buildBoundedContextPrompt({
+    systemPrompt: "system instructions",
+    userPrompt: "Що описано у файлі?",
+    sections: [{
+      label: "Вкладений файл: report.pdf",
+      content: ("Розділ документа з важливими даними. ").repeat(500),
+    }],
+    budget,
+  });
+
+  assert.equal(result.prompt.startsWith("Що описано у файлі?"), true);
+  assert.ok(result.prompt.includes("Вкладений файл: report.pdf"));
+  assert.ok(result.prompt.toLocaleLowerCase("uk-UA").includes("контексту моделі"));
+  assert.equal(result.stats.status, "truncated");
+  assert.ok(
+    estimateMessageTokens({ content: "system instructions" }) +
+      estimateMessageTokens({ content: result.prompt }) <= budget.inputBudget,
+  );
+});
+
+test("document context is shared across multiple files and never exceeds budget", async () => {
+  const { buildBoundedContextPrompt } = await import("../src/contextManager.ts");
+  const budget = budgetOf(1000);
+  const result = buildBoundedContextPrompt({
+    systemPrompt: SYSTEM,
+    userPrompt: USER,
+    sections: [
+      { label: "file-a.pdf", content: "A. ".repeat(1000), priority: 10 },
+      { label: "file-b.pdf", content: "B. ".repeat(1000), priority: 10 },
+    ],
+    budget,
+  });
+
+  assert.ok(result.prompt.includes("file-a.pdf"));
+  assert.ok(result.prompt.includes("file-b.pdf"));
+  assert.ok(result.stats.truncatedSections >= 1);
+  assert.ok(
+    estimateMessageTokens({ content: SYSTEM }) +
+      estimateMessageTokens({ content: result.prompt }) <= budget.inputBudget,
+  );
+});
+
+test("fixed system prompt and user request are never truncated", async () => {
+  const { buildBoundedContextPrompt } = await import("../src/contextManager.ts");
+  const result = buildBoundedContextPrompt({
+    systemPrompt: "я".repeat(2000),
+    userPrompt: "Збережи цей запит повністю",
+    sections: [{ label: "file.pdf", content: "document data" }],
+    budget: budgetOf(100),
+  });
+
+  assert.equal(result.stats.status, "fixed-content-exceeds-budget");
+  assert.equal(result.prompt, "Збережи цей запит повністю");
+});
+
+test("only explicit full-document requests trigger expensive Map-Reduce summaries", async () => {
+  const { isFullDocumentSummaryRequest } = await import("../src/contextManager.ts");
+  assert.equal(isFullDocumentSummaryRequest("А цей про що?"), false);
+  assert.equal(isFullDocumentSummaryRequest("А це шо таке?"), false);
+  assert.equal(isFullDocumentSummaryRequest("Це?"), false);
+  assert.equal(isFullDocumentSummaryRequest("Переглянь про що цей файл"), false);
+  assert.equal(isFullDocumentSummaryRequest("Зроби повний огляд усього документа"), true);
+  assert.equal(isFullDocumentSummaryRequest("Create a full document summary"), true);
+  assert.equal(isFullDocumentSummaryRequest("Знайди суму ПДВ у таблиці"), false);
+});
+
 test("estimator is non-zero, monotonic and heavier for Cyrillic than Latin", () => {
   assert.equal(estimateTokens(""), 0);
   assert.ok(estimateTokens("привіт світе") > estimateTokens("hello world"));

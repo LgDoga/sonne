@@ -49,7 +49,8 @@ import {
 } from "./ollamaClient";
 import {
   type ContextStats,
-  estimateMessageTokens,
+  buildBoundedContextPrompt,
+  isFullDocumentSummaryRequest,
   resolveContextBudget,
   selectHistory,
 } from "./contextManager";
@@ -170,6 +171,13 @@ type PerfTrace = {
   streamError: string | null;
   cancelled: boolean;
   final: OllamaChatChunk | null;
+  requestNumPredict: number | null;
+  contentChars: number;
+  liveStartedAt: number | null;
+  lastProgressLogAt: number;
+  progressCompletionLogged: boolean;
+  outputTokenLimit: number | null;
+
 };
 
 function perfMark(trace: PerfTrace, name: PerfMarkName): void {
@@ -192,6 +200,7 @@ function perfObserveChunk(trace: PerfTrace, chunk: OllamaChatChunk): void {
 
   if (hasContent) {
     trace.contentChunks += 1;
+    trace.contentChars += chunk.message?.content?.length ?? 0;
     perfMark(trace, "firstContent");
   }
 
@@ -206,6 +215,51 @@ function perfObserveChunk(trace: PerfTrace, chunk: OllamaChatChunk): void {
   if (chunk.done === true) {
     trace.final = chunk;
     perfMark(trace, "doneChunk");
+  }
+}
+
+function perfLogEvent(trace: PerfTrace, event: string, details: Record<string, unknown> = {}): void {
+  if (!PERF_DIAGNOSTICS_ENABLED) return;
+  // Event timestamps and counters are still collected in PerfTrace and shown
+  // in the unified report. This function intentionally emits no per-event logs.
+  void trace;
+  void event;
+  void details;
+}
+
+/** Logs first text, a five-second heartbeat, and completion; never logs message content. */
+function perfLogStreamProgress(trace: PerfTrace): void {
+  if (!PERF_DIAGNOSTICS_ENABLED) return;
+  const now = performance.now();
+
+  if (trace.marks.firstContent !== undefined && trace.liveStartedAt === null) {
+    trace.liveStartedAt = trace.marks.firstContent;
+    trace.lastProgressLogAt = now;
+    perfLogEvent(trace, "first generated text received", {
+      output_chunks_received: trace.contentChunks,
+      output_characters_received: trace.contentChars,
+      generation_elapsed: "0 ms",
+    });
+  }
+
+  if (trace.liveStartedAt !== null && trace.final === null && now - trace.lastProgressLogAt >= 5000) {
+    const elapsed = now - trace.liveStartedAt;
+    perfLogEvent(trace, "generation in progress", {
+      generation_elapsed: `${(elapsed / 1000).toFixed(1)} s`,
+      output_chunks_received: trace.contentChunks,
+      output_characters_received: trace.contentChars,
+    });
+    trace.lastProgressLogAt = now;
+  }
+
+  if (trace.final !== null && !trace.progressCompletionLogged) {
+    trace.progressCompletionLogged = true;
+    perfLogEvent(trace, "final Ollama chunk received", {
+      output_tokens: perfCount(trace.final.eval_count),
+      output_chunks_received: trace.contentChunks,
+      output_characters_received: trace.contentChars,
+      ollama_eval_duration: perfNsToMs(trace.final.eval_duration),
+    });
   }
 }
 
@@ -334,6 +388,21 @@ function perfBuildReport(trace: PerfTrace): Record<string, string> {
     ...perfContextReport(trace.context),
     system_prompt_chars: String(trace.systemPromptChars),
     user_prompt_chars: String(trace.userPromptChars),
+    output_token_limit: trace.outputTokenLimit === null
+      ? "not applied"
+      : String(trace.outputTokenLimit),
+    // The first value is the adaptive cap chosen by Sonne; the second is the
+    // exact num_predict sent in the Ollama request options (if any).
+    num_predict_sent: trace.requestNumPredict === null
+      ? "not sent (model configuration)"
+      : String(trace.requestNumPredict),
+    generation_wall_first_content_to_done: perfDiff(marks.doneChunk, marks.firstContent),
+    generation_eval_duration: perfNsToMs(final?.eval_duration),
+    generation_output_tokens: perfCount(final?.eval_count),
+    generation_output_chars_received: String(trace.contentChars),
+    time_to_first_content_after_headers: perfDiff(marks.firstContent, marks.headers),
+    stream_flush_after_done_chunk: perfDiff(marks.streamEnd, marks.doneChunk),
+
   };
 }
 
@@ -1011,6 +1080,12 @@ CSS підключено
       ),
       systemPromptChars: 0,
       userPromptChars: prompt.length,
+      requestNumPredict: null,
+      outputTokenLimit: null,
+      contentChars: 0,
+      liveStartedAt: null,
+      lastProgressLogAt: 0,
+      progressCompletionLogged: false,
       marks: {},
       chunks: 0,
       thinkingChunks: 0,
@@ -1020,6 +1095,7 @@ CSS підключено
       cancelled: false,
       final: null,
     };
+    perfLogEvent(perfTrace, "request pipeline started");
 
     let rawFull = "";
     let pendingContent = "";
@@ -1119,6 +1195,7 @@ CSS підключено
       }
 
       perfMark(perfTrace, "instructions"); // [perf-diag]
+      perfLogEvent(perfTrace, "instructions ready");
 
       // Both Pro AI backends receive the same profile instructions and the
       // same task/response assembly (see buildSystemPrompt).
@@ -1132,6 +1209,8 @@ CSS підключено
       const explicitImageAnalysis =
         /(проаналізуй|аналізуй|опиши|розглянь|що\s+на\s+зображенн|що\s+на\s+картин|analy[sz]e|describe|explain|what\s+is\s+in)/i.test(prompt) &&
         /(зображенн|картинк|image|images|picture|photo|фото)/i.test(prompt);
+      const fullDocumentSummaryRequest =
+        promotedAttachments.length > 0 && isFullDocumentSummaryRequest(prompt);
 
       // SQLite transaction is the source of truth: process exactly the
       // attachments promoted into this message by start_turn.
@@ -1139,6 +1218,7 @@ CSS підключено
         name: string;
         format: string;
         content: string;
+        kind: "retrieval" | "fallback" | "summary";
       }> = [];
 
       if (promotedAttachments.length > 0) {
@@ -1168,6 +1248,7 @@ CSS підключено
                 name: result.fileName || "Документ",
                 format: result.detectedFormat || "невідомий формат",
                 content: result.content || "",
+                kind: "retrieval" as const,
               })),
             );
           } catch (error) {
@@ -1209,6 +1290,7 @@ CSS підключено
                     file.mimeType ||
                     "невідомий формат",
                   content: document.content || "",
+                  kind: "fallback" as const,
                 };
               }),
             );
@@ -1261,7 +1343,7 @@ CSS підключено
                 throw new Error("Не дочекалися завершення індексації вкладення.");
               }
 
-              if (!explicitImageAnalysis) {
+              if (fullDocumentSummaryRequest && !explicitImageAnalysis) {
                 const summary = await generateDocumentSummary(
                   processing.documentId,
                   backendConfig.ollamaModel,
@@ -1271,9 +1353,10 @@ CSS підключено
 
                 if (summary.trim()) {
                   attachmentResults.push({
-                    name: `${file.fileName} — повний підсумок`,
+                    name: file.fileName,
                     format: "Map-Reduce summary",
                     content: summary,
+                    kind: "summary",
                   });
                 }
               }
@@ -1287,17 +1370,49 @@ CSS підключено
         }
       }
 
-      const attachmentContext = attachmentResults.map((file, index) =>
-        `\n\n--- Вкладений файл: ${file.name} (${file.format}), фрагмент ${index + 1} ---\n${file.content || "Текстовий вміст не знайдено в індексі."}`,
-      ).join("");
+      // Overview requests use the cached/generated document summary instead of
+      // sending both the same document's 12 retrieval chunks and its full summary.
+      // Targeted questions use semantic retrieval only; they do not trigger a
+      // full Map-Reduce pass for every follow-up.
+      const preferredAttachmentResults = attachmentResults.filter((item) => {
+        if (!fullDocumentSummaryRequest) return item.kind !== "summary";
+        if (item.kind === "summary") return true;
+        return !attachmentResults.some(
+          (candidate) => candidate.kind === "summary" && candidate.name === item.name,
+        );
+      });
 
-      const archiveContext = archiveFiles.map((file) =>
-        `\n\n--- Вміст архіву: ${file.name} ---\n${file.content}`,
-      ).join("");
+      const groupedAttachmentContext = new Map<string, { format: string; kind: "retrieval" | "fallback" | "summary"; content: string[] }>();
+      for (const result of preferredAttachmentResults) {
+        const current = groupedAttachmentContext.get(result.name) ?? {
+          format: result.format,
+          kind: result.kind,
+          content: [],
+        };
+        current.content.push(result.content || "Текстовий вміст не знайдено в індексі.");
+        groupedAttachmentContext.set(result.name, current);
+      }
 
-      let modelPrompt = attachmentContext || archiveContext
-        ? `${prompt}\n\nВміст вкладень та архівів:${attachmentContext}${archiveContext}`
-        : prompt;
+      const contextSections: Array<{ label: string; content: string; priority?: number }> = [];
+      for (const [fileName, group] of groupedAttachmentContext) {
+        contextSections.push({
+          label: group.kind === "summary"
+            ? `Вкладений файл: ${fileName} (${group.format}) — повний підсумок`
+            : group.kind === "retrieval"
+              ? `Вкладений файл: ${fileName} (${group.format}) — релевантні фрагменти семантичного пошуку; це не повний текст документа`
+              : `Вкладений файл: ${fileName} (${group.format}) — резервний витяг документа`,
+          content: group.content.join("\n\n--- Фрагмент документа ---\n\n"),
+          priority: 100,
+        });
+      }
+      for (const file of archiveFiles) {
+        contextSections.push({
+          label: `Вміст архіву: ${file.name}`,
+          content: file.content,
+          priority: 80,
+        });
+      }
+      let visionContextText = "";
 
       // Explicit image analysis: enumerate every image, reuse only current-version
       // cache entries, persist each new result, and expose deterministic progress.
@@ -1602,13 +1717,13 @@ CSS підключено
         });
 
         if (total === 0) {
-          modelPrompt +=
+          visionContextText +=
             "\n\nУВАГА: локальна система не повернула жодного вбудованого image asset. " +
             "Не стверджуй, що зображення були переглянуті або проаналізовані. Повідом, що доступних зображень для Vision-аналізу не знайдено.";
         }
 
         if (descriptions.length > 0) {
-          modelPrompt +=
+          visionContextText +=
             `\n\nРЕЗУЛЬТАТИ ЛОКАЛЬНОГО VISION-АНАЛІЗУ (${descriptions.length}/${total} зображень):\n` +
             `${descriptions.join("\n\n")}\n\n` +
             "Правила використання візуальних доказів: Vision-опис, Alt text і OCR наведені окремо; " +
@@ -1621,14 +1736,22 @@ CSS підключено
         }
 
         if (failures.length > 0) {
-          modelPrompt += `\n\nНе вдалося проаналізувати (${failures.length}):\n${failures.join("\n")}`;
+          visionContextText += `\n\nНе вдалося проаналізувати (${failures.length}):\n${failures.join("\n")}`;
         }
         if (indexingErrors.length > 0) {
-          modelPrompt += `\n\nVision-описи збережено, але не всі потрапили до пошукового індексу: ${indexingErrors.join("; ")}`;
+          visionContextText += `\n\nVision-описи збережено, але не всі потрапили до пошукового індексу: ${indexingErrors.join("; ")}`;
         }
 
         updateAssistant({
           visionProgress: `Vision (Gemma 3): завершено ${completed}/${total} · кеш: ${cached} · новий аналіз: ${analyzed} · помилки: ${failures.length}. Формую відповідь…`,
+        });
+      }
+
+      if (visionContextText.trim()) {
+        contextSections.push({
+          label: "Локальний аналіз зображень",
+          content: visionContextText,
+          priority: 120,
         });
       }
 
@@ -1681,16 +1804,45 @@ CSS підключено
         inputBudget: Math.max(0, baseContextBudget.inputBudget - visionImages.length * 512),
       };
 
-      const fixedTokens =
-        estimateMessageTokens({ content: systemPrompt }) +
-        estimateMessageTokens({ content: modelPrompt });
+      const contextPack = buildBoundedContextPrompt({
+        systemPrompt,
+        userPrompt: prompt,
+        sections: contextSections,
+        budget: contextBudget,
+        historyReserveTokens: fullHistory.length > 0
+          ? Math.min(768, Math.floor(contextBudget.inputBudget * 0.12))
+          : 0,
+      });
 
-      if (fixedTokens > contextBudget.inputBudget) {
+      if (contextPack.stats.status === "fixed-content-exceeds-budget") {
         throw new Error(
-          `Системний промпт і вкладення потребують приблизно ${fixedTokens} токенів, ` +
-          `але доступний бюджет — ${contextBudget.inputBudget}. ` +
-          `Розділи документи на менші частини або надішли менше вмісту за раз.`,
+          `Системні інструкції та саме запитання потребують приблизно ${contextPack.stats.fixedTokens} токенів, ` +
+          `але доступний бюджет — ${contextBudget.inputBudget}. Скороти запит або вибери модель із більшим контекстом.`,
         );
+      }
+      if (contextSections.length > 0 && contextPack.stats.includedSections === 0) {
+        throw new Error(
+          "Не вдалося вмістити жодного фрагмента вкладення в доступний контекст моделі. " +
+          "Спробуй меншу кількість файлів або модель із більшим контекстом.",
+        );
+      }
+
+      const modelPrompt = contextPack.prompt;
+      if (
+        contextPack.stats.truncatedSections > 0 ||
+        contextPack.stats.omittedSections > 0
+      ) {
+        console.info("[Sonne context] document context bounded to model budget", {
+          status: contextPack.stats.status,
+          inputBudget: contextPack.stats.inputBudget,
+          fixedTokens: contextPack.stats.fixedTokens,
+          availableContextTokens: contextPack.stats.availableContextTokens,
+          usedContextTokens: contextPack.stats.usedContextTokens,
+          historyReserveTokens: contextPack.stats.historyReserveTokens,
+          includedSections: contextPack.stats.includedSections,
+          truncatedSections: contextPack.stats.truncatedSections,
+          omittedSections: contextPack.stats.omittedSections,
+        });
       }
 
       if (modelPrompt !== prompt) {
@@ -1751,18 +1903,22 @@ CSS підключено
         apiMessages[apiMessages.length - 1].images = visionImages;
       }
 
+      const chatRequestBody = buildChatRequestBody(
+        backendConfig,
+        apiMessages,
+        userRequestedThinking,
+      );
+      perfTrace.requestNumPredict = chatRequestBody.options?.num_predict ?? null;
+
       const activeRequest = await createChatStream(
         OLLAMA_URL,
-        buildChatRequestBody(
-          backendConfig,
-          apiMessages,
-          userRequestedThinking,
-        ),
+        chatRequestBody,
         generationController.signal,
         backendConfig.backend === "gemma" ? [] : ["sonne-gemma:latest"],
       );
 
       perfMark(perfTrace, "headers"); // [perf-diag]
+      perfLogEvent(perfTrace, "Ollama response stream ready");
 
       activeGeneration.request = activeRequest;
 
@@ -1804,6 +1960,7 @@ CSS підключено
         }
 
         perfObserveChunk(perfTrace, chunk); // [perf-diag]
+        perfLogStreamProgress(perfTrace);
 
         // The private thinking channel is intentionally ignored.
         // Only normal response content is displayed.
@@ -1816,6 +1973,7 @@ CSS підключено
 
       flushPendingContent();
       perfMark(perfTrace, "streamEnd"); // [perf-diag]
+      perfLogEvent(perfTrace, "response stream ended");
       perfLogReport(perfTrace); // [perf-diag]
 
       // ------------------------------------------------------
@@ -1855,6 +2013,7 @@ CSS підключено
         }
         perfTrace.cancelled = true; // [perf-diag]
         perfMark(perfTrace, "streamEnd"); // [perf-diag]
+        perfLogEvent(perfTrace, "response stream ended");
         perfLogReport(perfTrace); // [perf-diag]
         updateAssistant({
           timestamp: formatNow(),
