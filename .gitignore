@@ -26,3 +26,12 @@ target
 *.njsproj
 *.sln
 *.sw?
+
+# Local rollback and pre-patch backups (never commit)
+.sonne-backups/
+src/**/*.bak
+src/**/*.backup-*
+src/**/*.pre-*
+src-tauri/**/*.bak
+src-tauri/**/*.backup-*
+src-tauri/**/*.pre-*

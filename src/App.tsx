@@ -54,6 +54,7 @@ import {
   resolveContextBudget,
   selectHistory,
 } from "./contextManager";
+import { getPromptEvalMetrics } from "./ollamaMetrics";
 
 // ============================================================
 // TYPES
@@ -74,6 +75,7 @@ type OllamaChatChunk = {
   total_duration?: number;
   load_duration?: number;
   prompt_eval_count?: number;
+  prompt_eval_cached_count?: number;
   prompt_eval_duration?: number;
   eval_count?: number;
   eval_duration?: number;
@@ -331,6 +333,10 @@ function perfBuildReport(trace: PerfTrace): Record<string, string> {
   const ollamaTotalMs = perfIsValidNumber(final?.total_duration)
     ? final.total_duration / 1e6
     : undefined;
+  const promptEvalMetrics = getPromptEvalMetrics(
+    final?.prompt_eval_count,
+    final?.prompt_eval_cached_count,
+  );
 
   return {
     model_requested: trace.model,
@@ -365,10 +371,12 @@ function perfBuildReport(trace: PerfTrace): Record<string, string> {
     time_to_response_headers: perfSince(trace, "headers"),
     time_to_done_chunk: perfSince(trace, "doneChunk"),
 
-    prompt_tokens_prompt_eval_count: perfCount(final?.prompt_eval_count),
+    prompt_tokens_prompt_eval_count: perfCount(promptEvalMetrics.total),
+    prompt_tokens_prompt_eval_cached_count: perfCount(promptEvalMetrics.cached),
+    prompt_tokens_prompt_eval_uncached_count: perfCount(promptEvalMetrics.uncached),
     output_tokens_eval_count: perfCount(final?.eval_count),
     prompt_eval_rate: perfRate(
-      final?.prompt_eval_count,
+      promptEvalMetrics.rateTokens,
       final?.prompt_eval_duration,
     ),
     generation_rate: perfRate(final?.eval_count, final?.eval_duration),
@@ -1803,6 +1811,7 @@ CSS підключено
         ...baseContextBudget,
         inputBudget: Math.max(0, baseContextBudget.inputBudget - visionImages.length * 512),
       };
+      perfTrace.outputTokenLimit = contextBudget.outputReserve;
 
       const contextPack = buildBoundedContextPrompt({
         systemPrompt,
@@ -1907,6 +1916,7 @@ CSS підключено
         backendConfig,
         apiMessages,
         userRequestedThinking,
+        contextBudget.outputReserve,
       );
       perfTrace.requestNumPredict = chatRequestBody.options?.num_predict ?? null;
 

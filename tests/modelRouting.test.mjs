@@ -943,3 +943,26 @@ test("T7. Ukrainian coding request with translation routes to Pro AI; the writin
   assert.equal(backendOf(route(coding, { thinking: true })), "pro-thinking");
   assert.equal(backendOf(route("Напиши текст про переклад і наведи приклад функції.")), "gemma");
 });
+
+
+test("adaptive output token limit is sent for all backends", () => {
+  const messages = [{ role: "user", content: "hello" }];
+
+  const instruct = buildChatRequestBody(BACKENDS[1], messages, false, 3072);
+  assert.equal(instruct.options?.num_predict, 3072);
+  assert.equal(instruct.options?.num_ctx, 12288);
+  assert.equal(instruct.options?.temperature, 0.65);
+
+  const thinking = buildChatRequestBody(BACKENDS[0], messages, true, 2048);
+  assert.deepEqual(thinking.options, { num_predict: 2048 });
+
+  const gemma = buildChatRequestBody(BACKENDS[2], messages, false, 1024);
+  assert.deepEqual(gemma.options, { num_predict: 1024 });
+});
+
+test("adaptive output token limit rejects invalid values", () => {
+  assert.throws(
+    () => buildChatRequestBody(BACKENDS[2], [], false, 0),
+    /positive finite number/,
+  );
+});

@@ -6,7 +6,7 @@ use std::{
 };
 
 use flate2::read::GzDecoder;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use tar::{Archive as TarArchive, EntryType};
 use uuid::Uuid;
 use zip::ZipArchive;

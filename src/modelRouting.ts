@@ -845,13 +845,14 @@ export type OllamaChatRequestBody = {
   stream: true;
   think: boolean;
   messages: ChatMessageBody[];
-  options?: RuntimeOptions;
+  options?: Partial<RuntimeOptions>;
 };
 
 export function buildChatRequestBody(
   config: BackendConfig,
   messages: ChatMessageBody[],
   userRequestedThinking: boolean,
+  outputTokenLimit?: number,
 ): OllamaChatRequestBody {
   const body: OllamaChatRequestBody = {
     model: config.ollamaModel,
@@ -861,6 +862,16 @@ export function buildChatRequestBody(
   };
 
   if (config.options) body.options = { ...config.options };
+
+  if (outputTokenLimit !== undefined) {
+    if (!Number.isFinite(outputTokenLimit) || outputTokenLimit < 1) {
+      throw new Error("Output token limit must be a positive finite number.");
+    }
+    body.options = {
+      ...body.options,
+      num_predict: Math.floor(outputTokenLimit),
+    };
+  }
 
   return body;
 }

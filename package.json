@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node --test tests/contextManager.test.ts tests/modelRouting.test.mjs tests/routerV2.test.mjs tests/ollamaLifecycle.test.ts tests/ollamaMetrics.test.ts",
+    "check:rust:fmt": "cargo fmt --manifest-path src-tauri/Cargo.toml -- --check",
+    "check:rust": "cargo test --manifest-path src-tauri/Cargo.toml && cargo check --manifest-path src-tauri/Cargo.toml",
+    "check": "npm run test && npm run build && npm run check:rust:fmt && npm run check:rust"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -30,5 +34,8 @@
     "@vitejs/plugin-react": "^6.0.2",
     "typescript": "~6.0.3",
     "vite": "^8.0.16"
+  },
+  "engines": {
+    "node": ">=24.12.0"
   }
 }

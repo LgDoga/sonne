@@ -1071,10 +1071,12 @@ mod storage_lifecycle_tests {
             !replaced_blob_exists,
             "replaced assets with no remaining references must be removed"
         );
-        assert!(!recovered
-            .root_dir()
-            .join(&replaced_blob.relative_path)
-            .exists());
+        assert!(
+            !recovered
+                .root_dir()
+                .join(&replaced_blob.relative_path)
+                .exists()
+        );
 
         let parent_state: String = recovered
             .connection()

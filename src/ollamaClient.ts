@@ -5,6 +5,7 @@ import {
   type ChatResponse,
   type Fetch,
 } from "ollama/browser";
+import { getOllamaModelsToUnload } from "./ollamaLifecycle";
 
 export type OllamaChatStream = AbortableAsyncIterator<ChatResponse>;
 
@@ -143,9 +144,12 @@ export async function createChatStream(
 
   try {
     const requestedModel = request.model;
-    await unloadPreviousOllamaModel(host, requestedModel);
-    for (const model of unloadModelsBefore) {
-      if (model === requestedModel) continue;
+    const modelsToUnload = getOllamaModelsToUnload(
+      lastOllamaModel,
+      requestedModel,
+      unloadModelsBefore,
+    );
+    for (const model of modelsToUnload) {
       try {
         await requestOllamaModelUnload(host, model);
         if (lastOllamaModel === model) lastOllamaModel = null;

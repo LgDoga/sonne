@@ -226,3 +226,21 @@ test("estimator is non-zero, monotonic and heavier for Cyrillic than Latin", () 
   assert.ok(estimateTokens("привіт світе") > estimateTokens("hello world"));
   assert.ok(estimateTokens("a".repeat(100)) > estimateTokens("a".repeat(10)));
 });
+
+
+test("oversized newest turn is retained in a bounded form instead of dropping all history", () => {
+  const userContent = "Поясни, чому виникла ця помилка, і врахуй попередній контекст.";
+  const history: ContextMessage[] = [
+    { role: "user", content: userContent },
+    { role: "assistant", content: ("Детальна попередня відповідь з аргументами. ").repeat(500) },
+  ];
+  const result = run(history, FIXED + estimateMessageTokens({ content: userContent }) + 90);
+
+  assert.equal(result.history[0]?.role, "user");
+  assert.equal(result.history[0]?.content, userContent);
+  assert.equal(result.history.at(-1)?.role, "assistant");
+  assert.ok(result.history.at(-1)?.content.includes("скорочено через ліміт контексту"));
+  assert.equal(result.stats.status, "trimmed");
+  assert.equal(result.stats.optimized, true);
+  assert.ok(result.stats.estInputTokens <= result.stats.inputBudget);
+});

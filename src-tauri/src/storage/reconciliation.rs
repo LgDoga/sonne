@@ -39,11 +39,14 @@ fn hash_file(path: &Path) -> Result<(String, u64), String> {
             break;
         }
         hasher.update(&buffer[..read]);
-        size = size.checked_add(read as u64)
+        size = size
+            .checked_add(read as u64)
             .ok_or_else(|| "File size overflow".to_string())?;
     }
 
-    let hash = hasher.finalize().iter()
+    let hash = hasher
+        .finalize()
+        .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
 
@@ -58,8 +61,7 @@ fn validate_blob_relative_path(relative: &str) -> bool {
     }
 
     let components: Vec<_> = path.components().collect();
-    if components.len() != 3
-        || !matches!(components[0], Component::Normal(name) if name == "blobs")
+    if components.len() != 3 || !matches!(components[0], Component::Normal(name) if name == "blobs")
     {
         return false;
     }
@@ -85,7 +87,9 @@ fn validate_blob_relative_path(relative: &str) -> bool {
     };
 
     folder.len() == 2
-        && folder.chars().all(|character| character.is_ascii_hexdigit())
+        && folder
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
         && hash.len() == 64
         && hash.chars().all(|character| character.is_ascii_hexdigit())
         && hash == hash.to_ascii_lowercase()
@@ -116,7 +120,9 @@ fn scan_directory(
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) => {
-            report.scan_errors.push(format!("{}: {}", directory.display(), error));
+            report
+                .scan_errors
+                .push(format!("{}: {}", directory.display(), error));
             return;
         }
     };
@@ -135,7 +141,9 @@ fn scan_directory(
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                report.scan_errors.push(format!("{}: {}", path.display(), error));
+                report
+                    .scan_errors
+                    .push(format!("{}: {}", path.display(), error));
                 continue;
             }
         };
@@ -176,18 +184,20 @@ pub fn reconcile(
 ) -> Result<ReconciliationReport, String> {
     let blobs_root = storage_root.join("blobs");
 
-    let mut statement = connection.prepare(
-        "SELECT sha256, relative_path, original_size, stored_size FROM blobs"
-    ).map_err(|e| format!("Cannot query blob registry: {e}"))?;
+    let mut statement = connection
+        .prepare("SELECT sha256, relative_path, original_size, stored_size FROM blobs")
+        .map_err(|e| format!("Cannot query blob registry: {e}"))?;
 
-    let rows = statement.query_map([], |row| {
-        Ok(RegisteredBlob {
-            sha256: row.get(0)?,
-            relative_path: row.get(1)?,
-            original_size: row.get(2)?,
-            stored_size: row.get(3)?,
+    let rows = statement
+        .query_map([], |row| {
+            Ok(RegisteredBlob {
+                sha256: row.get(0)?,
+                relative_path: row.get(1)?,
+                original_size: row.get(2)?,
+                stored_size: row.get(3)?,
+            })
         })
-    }).map_err(|e| format!("Cannot read blob registry: {e}"))?;
+        .map_err(|e| format!("Cannot read blob registry: {e}"))?;
 
     let registered: Vec<RegisteredBlob> = rows
         .collect::<Result<Vec<_>, _>>()
@@ -221,7 +231,9 @@ pub fn reconcile(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            report.scan_errors.push(format!("{}: {}", blobs_root.display(), error));
+            report
+                .scan_errors
+                .push(format!("{}: {}", blobs_root.display(), error));
             skip_registered_blob_checks = true;
         }
     }
@@ -244,7 +256,9 @@ pub fn reconcile(
                 continue;
             }
             Err(error) => {
-                report.scan_errors.push(format!("{}: {}", blob.relative_path, error));
+                report
+                    .scan_errors
+                    .push(format!("{}: {}", blob.relative_path, error));
                 continue;
             }
         };
@@ -275,20 +289,15 @@ pub fn reconcile(
                 }
             }
             Err(error) => {
-                report.scan_errors.push(format!("{}: {}", blob.relative_path, error));
+                report
+                    .scan_errors
+                    .push(format!("{}: {}", blob.relative_path, error));
             }
         }
     }
 
-
-
     if scan_blobs_root {
-        scan_directory(
-            &blobs_root,
-            &blobs_root,
-            &registered_paths,
-            &mut report,
-        );
+        scan_directory(&blobs_root, &blobs_root, &registered_paths, &mut report);
     }
 
     Ok(report)
@@ -309,10 +318,7 @@ mod tests {
                 uuid::Uuid::new_v4()
             ));
             fs::create_dir(&path).unwrap_or_else(|error| {
-                panic!(
-                    "Cannot create test directory {}: {error}",
-                    path.display()
-                )
+                panic!("Cannot create test directory {}: {error}", path.display())
             });
             Self(path)
         }
@@ -324,7 +330,8 @@ mod tests {
     }
 
     fn test_hash(data: &[u8]) -> String {
-        Sha256::digest(data).iter()
+        Sha256::digest(data)
+            .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect()
     }
@@ -334,25 +341,29 @@ mod tests {
         fs::create_dir_all(directory.0.join("blobs")).unwrap();
 
         let connection = Connection::open_in_memory().unwrap();
-        connection.execute_batch(
-            "CREATE TABLE blobs (
+        connection
+            .execute_batch(
+                "CREATE TABLE blobs (
                 sha256 TEXT PRIMARY KEY,
                 relative_path TEXT NOT NULL UNIQUE,
                 original_size INTEGER NOT NULL,
                 stored_size INTEGER NOT NULL
-            );"
-        ).unwrap();
+            );",
+            )
+            .unwrap();
 
         (directory, connection)
     }
 
     fn register(connection: &Connection, data: &[u8], relative: &str) -> String {
         let hash = test_hash(data);
-        connection.execute(
-            "INSERT INTO blobs (sha256, relative_path, original_size, stored_size)
+        connection
+            .execute(
+                "INSERT INTO blobs (sha256, relative_path, original_size, stored_size)
              VALUES (?1, ?2, ?3, ?3)",
-            rusqlite::params![hash, relative, data.len() as i64],
-        ).unwrap();
+                rusqlite::params![hash, relative, data.len() as i64],
+            )
+            .unwrap();
         hash
     }
 
@@ -429,8 +440,13 @@ mod tests {
         assert!(!validate_blob_relative_path("blobs/../../outside.blob"));
         assert!(!validate_blob_relative_path("/blobs/aa/file.blob"));
         assert!(!validate_blob_relative_path("blobs/aa/file.blob"));
-        assert!(!validate_blob_relative_path(&format!("blobs/aa/{}.blob", "g".repeat(64))));
-        assert!(!validate_blob_relative_path(&format!("blobs/bb/{hash}.blob")));
+        assert!(!validate_blob_relative_path(&format!(
+            "blobs/aa/{}.blob",
+            "g".repeat(64)
+        )));
+        assert!(!validate_blob_relative_path(&format!(
+            "blobs/bb/{hash}.blob"
+        )));
         assert!(validate_blob_relative_path(&valid_relative));
         assert!(validate_blob_identity(&valid_relative, &hash));
         assert!(!validate_blob_identity(
@@ -484,11 +500,13 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, data).unwrap();
 
-        connection.execute(
-            "INSERT INTO blobs (sha256, relative_path, original_size, stored_size)
+        connection
+            .execute(
+                "INSERT INTO blobs (sha256, relative_path, original_size, stored_size)
              VALUES (?1, ?2, 999, 999)",
-            rusqlite::params![hash, relative],
-        ).unwrap();
+                rusqlite::params![hash, relative],
+            )
+            .unwrap();
 
         let report = reconcile(&connection, &directory.0).unwrap();
         assert_eq!(report.verified_blobs, 1);

@@ -112,14 +112,21 @@ export type BoundedContextResult = {
 const CONTEXT_TRUNCATION_NOTICE =
   "\n[Частину вмісту не додано через ліміт контексту моделі. Оригінальний документ збережено; задай уточнювальне запитання для інших деталей.]";
 
+const HISTORY_TRUNCATION_NOTICE =
+  "\n[Частину попереднього повідомлення скорочено через ліміт контексту.]";
+
 /**
  * Keep a complete prefix at a readable boundary and explicitly mark that the
  * source was shortened. The token estimator is conservative and deterministic.
  */
-export function truncateTextToTokenBudget(text: string, maxTokens: number): string {
+export function truncateTextToTokenBudget(
+  text: string,
+  maxTokens: number,
+  notice = CONTEXT_TRUNCATION_NOTICE,
+): string {
   if (!text.trim() || maxTokens <= 0) return "";
   if (estimateTokens(text) <= maxTokens) return text;
-  if (estimateTokens(CONTEXT_TRUNCATION_NOTICE) >= maxTokens) return "";
+  if (estimateTokens(notice) >= maxTokens) return "";
 
   let low = 0;
   let high = text.length;
@@ -136,7 +143,7 @@ export function truncateTextToTokenBudget(text: string, maxTokens: number): stri
         safeEnd -= 1;
       }
     }
-    const candidate = text.slice(0, safeEnd).trimEnd() + CONTEXT_TRUNCATION_NOTICE;
+    const candidate = text.slice(0, safeEnd).trimEnd() + notice;
     if (estimateTokens(candidate) <= maxTokens) {
       best = safeEnd;
       low = middle + 1;
@@ -152,10 +159,10 @@ export function truncateTextToTokenBudget(text: string, maxTokens: number): stri
   const boundary = Math.max(newline, space);
   if (boundary >= floor) best = boundary;
 
-  let result = text.slice(0, best).trimEnd() + CONTEXT_TRUNCATION_NOTICE;
+  let result = text.slice(0, best).trimEnd() + notice;
   while (best > 0 && estimateTokens(result) > maxTokens) {
     best = Math.floor(best * 0.95);
-    result = text.slice(0, best).trimEnd() + CONTEXT_TRUNCATION_NOTICE;
+    result = text.slice(0, best).trimEnd() + notice;
   }
   return estimateTokens(result) <= maxTokens ? result : "";
 }
@@ -354,6 +361,60 @@ export type HistorySelection = {
   stats: ContextStats;
 };
 
+function fitNewestHistoryTurn(
+  turn: readonly ContextMessage[],
+  availableTokens: number,
+): ContextMessage[] {
+  const userIndex = turn.findIndex((message) => message.role === "user");
+  if (userIndex < 0 || availableTokens <= 0) return [];
+
+  const userMessage = turn[userIndex];
+  const userCost = estimateMessageTokens(userMessage);
+
+  // Preserve the complete user question whenever possible. If it alone is
+  // too large, retain a clearly marked prefix instead of discarding all history.
+  if (userCost > availableTokens) {
+    const content = truncateTextToTokenBudget(
+      userMessage.content,
+      availableTokens - MESSAGE_OVERHEAD_TOKENS,
+      HISTORY_TRUNCATION_NOTICE,
+    );
+    return content ? [{ role: "user", content }] : [];
+  }
+
+  const selected: ContextMessage[] = [{
+    role: "user",
+    content: userMessage.content,
+  }];
+  const remainingTokens = availableTokens - userCost;
+  if (remainingTokens <= MESSAGE_OVERHEAD_TOKENS) return selected;
+
+  // In a multi-reply turn, the newest assistant response carries the latest
+  // state. Keep that response after the complete user prompt; older replies
+  // in the oversized turn are omitted before it.
+  let latestAssistant: ContextMessage | undefined;
+  for (let index = turn.length - 1; index > userIndex; index -= 1) {
+    if (turn[index].role === "assistant") {
+      latestAssistant = turn[index];
+      break;
+    }
+  }
+  if (!latestAssistant) return selected;
+
+  if (estimateMessageTokens(latestAssistant) <= remainingTokens) {
+    selected.push({ role: "assistant", content: latestAssistant.content });
+    return selected;
+  }
+
+  const content = truncateTextToTokenBudget(
+    latestAssistant.content,
+    remainingTokens - MESSAGE_OVERHEAD_TOKENS,
+    HISTORY_TRUNCATION_NOTICE,
+  );
+  if (content) selected.push({ role: "assistant", content });
+  return selected;
+}
+
 export function selectHistory(
   history: readonly ContextMessage[],
   input: { systemPrompt: string; userPrompt: string; budget: ContextBudget },
@@ -367,6 +428,7 @@ export function selectHistory(
   const available = budget.inputBudget - fixedTokens;
 
   let keepFrom = 0;
+  let selectedOverride: ContextMessage[] | null = null;
   let status: HistorySelectionStatus = "within-budget";
 
   if (available < 0) {
@@ -379,23 +441,28 @@ export function selectHistory(
     keepFrom = history.length;
 
     // Walk back one turn at a time (a user message plus the replies that
-    // follow it). A turn that does not fit stops the walk, so what is kept
-    // is always a contiguous, whole-turn tail of the conversation.
+    // follow it). Older whole turns are retained while they fit.
     let used = 0;
     let end = history.length;
 
     while (end > 0) {
       let start = end - 1;
-
-      while (start > 0 && history[start].role !== "user") start--;
+      while (start > 0 && history[start].role !== "user") start -= 1;
 
       // Replies with no user message before them would be orphaned.
       if (history[start].role !== "user") break;
 
       let turnCost = 0;
+      for (let index = start; index < end; index += 1) turnCost += costs[index];
 
-      for (let i = start; i < end; i++) turnCost += costs[i];
-      if (used + turnCost > available) break;
+      if (used + turnCost > available) {
+        // A too-large newest turn is the exception: salvage its user prompt
+        // and latest assistant response within the remaining budget.
+        if (end === history.length && used === 0) {
+          selectedOverride = fitNewestHistoryTurn(history.slice(start, end), available);
+        }
+        break;
+      }
 
       used += turnCost;
       keepFrom = start;
@@ -403,18 +470,25 @@ export function selectHistory(
     }
   }
 
-  const selected = history.slice(keepFrom).map((message) => ({
+  const selectedSource = selectedOverride ?? history.slice(keepFrom);
+  const selected = selectedSource.map((message) => ({
     role: message.role,
     content: message.content,
   }));
-  const selectedTokens = costs.slice(keepFrom).reduce((sum, cost) => sum + cost, 0);
+  const selectedTokens = selected.reduce(
+    (sum, message) => sum + estimateMessageTokens(message),
+    0,
+  );
   const omitted = history.length - selected.length;
+  const historyWasShortened = selectedOverride !== null && selected.some((message) =>
+    message.content.includes(HISTORY_TRUNCATION_NOTICE),
+  );
 
   return {
     history: selected,
     stats: {
       status,
-      optimized: omitted > 0,
+      optimized: omitted > 0 || historyWasShortened,
       contextWindow: budget.contextWindow,
       windowSource: budget.windowSource,
       inputBudget: budget.inputBudget,

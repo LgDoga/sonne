@@ -5,13 +5,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tauri::State;
 use uuid::Uuid;
 
-use super::{Storage, MAX_FILE_SIZE_BYTES};
+use super::{MAX_FILE_SIZE_BYTES, Storage};
 
 const MAX_SECTIONS: usize = 10_000;
 const MAX_CHUNKS: usize = 50_000;
@@ -2695,8 +2695,8 @@ pub fn get_document_summary(
 #[cfg(test)]
 mod processing_claim_tests {
     use super::{
-        claim_document_processing, now_timestamp, recover_interrupted_document_processing,
-        renew_document_claim, validate_document_access, PROCESSING_LEASE_MS,
+        PROCESSING_LEASE_MS, claim_document_processing, now_timestamp,
+        recover_interrupted_document_processing, renew_document_claim, validate_document_access,
     };
     use rusqlite::Connection;
     use std::{

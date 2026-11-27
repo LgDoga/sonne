@@ -5,13 +5,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{Storage, MAX_FILE_SIZE_BYTES};
+use super::{MAX_FILE_SIZE_BYTES, Storage};
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -816,7 +816,7 @@ fn remove_unregistered_blob_file(root: &Path, sha256: &str) -> Result<bool, Stri
         Err(error) => {
             return Err(format!(
                 "Cannot inspect unregistered blob directory: {error}"
-            ))
+            ));
         }
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err("Unregistered blob directory is not a regular directory".into());

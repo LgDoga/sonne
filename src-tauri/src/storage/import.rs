@@ -13,8 +13,8 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::{
-    AttachmentReferenceRecord, Storage, MAX_FILE_SIZE_BYTES, MAX_IMPORT_BATCH_SIZE_BYTES,
-    MAX_IMPORT_FILES,
+    AttachmentReferenceRecord, MAX_FILE_SIZE_BYTES, MAX_IMPORT_BATCH_SIZE_BYTES, MAX_IMPORT_FILES,
+    Storage,
 };
 
 fn now_timestamp() -> Result<i64, String> {
